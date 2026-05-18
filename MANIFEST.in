@@ -1,0 +1,6 @@
+global-exclude __pycache__ *.py[cod]
+prune logs
+prune .venv
+exclude .env
+exclude *.zip
+exclude *.tar.gz

@@ -1,0 +1,12 @@
+{
+  "attempted": 0,
+  "completed": 0,
+  "ended_at": "2026-05-18T04:16:21.917027+05:30",
+  "errors": 2,
+  "output_dir": "research\\backtests\\grid_smoke\\sweep_20260518_041610",
+  "started_at": "2026-05-18T04:16:10.472557+05:30",
+  "status": "finished",
+  "stop_reason": "completed",
+  "top_results": [],
+  "until": null
+}

@@ -1,0 +1,36 @@
+{
+  "attempted": 1,
+  "completed": 1,
+  "ended_at": "2026-05-17T04:40:36.212540+05:30",
+  "errors": 0,
+  "output_dir": "research\\backtests\\smoke\\sweep_20260517_044035",
+  "started_at": "2026-05-17T04:40:35.325576+05:30",
+  "status": "finished",
+  "stop_reason": "cutoff_reached",
+  "top_results": [
+    {
+      "accepted_reports": 8,
+      "candles_loaded": 120,
+      "completed_at": "2026-05-17T04:40:36.212540+05:30",
+      "enter_long": 2,
+      "enter_short": 2,
+      "error": "",
+      "exit_long": 2,
+      "exit_short": 2,
+      "family": "adaptive_hybrid",
+      "fees_paid": "3.440440741667923524483966164",
+      "final_equity": "1014.781133963493192886793004",
+      "hold": 116,
+      "interval": "1h",
+      "max_drawdown_pct": "1.602342462757479267555106554",
+      "pair": "B-SOL_USDT",
+      "profit_factor": "1.656482556755466188949670460",
+      "rejected_reports": 116,
+      "total_return_pct": "1.478113396349319288679300400",
+      "trade_count": 4,
+      "variant": "adaptive_default",
+      "win_rate_pct": "50.0"
+    }
+  ],
+  "until": null
+}

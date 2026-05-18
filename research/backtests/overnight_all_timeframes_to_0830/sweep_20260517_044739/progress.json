@@ -1,0 +1,12 @@
+{
+  "attempted": 5,
+  "completed": 5,
+  "errors": 0,
+  "last_interval": "1m",
+  "last_pair": "B-ETH_USDT",
+  "last_variant": "adaptive_default",
+  "output_dir": "research\\backtests\\overnight_all_timeframes_to_0830\\sweep_20260517_044739",
+  "started_at": "2026-05-17T04:47:39.605487+05:30",
+  "status": "running",
+  "until": "2026-05-17T08:30:00+05:30"
+}

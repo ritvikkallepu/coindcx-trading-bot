@@ -1,0 +1,2 @@
+completed_at,pair,interval,variant,family,candles_loaded,total_return_pct,final_equity,trade_count,win_rate_pct,profit_factor,max_drawdown_pct,fees_paid,accepted_reports,rejected_reports,enter_long,enter_short,exit_long,exit_short,hold,error
+2026-05-17T04:41:02.362566+05:30,B-SOL_USDT,1h,adaptive_default,adaptive_hybrid,120,1.478113396349319288679300400,1014.781133963493192886793004,4,50.0,1.656482556755466188949670460,1.602342462757479267555106554,3.440440741667923524483966164,8,116,2,2,2,2,116,

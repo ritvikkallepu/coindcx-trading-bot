@@ -1,0 +1,12 @@
+{
+  "attempted": 17,
+  "completed": 17,
+  "errors": 0,
+  "last_interval": "4h",
+  "last_pair": "B-SOL_USDT",
+  "last_variant": "bb_lenient_volume",
+  "output_dir": "research\\backtests\\overnight_to_0830\\sweep_20260517_044134",
+  "started_at": "2026-05-17T04:41:34.871251+05:30",
+  "status": "running",
+  "until": "2026-05-17T08:30:00+05:30"
+}

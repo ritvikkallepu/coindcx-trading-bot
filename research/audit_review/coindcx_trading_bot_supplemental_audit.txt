@@ -1,0 +1,639 @@
+CoinDCX Trading Bot
+Supplemental Bug Audit, Strategy/Risk Review, and ATR Improvement Plan
+Scope note / This document formats the pasted audit notes into an implementation-ready Word handoff. It is based on the uploaded pasted text only and does not read or include any API key or secret key material.
+Prepared for: Trading bot improvement workstream
+Source: pasted audit notes supplied in the current chat
+Executive Summary
+Core status: The bot has a useful research and paper-trading foundation, but multiple issues prevent it from being treated as live-futures-ready.
+Highest-risk bug: The backtest engine appears to evaluate a signal with the current candle close and fill at that same close, creating look-ahead bias.
+Highest-risk operational gap: Broker state is memory-first. If the bot restarts while a position is open, it can lose awareness of that position unless exchange reconciliation or persistence is added.
+Highest-value risk fix: Daily risk checks should include mark-to-market unrealized P&L, not realized P&L only.
+Highest-value ATR fix: Add NATR, ATR percentile rank, ATR entry gates, Chandelier exits, ratcheted take-profit logic, and dual-period ATR.
+Priority Summary
+Priority | Issue | Why it matters
+Critical | Look-ahead bias in backtest | Affects all strategy evaluation because live execution cannot know the candle close before the candle closes.
+Critical | No state persistence | Positions, orders, P&L, and open risk can be lost on restart.
+High | Fee rate heuristic bug | Wrong fees can be silently applied when raw-rate and percent formats are auto-detected.
+High | Blocking rate limiter | Synchronous sleep can stall candle processing and trailing-stop management.
+Medium | Indicator recomputation | O(n) recalculation on every candle creates unnecessary latency and scaling issues.
+Medium | Daily limit ignores unrealized P&L | Actual drawdown can exceed the daily limit before realized loss catches up.
+Medium | WebSocket gap replay missing | Missed candles during disconnects can distort indicators and state.
+Low | Dead isinstance(int) guard | Suggests API drift and should be removed to avoid confusion.
+Low | .venv included in archive | Bloats distribution and creates cross-platform dependency problems.
+Detailed Audit Notes
+Bugs Found
+1. Look-Ahead Bias in the Backtest Engine (Critical)
+In backtest/engine.py, signals are generated using candle.close and the order is also filled at that same candle.close:
+# Signal evaluated using close price...
+market_price=candle.close
+# ...and filled at the same close price immediately
+report = execution.process_decision(decision, market_price=candle.close, ...)
+In reality, you only know the close price after the candle fully closes. A realistic engine should fill at the next candle's open price. This makes backtests look better than live performance will be.
+2. Ambiguous Fee Rate Heuristic in main.py
+if fee_rate >= Decimal("0.01"):
+return fee_rate / Decimal("100")
+The code tries to auto-detect if a fee was passed as a raw rate (0.0002) vs. a percentage (0.02) by checking if it's
+>= 0.01. But 0.01 is itself a valid raw rate (1%), so passing --fee-rate 0.01 (meaning 1%) silently converts it to
+0.0001 (0.01%). There's no warning or error - it just silently uses the wrong fee.
+3. Dead Code Guard in _is_approved_scale_in (risk/manager.py)
+if isinstance(context.open_positions, int):
+return False
+open_positions is typed as OpenPositions (a sequence of OpenPosition objects), never an int. This check is a remnant
+of an older API and will never trigger. It suggests there may have been a silent API drift - worth cleaning up to
+avoid confusion.
+4. Synthetic Exit Signal Has Wrong Field Semantics (broker/paper.py)
+When a stop-loss or take-profit triggers inside process_candle, a synthetic StrategySignal is created with
+entry_price=price (the trigger price). But in StrategySignal, entry_price is semantically "the price you want to
+enter at," not the exit fill price. This mislabelling can corrupt any downstream logic that reads entry_price on
+the signal expecting an entry context.
+5. Daily Start Equity Calculation Can Be Misleading (backtest/engine.py)
+daily_start_equity[day] = broker.snapshot({self.config.pair: candle.close}).equity
+This snapshots equity at the close of the first candle of the day, not at the true start-of-day mark. If a position was opened the previous day, the unrealized P&L at the first candle's close is already included. The daily loss limit percentage is then calculated against a slightly off base, which matters for strategies that hold overnight.
+Improvements to Make
+Strategy & Signal Logic
+No multi-timeframe confirmation in live trading. The backtest and research sweep support multiple intervals, but the live market_stream command only subscribes to a single interval. Adding a higher-timeframe trend filter before live entry would significantly reduce false signals.
+AdaptiveHybridStrategy regime detection uses hard-coded thresholds (trend_spread_reference_pct, trend_move_reference_pct). These were clearly tuned manually. You could make them adaptive based on volatility percentiles computed from the rolling candle window.
+Exit logic for EMA/RSI strategy is asymmetric. It generates exits on a crossdown signal for longs but there's no symmetric re-entry guard - a fast cross-and-recross in choppy markets generates repeated small-loss entries.
+Risk Management
+max_open_positions = 1 is hardcoded as the default and live trading is completely blocked ("Risk approval is paper-only"). Adding even a basic live execution path with strict risk gates would make the bot usable for actual trading.
+No position sizing for volatility adjustment. The current fixed_fraction_position_size sizes by stop distance, which is good. But it doesn't account for instrument-level volatility regime (e.g., reducing size during high-ATR periods).
+Daily loss limit uses realized P&L only. An open position with a large unrealized loss doesn't count toward the daily limit until it's closed. You could add an unrealized P&L check too.
+Data & Performance
+Indicators are fully recomputed from scratch on every candle in latest_indicator_snapshot. For a 1000-candle window this is O(n) per tick. Adding incremental EMA and ATR updates (which only need the last value + the new candle) would reduce overhead significantly.
+MinIntervalRateLimiter blocks the calling thread with time.sleep(). If the main loop is also responsible for processing candles or managing trailing stops, API calls will stall that loop. Consider an async or non-blocking rate limiter, or move API calls to a background thread.
+The rate limiter is process-local only. If you ever run multiple instances (e.g., different pairs in parallel processes), they'll each think they have full API rate budget, and together they'll exceed the CoinDCX limit. A shared token bucket (e.g., via Redis or a multiprocessing lock) would fix this.
+Reliability & Operations
+No persistent state across restarts. All broker state (open positions, P&L, orders) is in-memory. If the bot crashes or restarts with an open position, it starts fresh with no knowledge of that position. You need to either persist state to disk/DB on every write, or query the exchange on startup to reconcile.
+WebSocket re-subscriptions on reconnect. The reconnection=True setting helps reconnect the socket, and the connect event re-emits join for channels - that's good. But there's no replay of missed candles during the reconnection gap. If the bot was disconnected for 5 minutes, the candle builder won't know, and incomplete candles may be silently dropped.
+No alerting or notification system. There's no Telegram/email/webhook integration when trades are executed, stopped out, or when the daily limit is hit. For an unattended bot this is a significant gap.
+.venv is included in the zip. The entire virtual environment (with platform-specific .pyd and .exe binaries for Windows) is committed. This makes the zip ~15MB and won't work cross-platform. Add .venv/ to .gitignore and distribute only pyproject.toml.
+Code Quality
+config.py custom .env parser will silently fail on multi-line values, values with = in them (e.g., base64 secrets), and quoted strings with escaped quotes. Python's python-dotenv handles all these edge cases and is already a transitive dep via other packages.
+No type checking in CI. The project has mypy compatible types (from __future__ import annotations, py.typed markers in dependencies) but no mypy run in any visible CI config. Adding mypy --strict on the app/ directory would catch bugs like the open_positions: int issue above at development time.
+backtest/metrics.py Sharpe ratio - worth double-checking whether it annualizes by trading days or calendar days, since crypto trades 24/7/365 (not the typical 252 trading-day assumption).
+Quick Priority Summary
+Critical: CriticalLook-ahead bias in backtest (affects all strategy evaluation)
+Critical: CriticalNo state persistence (positions lost on restart)
+High: HighFee rate heuristic bug (wrong fees silently applied)
+High: HighBlocking rate limiter stalls candle processing
+Medium: MediumIndicator recomputed O(n) every tick
+Medium: MediumNo unrealized P&L in daily loss limit
+Medium: MediumWebSocket gap - no missed candle replay
+Low: LowDead isinstance(int) check
+Low: Low.venv in version control
+Happy to dive deeper into any specific area, or help implement fixes for any of these.
+Deep Dive: Strategy, Signal Logic, and Risk Management
+Here's a summary of the most important things to act on first, in priority order:
+Bugs to fix now
+The RSI overlap at 50 is the quickest fix - just nudge the bounds to [52, 72] long and [28, 48] short. The BB band-touch condition (fires on close, not wick-pierce + close-inside) is causing false reversion entries on tight squeezes. Both are one-line changes.
+The bigger structural issue is the exit signal routing when the regime switches. If the Bollinger strategy opened a trade but the regime then flipped to "trend" and swapped EMA to primary, the BB exit signal is now coming from the secondary - and the adaptive hybrid ignores secondary exit signals entirely. Positions can get stranded.
+The two most impactful improvements
+The regime detection's hard-coded thresholds (trend_spread_reference_pct=0.65%, trend_move_reference_pct=3%) will silently misclassify market conditions on any pair or timeframe that wasn't used when those values were tuned. Normalising them against ATR-implied volatility is about 10 lines of code and makes the whole system instrument-agnostic.
+The daily loss limit using only realized P&L means you can be sitting at -9% unrealized and -3% realized, well within the "10% daily limit," while your actual drawdown is -12%. Adding mark-to-market unrealized P&L to the limit check requires adding current_mark_prices to RiskContext - the candle close is already available everywhere this is called.
+For sizing: The volatility-adjusted risk percentage and tick-size rounding for stop/TP prices are the highest value with the least risk. The Kelly criterion work is worth doing once you have more backtest history to derive reliable win rates from.
+ATR Improvement Analysis
+Here's the full breakdown of what's in that file and why each improvement matters specifically to your code:
+1. NATR - Normalised ATR (normalised_atr)
+Your current stop distances are atr * 1.5, atr * 1.2, atr * 2.0 etc. The multipliers were tuned on one instrument. A raw ATR of INR1500 on BTC is 0.06% of price; on a INR5 altcoin a INR0.02 ATR is also tiny, but the same multiplier gives a proportionally much wider stop in volatility-adjusted terms. NATR = (ATR / close) x 100 makes every stop multiple mean the same thing regardless of price level or instrument.
+2. ATR Percentile Rank (atr_percentile_rank)
+Answers "is the market more or less volatile than usual right now?" This directly fixes the issue from the deep-dive where trend_spread_reference_pct = 0.65% is a hard-coded constant that misfires on different volatility regimes. Feed the rank into the regime detection to scale the thresholds up or down dynamically.
+3. Chandelier Exit (chandelier_exit)
+Your current trailing stop is percentage-based (trailing_stop_activation_pct, trailing_stop_distance_pct). These percentages are constant regardless of volatility - on a high-ATR day a 2% trail is less than 1 ATR and you get stopped on normal noise; on a low-ATR day 2% is 4 ATRs and you never trail meaningfully. The Chandelier Exit is highest_high - NxATR for longs, which automatically scales with volatility. The integration comment in the code shows exactly which two lines in PaperBroker to replace.
+4. Ratcheted Take-Profit Fix (ratcheted_take_profit)
+This is the bug from the earlier analysis. In update_dynamic_atr_exits, the TP is recalculated as candle.close + target_distance every candle. If close drops from 104 -> 99, TP drops from 109 -> 104 - the target drifts backward on retracements. The stop correctly ratchets (only moves up for longs via best_price), but the TP doesn't. This function fixes the TP to use best_price + distance and only move in the profitable direction, matching how the stop already behaves.
+5. ATR Entry Gate (atr_entry_gate)
+Blocks entries at two extremes your code currently has no protection against: when NATR is above 5% (chaotic, slippage explodes, signal reliability drops), and when NATR is below 0.1% (dead market, moves too small to overcome your 0.02% maker fee + slippage). Drop it at the top of any strategy's evaluate() - one call, returns allowed: bool and a reason string that flows into the existing metadata system.
+6. Dual ATR (dual_atr)
+The spike filter in HybridMetaStrategy uses ATR(14) as the baseline - but if a news spike doubles ATR(14), the threshold for future spikes relaxes permanently for several candles. A slow ATR(20) as the spike-filter baseline and fast ATR(5) for stop distances gives you two purpose-matched tools instead of one mediocre compromise. The ratio fast/slow > 1.5 is also a clean signal that short-term volatility is expanding, which you could feed into the regime detector.
+Appendix A: atr_improvements.py
+Implementation note / This appendix preserves the supplied Python implementation notes as a reference patch. Review imports, project paths, and behavior in tests before merging.
+"""
+atr_improvements.py
+===================
+Drop-in improvements for app/data/indicators.py  (ATR section)
+and app/broker/paper.py (update_dynamic_atr_exits).
+Five concrete upgrades:
+1. NATR  - normalised ATR as % of close; instrument-agnostic
+2. ATR percentile rank - is volatility currently high or low?
+3. Chandelier exit    - proper ATR-based trailing stop (replaces
+the percentage-based trailing stop)
+4. Dynamic ATR TP fix - take-profit no longer drifts backwards
+5. ATR entry filter   - skip entries in dead or chaotic markets
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Iterable
+# -- re-use your existing types ----------------------------------------------
+from app.data.candle_builder import CandleSeries, OHLCVCandle
+from app.strategies.base import SignalDirection
+# ============================================================================
+# 1.  NATR - Normalised Average True Range
+# ============================================================================
+#
+# PROBLEM IN CURRENT CODE
+# -----------------------
+# Every strategy compares raw ATR values directly:
+#
+#   atr_current = atr_values[-1]          # e.g. 1500 INR on BTC/USDT
+#   stop_distance = atr * stop_multiple   # 1500 x 1.5 = 2250 INR
+#
+# 2250 INR on BTC is ~0.06% of price. On an altcoin worth INR5 that same
+# multiple of a INR0.02 ATR gives a INR0.03 stop - also 0.6% but
+# *ten times bigger in % terms*.  The multiples (1.2, 1.35, 1.5, 2.0)
+# were all tuned on one instrument and silently mean different things
+# on every other pair.
+#
+# FIX
+# ---
+# Use NATR = (ATR / close) x 100.  All multiples then work in % terms,
+# which are portable across any price level.
+#
+# HOW TO USE IT
+# -------------
+# Add natr to IndicatorSnapshot, then in each strategy replace:
+#
+#   stop_distance = atr * self.stop_atr_multiple
+#
+# with:
+#
+#   stop_distance = latest.close * (natr / 100) * self.stop_atr_multiple
+#
+# which is identical in value but now self.stop_atr_multiple means the
+# same thing regardless of which instrument or timeframe you're on.
+def normalised_atr(
+candles: Iterable[OHLCVCandle],
+period: int = 14,
+) -> list[Decimal | None]:
+"""
+NATR = (ATR / close) x 100.
+Returns a list aligned with `candles`.  Values before the warmup
+window are None.  A value of 1.5 means "ATR is 1.5% of price".
+"""
+series = list(candles)
+atr_series = average_true_range(series, period)
+result: list[Decimal | None] = []
+for candle, atr_val in zip(series, atr_series):
+if atr_val is None or candle.close <= 0:
+result.append(None)
+else:
+result.append((atr_val / candle.close) * Decimal("100"))
+return result
+# ============================================================================
+# 2.  ATR Percentile Rank
+# ============================================================================
+#
+# PROBLEM IN CURRENT CODE
+# -----------------------
+# The adaptive hybrid uses hard-coded thresholds to detect regime:
+#
+#   trend_spread_reference_pct = Decimal("0.65")
+#   trend_move_reference_pct   = Decimal("3")
+#
+# These were tuned for a specific volatility level and break on any pair
+# with different typical volatility.  The regime detection also has no
+# sense of whether current volatility is *historically high or low*.
+#
+# In the risk manager, daily-loss limits and position sizing use fixed
+# percentages that ignore the current volatility regime entirely.
+#
+# FIX
+# ---
+# ATR percentile rank answers: "Is the market more or less volatile
+# than usual right now?"
+#
+#   rank = 0.0  -> lowest ATR seen in the lookback (very quiet)
+#   rank = 1.0  -> highest ATR seen in the lookback (very volatile)
+#   rank = 0.75 -> top quartile - above-average volatility
+#
+# HOW TO USE IT
+# -------------
+# In AdaptiveHybridStrategy._market_regime():
+#
+#   atr_rank = atr_percentile_rank(series, period=14, lookback=100)
+#   # Scale regime thresholds down when volatility is high
+#   effective_spread_ref = trend_spread_reference_pct * (1 + atr_rank * 0.5)
+#
+# In fixed_fraction_position_size() (risk/position_sizing.py):
+#
+#   if atr_rank >= 0.75:
+#       effective_risk_pct = max_risk_per_trade_pct * Decimal("0.60")
+#   elif atr_rank <= 0.25:
+#       effective_risk_pct = max_risk_per_trade_pct * Decimal("1.10")
+#   else:
+#       effective_risk_pct = max_risk_per_trade_pct
+def atr_percentile_rank(
+candles: Iterable[OHLCVCandle],
+*,
+period: int = 14,
+lookback: int = 100,
+) -> Decimal | None:
+"""
+Returns the percentile rank of the current ATR within its recent
+`lookback`-candle history.  0 = lowest volatility seen, 1 = highest.
+Returns None if there is not enough data.
+"""
+series = list(candles)
+atr_series = average_true_range(series, period)
+valid = [v for v in atr_series if v is not None]
+if not valid:
+return None
+current = valid[-1]
+window = valid[-lookback:]                    # last `lookback` valid ATRs
+if len(window) < 2:
+return None
+rank = sum(1 for v in window if v <= current) / len(window)
+return Decimal(str(round(rank, 4)))
+# ============================================================================
+# 3.  Chandelier Exit  (ATR-based trailing stop)
+# ============================================================================
+#
+# PROBLEM IN CURRENT CODE
+# -----------------------
+# The trailing stop in PaperBroker uses percentage-based activation and
+# distance:
+#
+#   trailing_stop_activation_pct  = 1%   # activate after +1% gain
+#   trailing_stop_distance_pct    = 2%   # trail 2% below peak
+#
+# These percentages are constant regardless of how volatile the instrument
+# is.  On a 0.5% ATR candle a 2% trail is 4 ATRs - very wide.  On a 3%
+# ATR candle it's less than 1 ATR - will stop you out on normal noise.
+#
+# FIX
+# ---
+# The Chandelier Exit is the industry standard for ATR-based trailing stops:
+#
+#   LONG  stop = highest_high(lookback) - (multiplier x ATR)
+#   SHORT stop = lowest_low(lookback)  + (multiplier x ATR)
+#
+# It trails automatically without needing a separate activation threshold,
+# and it stays proportional to volatility because it's measured in ATR units.
+#
+# HOW TO USE IT
+# -------------
+# Replace (or augment) PaperBroker._update_trailing_stop() and
+# _trailing_stop_candidate() with these functions.
+# Store `chandelier_lookback` and `chandelier_multiple` in position.metadata
+# at entry time.
+@dataclass(frozen=True)
+class ChandelierLevels:
+long_stop: Decimal       # for long positions: highest_high - N*ATR
+short_stop: Decimal      # for short positions: lowest_low + N*ATR
+highest_high: Decimal
+lowest_low: Decimal
+atr: Decimal
+def chandelier_exit(
+candles: Iterable[OHLCVCandle],
+*,
+atr_period: int = 14,
+lookback: int = 22,          # default: 22 candles (~1 month on 1h chart)
+multiplier: Decimal = Decimal("3"),
+) -> ChandelierLevels | None:
+"""
+Computes the Chandelier Exit levels for the most recent candle.
+For a LONG position:
+stop = highest_high(lookback) - multiplier * ATR(atr_period)
+For a SHORT position:
+stop = lowest_low(lookback) + multiplier * ATR(atr_period)
+Returns None if there is not enough history.
+INTEGRATION EXAMPLE
+-------------------
+In PaperBroker.update_dynamic_atr_exits() (or a new method), call this
+each candle and update position.stop_loss:
+levels = chandelier_exit(candles, multiplier=Decimal("3"))
+if levels is not None:
+if position.direction == LONG:
+new_stop = max(position.stop_loss or 0, levels.long_stop)
+# ratchet: only ever move stop UP for longs
+if new_stop > (position.stop_loss or 0):
+position = replace(position, stop_loss=new_stop)
+else:
+new_stop = min(position.stop_loss or 1e18, levels.short_stop)
+if new_stop < (position.stop_loss or Decimal("999999")):
+position = replace(position, stop_loss=new_stop)
+"""
+series = list(candles)
+if len(series) < max(atr_period, lookback):
+return None
+atr_series = average_true_range(series, atr_period)
+current_atr = atr_series[-1]
+if current_atr is None or current_atr <= 0:
+return None
+window = series[-lookback:]
+highest_high = max(c.high for c in window)
+lowest_low   = min(c.low  for c in window)
+long_stop  = highest_high - multiplier * current_atr
+short_stop = lowest_low   + multiplier * current_atr
+return ChandelierLevels(
+long_stop=max(long_stop, Decimal("0")),
+short_stop=short_stop,
+highest_high=highest_high,
+lowest_low=lowest_low,
+atr=current_atr,
+)
+# ============================================================================
+# 4.  Dynamic ATR Take-Profit Fix  (broker/paper.py)
+# ============================================================================
+#
+# PROBLEM IN CURRENT CODE
+# -----------------------
+# In PaperBroker.update_dynamic_atr_exits() the take-profit is recalculated
+# every candle as:
+#
+#   take_profit = max(candle.close + target_distance, tiny_price)  # LONG
+#
+# This means if close drops from 104 -> 99, the TP drops from 109 -> 104.
+# The TP drifts *backward* on retracements, which defeats the purpose of
+# having a fixed reward target.
+#
+# The stop correctly ratchets (only moves up for longs via `best_price`),
+# but the TP has no equivalent ratchet.
+#
+# FIX
+# ---
+# Anchor the initial TP at entry and only move it *forward* (up for longs,
+# down for shorts).  Replace the TP section of update_dynamic_atr_exits()
+# with this function:
+def ratcheted_take_profit(
+position_direction: SignalDirection,
+current_take_profit: Decimal | None,
+entry_price: Decimal,
+best_price: Decimal,         # highest high for longs, lowest low for shorts
+atr: Decimal,
+take_profit_multiple: Decimal,
+) -> Decimal:
+"""
+Returns the new take-profit price, ensuring it only moves in the
+profitable direction (never backward).
+For LONG:  new_tp = max(current_tp, best_price + atr * multiple)
+For SHORT: new_tp = min(current_tp, best_price - atr * multiple)
+This anchors the TP to the best price seen (not just the close),
+and the ratchet means a pullback never reduces the target.
+INTEGRATION
+-----------
+In PaperBroker.update_dynamic_atr_exits(), replace:
+take_profit = max(candle.close + target_distance, tiny_price)
+with:
+take_profit = ratcheted_take_profit(
+position_direction=position.direction,
+current_take_profit=position.take_profit,
+entry_price=position.entry_price,
+best_price=best_price,   # already computed just above
+atr=atr,
+take_profit_multiple=take_profit_multiple,
+)
+"""
+distance = atr * take_profit_multiple
+tiny = Decimal("0.00000001")
+if position_direction == SignalDirection.LONG:
+# Minimum target: entry + distance (don't move TP below initial target)
+candidate = max(best_price + distance, entry_price + distance)
+if current_take_profit is not None:
+return max(current_take_profit, candidate)     # ratchet forward
+return max(candidate, tiny)
+# SHORT: TP moves DOWN, so we take the minimum
+candidate = min(best_price - distance, entry_price - distance)
+if current_take_profit is not None:
+return min(current_take_profit, max(candidate, tiny))  # ratchet forward
+return max(candidate, tiny)
+# ============================================================================
+# 5.  ATR Entry Filter
+# ============================================================================
+#
+# PROBLEM IN CURRENT CODE
+# -----------------------
+# There is no ATR-based gate on entries at all.  The HybridMeta has a spike
+# filter (candle range > 3.5 x ATR -> block), but nothing prevents entering:
+#
+#   a) During extremely high volatility (top-quartile ATR):
+#      - Stops are very wide, so position sizes are tiny.
+#      - Price action is chaotic; signal reliability drops sharply.
+#      - Fills at expected price are unlikely (slippage explodes).
+#
+#   b) During extremely low volatility (bottom-decile ATR):
+#      - Moves too small to overcome fees (0.02% maker + slippage).
+#      - EMA and BB signals are meaningless in dead markets.
+#      - Any breakout from compression is a false breakout risk.
+#
+# FIX
+# ---
+# Use NATR + ATR percentile rank to gate entries at both extremes.
+# This is a pre-entry filter that the AdaptiveHybrid (or any strategy)
+# can call before emitting a signal.
+@dataclass(frozen=True)
+class ATREntryGate:
+"""
+Result of the ATR entry filter.
+allowed  : bool   - True = entry is permitted
+reason   : str    - explanation (always populated)
+natr_pct : Decimal | None  - current NATR value
+atr_rank : Decimal | None  - percentile rank 0->1
+"""
+allowed: bool
+reason: str
+natr_pct: Decimal | None = None
+atr_rank: Decimal | None = None
+def atr_entry_gate(
+candles: Iterable[OHLCVCandle],
+*,
+atr_period: int = 14,
+rank_lookback: int = 100,
+# Block entries when ATR rank is above this (too volatile)
+max_atr_rank: Decimal = Decimal("0.85"),
+# Block entries when ATR rank is below this (too quiet / no edge)
+min_atr_rank: Decimal = Decimal("0.05"),
+# Also block when NATR is above this absolute % (e.g. >5% is chaotic)
+max_natr_pct: Decimal = Decimal("5.0"),
+# Also block when NATR is below this (e.g. <0.1% = dead market)
+min_natr_pct: Decimal = Decimal("0.10"),
+) -> ATREntryGate:
+"""
+Returns ATREntryGate.allowed = False if the current ATR environment
+is unsuitable for a new entry.
+HOW TO USE IT
+-------------
+Call this at the top of any strategy's evaluate() before computing
+signal logic.  If not allowed, return a hold with the gate's reason:
+gate = atr_entry_gate(context.candles)
+if not gate.allowed:
+return StrategySignal.hold(
+..., reason=f"ATR gate blocked entry: {gate.reason}"
+)
+Or wire it into the AdaptiveHybrid's visual filter chain so it appears
+in the dashboard metadata.
+"""
+series = list(candles)
+natr_series = normalised_atr(series, atr_period)
+natr_val    = natr_series[-1] if natr_series else None
+rank        = atr_percentile_rank(series, period=atr_period, lookback=rank_lookback)
+if natr_val is None or rank is None:
+return ATREntryGate(
+allowed=True,   # not enough data yet -> don't block warmup
+reason="ATR gate: insufficient history, entry permitted.",
+natr_pct=natr_val,
+atr_rank=rank,
+)
+if natr_val > max_natr_pct:
+return ATREntryGate(
+allowed=False,
+reason=(
+f"ATR gate: NATR {natr_val:.2f}% exceeds max {max_natr_pct}% "
+f"- market is too volatile for reliable entries."
+),
+natr_pct=natr_val,
+atr_rank=rank,
+)
+if natr_val < min_natr_pct:
+return ATREntryGate(
+allowed=False,
+reason=(
+f"ATR gate: NATR {natr_val:.2f}% is below min {min_natr_pct}% "
+f"- market is too quiet; move unlikely to cover fees."
+),
+natr_pct=natr_val,
+atr_rank=rank,
+)
+if rank > max_atr_rank:
+return ATREntryGate(
+allowed=False,
+reason=(
+f"ATR gate: volatility rank {float(rank):.0%} is in the top "
+f"{100*(1-max_atr_rank):.0f}% of recent history - "
+f"chaotic conditions, skipping entry."
+),
+natr_pct=natr_val,
+atr_rank=rank,
+)
+if rank < min_atr_rank:
+return ATREntryGate(
+allowed=False,
+reason=(
+f"ATR gate: volatility rank {float(rank):.0%} is in the bottom "
+f"{100*min_atr_rank:.0f}% of recent history - "
+f"dead market, signals are unreliable."
+),
+natr_pct=natr_val,
+atr_rank=rank,
+)
+return ATREntryGate(
+allowed=True,
+reason=f"ATR gate: NATR {natr_val:.2f}%, rank {float(rank):.0%} - entry permitted.",
+natr_pct=natr_val,
+atr_rank=rank,
+)
+# ============================================================================
+# BONUS:  Dual-period ATR  (fast + slow)
+# ============================================================================
+#
+# PROBLEM IN CURRENT CODE
+# -----------------------
+# Every strategy uses period=14 for everything:
+#   - Stop distance      -> needs a FAST ATR (3-7) to react to recent moves
+#   - Spike filter       -> needs a SLOW ATR (20-30) to define "normal"
+#   - Regime detection   -> needs a SLOW ATR for structural volatility
+#
+# A single ATR(14) is a compromise that's mediocre at all three jobs.
+#
+# FIX
+# ---
+# Expose fast_atr (period=5) and slow_atr (period=20) in IndicatorSnapshot
+# alongside the existing atr (period=14), or replace atr with a named pair.
+#
+# Suggested mapping:
+#   fast_atr  (period=5)  -> stop-loss and take-profit distances
+#   slow_atr  (period=20) -> spike filter threshold, regime volatility scaling
+#   atr       (period=14) -> backward-compat, existing signal confidence calcs
+#
+# The ATR ratio  (fast_atr / slow_atr) is also a useful signal:
+#   ratio > 1.5 -> short-term volatility spike (possible news / manipulation)
+#   ratio < 0.6 -> compression / quiet period (potential breakout setup)
+@dataclass(frozen=True)
+class DualATR:
+fast: Decimal | None     # period=5,  responsive to recent price action
+slow: Decimal | None     # period=20, structural volatility baseline
+ratio: Decimal | None    # fast / slow - >1 means short-term vol expanding
+def dual_atr(
+candles: Iterable[OHLCVCandle],
+*,
+fast_period: int = 5,
+slow_period: int = 20,
+) -> DualATR:
+"""
+Computes fast and slow ATR and their ratio in a single pass.
+HOW TO ADD TO IndicatorSnapshot
+--------------------------------
+1. Add `dual_atr: DualATR | None = None` to IndicatorSnapshot.
+2. In latest_indicator_snapshot(), add:
+from app.data.atr_improvements import dual_atr as compute_dual_atr
+datr = compute_dual_atr(candles, fast_period=5, slow_period=20)
+3. In each strategy, use:
+fast_atr = context.indicators.dual_atr.fast   # for stops
+slow_atr = context.indicators.dual_atr.slow   # for spike filter
+4. Replace max_spike_atr_multiple check in HybridMetaStrategy with:
+candle_range > slow_atr * self.max_spike_atr_multiple
+so that a genuine spike doesn't inflate the baseline and loosen
+future checks.
+"""
+series = list(candles)
+fast_series = average_true_range(series, fast_period)
+slow_series = average_true_range(series, slow_period)
+fast_val = fast_series[-1] if fast_series else None
+slow_val = slow_series[-1] if slow_series else None
+ratio: Decimal | None = None
+if fast_val is not None and slow_val is not None and slow_val > 0:
+ratio = fast_val / slow_val
+return DualATR(fast=fast_val, slow=slow_val, ratio=ratio)
+# ============================================================================
+# Unchanged: your existing average_true_range (kept for reference)
+# ============================================================================
+def average_true_range(
+candles: Iterable[OHLCVCandle],
+period: int = 14,
+) -> list[Decimal | None]:
+"""
+Wilder's smoothed ATR.  Unchanged from your current implementation -
+all new functions above call this as their base.
+"""
+from app.data.indicators import _validate_period  # use your existing validator
+_validate_period(period)
+series = list(candles)
+if not series:
+return []
+true_ranges: list[Decimal] = []
+previous_close: Decimal | None = None
+for candle in series:
+if previous_close is None:
+true_range = candle.high - candle.low
+else:
+true_range = max(
+candle.high - candle.low,
+abs(candle.high - previous_close),
+abs(candle.low - previous_close),
+)
+true_ranges.append(true_range)
+previous_close = candle.close
+result: list[Decimal | None] = [None] * len(series)
+if len(true_ranges) < period:
+return result
+atr = sum(true_ranges[:period], Decimal("0")) / Decimal(period)
+result[period - 1] = atr
+for index in range(period, len(true_ranges)):
+atr = ((atr * Decimal(period - 1)) + true_ranges[index]) / Decimal(period)
+result[index] = atr
+return result
+Implementation Checklist
+Fix look-ahead bias by evaluating candle-close signals but filling at the next candle open, or by explicitly modeling next-bar execution.
+Add durable state persistence for open positions, fills, orders, equity snapshots, and risk events.
+Replace ambiguous fee-rate auto-detection with explicit CLI options or validation.
+Make the rate limiter async/non-blocking or isolate API calls from market-data processing.
+Move indicators toward incremental EMA/ATR updates.
+Add mark-to-market unrealized P&L to the daily loss-limit check.
+Replay missed candles after WebSocket reconnection or block new entries after data gaps.
+Add higher-timeframe confirmation to live trading.
+Fix RSI threshold overlap and BB false reversion conditions.
+Route exit signals from both primary and secondary strategies when regime switches occur.
+Normalize regime thresholds against ATR or ATR percentile rank.
+Add NATR, ATR percentile rank, ATR entry gate, Chandelier exit, ratcheted TP, and dual ATR.
+Add tick-size and step-size rounding for stop-loss, take-profit, and quantity.
+Add alerting through Telegram, email, or webhook for fills, stops, limits, disconnects, and kill-switch events.

@@ -1,0 +1,535 @@
+CoinDCX Trading Bot Audit and Improvement Handoff
+Detailed development summary for coworker AI / engineering handoff
+Scope note: The project ZIP was reviewed without opening or reading obvious secret files such as .env, API keys, secret keys, virtual environments, cache folders, and git metadata. The audit focused on source structure, trading logic, risk controls, bugs, backtesting realism, and ATR filtering.
+Area | Assessment
+Current maturity | Good research and paper-trading foundation; not yet safe for live futures deployment.
+Main danger zone | Futures-specific risk: scale-ins, leverage, liquidation distance, incomplete live execution recovery, and optimistic backtests.
+Best current direction | Prioritize security cleanup, basket-level risk checks, liquidation guardrails, ATR entry filters, and harsh backtesting before any live trading.
+Likely candidate area | B-SOL_USDT, 1h timeframe, EMA/RSI conservative style - only after walk-forward and harsh execution tests.
+Implementation Map
+This document is structured as a handoff. Each section explains the issue, why it matters, and what to implement. Suggested development tickets are grouped near the end.
+Priority | Workstream | Goal
+P0 | Security cleanup | Remove secrets/runtime artifacts from shared archives and logs.
+P0 | Basket-level risk | Prevent scale-ins from exceeding total allowed loss at the shared stop.
+P0 | Liquidation guard | Reject trades where liquidation is too close to stop-loss.
+P1 | ATR filtering | Block dead/choppy or violently unstable volatility regimes before entry.
+P1 | Backtest realism | Add spread, slippage, funding, partial fills, and harsh execution modes.
+P2 | Persistence/refactor | Add durable order/fill/state storage and split oversized modules.
+1. Security and Project Packaging
+Problem
+The ZIP contains sensitive and unnecessary runtime files. Even if the .env file was not opened during review, its presence in the archive is dangerous.
+.env
+.venv/
+logs/
+outputs/
+research/backtests/
+cache folders
+history files
+Why this matters
+If this ZIP is sent to another person, uploaded online, pushed to GitHub, or passed into an external AI/code-review tool, API keys and secret keys can leak.
+Required fix
+Create a clean export script that excludes secrets and runtime artifacts before zipping the project.
+mkdir clean_bot_export
+rsync -av coindcx-trading-bot/ clean_bot_export/coindcx-trading-bot \
+--exclude ".env" \
+--exclude ".venv" \
+--exclude "__pycache__" \
+--exclude ".git" \
+--exclude "logs" \
+--exclude "research/backtests" \
+--exclude "*.xlsx" \
+--exclude "*.zip"
+zip -r coindcx-trading-bot-clean.zip clean_bot_export/coindcx-trading-bot
+Add a safety scan that fails if the final archive contains secret-like files or strings:
+.env
+SECRET
+API_KEY
+PRIVATE_KEY
+TOKEN
+api_secret
+api_key
+Additional recommendation
+If the current ZIP was shared anywhere, rotate the CoinDCX API keys immediately.
+2. Auth Diagnostic Leakage
+Problem
+The auth diagnostic command in app/main.py prints partial key/signature fragments such as API key prefix/suffix or signature prefix/suffix. Even partial fragments are unnecessary.
+Required fix
+Replace any fragment printing with boolean checks only:
+print("API key loaded:", bool(settings.api_key))
+print("Secret loaded:", bool(settings.api_secret))
+print("Signature generated:", bool(signature))
+Do not print API key fragments, secret key fragments, signature fragments, or full request bodies containing authentication data.
+3. Critical Trading Issue: Scale-In Risk Is Not Basket-Aware
+Problem
+The bot allows scale-ins when allow_scale_in is enabled and direction matches the current position. However, it does not appear to recompute the full position risk after adding quantity.
+Why this matters
+A trade can look safe individually while the combined position is unsafe. For example: the first trade risks 1% of equity, then price moves against the trade, then a scale-in is accepted. The average entry changes, size increases, and the shared stop may now imply a 2%, 3%, 5%, or larger total loss.
+Required fix
+Before allowing any scale-in, calculate basket-level risk at the combined stop-loss.
+new_total_qty = current_qty + new_qty
+new_avg_entry = (
+current_avg_entry * current_qty + new_entry * new_qty
+) / new_total_qty
+loss_at_stop = abs(new_avg_entry - stop_price) * new_total_qty
+if loss_at_stop > equity * max_risk_per_trade:
+reject_trade("Scale-in exceeds basket risk limit")
+This check should run before order acceptance in both the paper broker and the live execution path.
+Also add
+max_total_account_risk
+max_open_notional_exposure
+max_risk_per_symbol
+max_positions_per_symbol
+max_scale_ins_per_position
+max_daily_loss
+4. Liquidation Risk Guard
+Problem
+For futures trading, a stop-loss alone is insufficient. The bot must check whether the liquidation price is safely farther away than the stop-loss.
+Required rule
+distance(entry, liquidation) > distance(entry, stop_loss) * safety_multiplier
+Example: if stop-loss is 1.5% away, liquidation should not be only 2% away. That is too fragile for live futures.
+Suggested multiplier
+Start with safety_multiplier = 2.0 or 3.0. If the stop-loss is 1.5% away, liquidation should ideally be at least 3% to 4.5% away.
+Required additions
+liquidation price calculation
+maintenance margin handling
+max leverage allowed per symbol
+position margin model
+isolated/cross margin behavior
+5. Backtesting Is Too Clean
+Problem
+The backtest engine is useful, but too optimistic for real futures execution. It does not yet punish the strategy enough for exchange friction and failure modes.
+Missing or weakly modeled
+funding fees
+spread
+slippage
+partial fills
+market order impact
+stop-loss slippage
+exchange downtime
+rejected orders
+websocket disconnects
+REST/websocket disagreement
+liquidation behavior
+maintenance margin
+tick size
+lot size
+minimum quantity
+symbol-specific leverage limits
+Required improvement
+BACKTEST_SPREAD_BPS = 3
+BACKTEST_MARKET_SLIPPAGE_BPS = 5
+BACKTEST_STOP_SLIPPAGE_BPS = 10
+BACKTEST_FUNDING_BPS_PER_8H = 1
+BACKTEST_PARTIAL_FILL_PROBABILITY = 0.15
+Run every strategy under multiple execution modes:
+clean mode
+normal exchange mode
+bad liquidity mode
+panic candle mode
+Principle: if a strategy only works in clean mode, it is not live-ready.
+6. Sharpe Ratio Is Misleading Across Timeframes
+Problem
+The current Sharpe calculation appears to annualize using sample length. This makes 1m, 5m, 1h, and 4h strategies difficult to compare fairly.
+Required fix
+Use timeframe-aware annualization.
+CANDLES_PER_YEAR = {
+"1m": 365 * 24 * 60,
+"5m": 365 * 24 * 12,
+"15m": 365 * 24 * 4,
+"1h": 365 * 24,
+"4h": 365 * 6,
+"1D": 365,
+}
+sharpe = mean_return / std_return * sqrt(CANDLES_PER_YEAR[timeframe])
+Alternative: rename the current metric to sample_sharpe and stop comparing it across candle intervals.
+7. Candle Gap Handling
+Problem
+CandleBuilder closes the current candle when the next trade arrives, but it does not appear to emit empty candles for skipped intervals. For lower-liquidity periods, time can silently disappear from indicators.
+Why this matters
+Indicators like EMA, RSI, ATR, Bollinger Bands, and volume averages assume consistent candle spacing. A skipped sequence can distort signals if treated as a normal next candle.
+Possible policies
+Policy A: emit flat candles for gaps using previous close.
+Policy B: mark gaps as missing and prevent indicator updates.
+Policy C: reject strategy signals after large data gaps.
+Recommendation: use Policy A for visualization and Policy C for trading decisions.
+Live-trading rule
+Do not open a new position after a large data gap.
+Do not scale in after a large data gap.
+Allow only reduce-only exits until data is stable again.
+8. Market Order time_in_force Footgun
+Problem
+FuturesOrderRequest rejects market orders with time_in_force, but the default appears to be good_till_cancel. This can accidentally create invalid market orders unless time_in_force=None is explicitly passed.
+Required fix
+if order_type == "market_order":
+time_in_force = None
+Better design: provide separate constructors to prevent invalid combinations.
+FuturesOrderRequest.market(...)
+FuturesOrderRequest.limit(...)
+9. Retry Signing Should Regenerate Timestamp and Signature
+Problem
+In coindcx_rest.py, signed requests appear to prepare the body/signature once and then reuse them across retries. Authenticated retries should regenerate timestamp, request body, and signature each time.
+Required fix
+for attempt in range(max_retries):
+body = build_body_with_fresh_timestamp()
+signature = sign(body, api_secret)
+response = send_request(body, signature)
+if response.ok:
+return response
+Reason: reused signatures or timestamps can become stale and cause authentication failures.
+10. Same-Candle Stop-Loss / Take-Profit Handling
+Current behavior
+When both stop-loss and take-profit are touched inside the same candle, the paper broker seems to trigger stop-loss first.
+Assessment
+This is conservative and safe. It may understate some backtest results, but that is better than overstating them.
+Required improvement
+same_candle_policy = "pessimistic" | "optimistic" | "open_path" | "lower_timeframe"
+Recommended default: pessimistic.
+Policy | Meaning
+pessimistic | If SL and TP are both hit in the same candle, assume SL happened first.
+optimistic | Assume TP happened first.
+open_path | Infer the likely path from open/high/low/close structure.
+lower_timeframe | Use smaller timeframe data to resolve candle path.
+11. Dynamic ATR Take-Profit May Become an Escaping Target
+Problem
+Dynamic ATR stop updates trail correctly in one direction, but take-profit appears to be recalculated from current close every candle. For long positions, if price rises, TP keeps moving upward.
+# Current problematic pattern
+long_stop = max(old_stop, new_stop)
+short_stop = min(old_stop, new_stop)
+take_profit = candle.close + target_distance
+Why this matters
+This can turn take-profit into a constantly escaping target. It may be acceptable for trend-following, but dangerous for mean-reversion strategies because winners can turn into reversals before TP is hit.
+Fix options
+Option 1: keep original take-profit.
+take_profit = position.take_profit
+Option 2: move TP only in favorable direction but anchor to entry.
+# Long
+take_profit = max(position.take_profit, entry_price + target_distance)
+# Short
+take_profit = min(position.take_profit, entry_price - target_distance)
+Option 3: make behavior configurable.
+take_profit_mode = "fixed" | "entry_atr" | "trailing_atr" | "none"
+Recommended default: fixed or entry_atr. Use trailing_atr only for trend-following strategies.
+12. Current Strategy Findings
+From internal backtest summaries, the better-looking results were mostly around SOL 1h strategies.
+Candidate | Comment
+B-SOL_USDT, 1h, ema_conservative_rsi | Best-looking current candidate area; still requires harsh testing.
+B-SOL_USDT, 1h, adaptive_default | Promising but must be tested out of sample.
+B-SOL_USDT, 1h, ema_default | Usable candidate for comparison.
+B-SOL_USDT, 4h, adaptive_default | Lower trade frequency; could be more robust after validation.
+Approximate top snapshot observed
+Metric | Value
+Pair | B-SOL_USDT
+Timeframe | 1h
+Strategy | ema_conservative_rsi
+Return | around +17.62%
+Trades | 21
+Win rate | around 61.90%
+Profit factor | around 3.10
+Max drawdown | around 2.30%
+Caution
+The sample size is small. Do not treat this as live-ready. The 1m and 5m strategies looked weaker and are likely to be eaten by fees, spread, slippage, noise, false breakouts, latency, and stop slippage.
+Recommendation: disable 1m/5m live candidates until they survive harsh backtests. Focus first on 1h and maybe 4h candidates.
+13. Strategy Selection Should Not Be Based Only on Return
+Problem
+Picking the highest-return config is dangerous. High return can come from overfitting, excess leverage, too few trades, a lucky regime, hidden drawdown, or a bad risk/reward distribution.
+Better scoring system
+score =
+return_pct
+- 2.0 * max_drawdown_pct
++ 3.0 * profit_factor
++ 0.2 * trade_count
+- penalty_for_low_sample_size
+- penalty_for_high_leverage
+Also penalize too few trades, large average loss, high leverage, max consecutive losses, low expectancy, bad harsh-mode performance, and performance concentrated in one lucky trade.
+Preferred candidate profile
+A boring +8% return strategy with 2% drawdown and stable trade distribution is better than a +40% return strategy with 35% drawdown and high leverage.
+14. Walk-Forward Validation
+Problem
+Backtests can overfit. The bot needs a walk-forward workflow so strategies are judged on unseen periods.
+Testing flow
+Train period 1 -> Test period 1
+Train period 2 -> Test period 2
+Train period 3 -> Test period 3
+Example:
+Optimize on Jan-Mar -> Test on Apr
+Optimize on Feb-Apr -> Test on May
+Optimize on Mar-May -> Test on Jun
+A strategy is acceptable only if
+it performs decently across multiple unseen periods
+drawdown remains controlled
+profit factor remains stable
+trade count is not too low
+performance is not dependent on one coin only
+15. Architecture Improvements
+Split app/main.py
+app/main.py is around 1,200+ lines and handles too many responsibilities. Split it into smaller command modules:
+app/cli/backtest_commands.py
+app/cli/live_commands.py
+app/cli/research_commands.py
+app/cli/auth_commands.py
+app/cli/dashboard_commands.py
+Split dashboard code
+app/dashboard/web.py is also large and contains too much inline UI. Split it into:
+app/dashboard/routes.py
+app/dashboard/templates/
+app/dashboard/static/
+Or, if keeping it simple:
+web_handlers.py
+web_templates.py
+web_state.py
+Add persistence
+Current state appears too memory-first. Add SQLite persistence for restart recovery and auditing.
+orders
+fills
+positions
+equity_snapshots
+risk_events
+strategy_signals
+api_errors
+kill_switch_events
+Add idempotency keys
+Every live order should have an idempotency key so the bot cannot double-place orders after a crash, retry, or reconnect.
+strategy_id + pair + candle_timestamp + signal_direction
+16. Core Live-Trading Safety System
+Before live trading, add these risk controls:
+Max total account risk
+Max open notional exposure
+Max risk per symbol
+Max daily realized + unrealized loss
+Cooldown after N losses
+Cooldown after large candle volatility
+Kill switch if websocket disconnects
+Kill switch if REST and websocket disagree
+Reject order if stop-loss is missing
+Reject order if liquidation price is too close
+Reject order if ATR is unavailable
+Reject order if candle data has gaps
+Reject order if exchange min/max quantity rules fail
+Reject order if spread is too wide
+Reject order if funding is too unfavorable
+Kill switch examples
+websocket disconnects for more than X seconds
+position exists on exchange but not in local state
+local state shows position but exchange does not
+order is open longer than expected
+stop-loss order fails
+daily loss exceeds limit
+API returns repeated auth errors
+exchange returns repeated order rejections
+17. ATR Filtering Audit
+The bot currently has ATR-based exits, but not a full ATR entry filter.
+What exists now
+Area | Current state
+ATR calculation | app/data/indicators.py calculates standard true range and uses Wilder-style smoothing. This appears okay.
+EMA-RSI exits | app/strategies/ema_rsi_trend.py uses ATR for stop-loss and take-profit sizing. Defaults: stop_atr_multiple=1.5, take_profit_atr_multiple=3.
+Hybrid spike filter | app/strategies/hybrid_meta.py has max_spike_atr_multiple=3.5. It blocks entry if latest candle range exceeds ATR * 3.5.
+Backtest dynamic exits | app/backtest/engine.py supports ATR dynamic exits; PaperBroker.update_dynamic_atr_exits recalculates stops after closed candles.
+Main ATR problem
+Current ATR usage is mostly exit sizing, spike candle blocking, and dynamic trailing exit behavior. It does not fully answer whether volatility is too low, too high, expanding too fast, collapsing, or abnormal relative to recent ATR.
+Verdict: the ATR system is half-built.
+18. Add ATR Percentage Filter
+Purpose
+Block trades when volatility is too low or too high. Calculate ATR as a percentage of price:
+atr_pct = (atr / close) * 100
+Timeframe | Suggested min ATR% | Suggested max ATR%
+5m | 0.08 | 0.90
+15m | 0.18 | 1.60
+1h | 0.35 | 3.00
+4h | 0.80 | 5.50
+These are starting values only. They must be backtested and tuned.
+Implementation helper
+from decimal import Decimal
+def _atr_volatility_filter(
+*,
+close: Decimal,
+atr: Decimal | None,
+min_atr_pct: Decimal,
+max_atr_pct: Decimal,
+) -> tuple[bool, str, Decimal | None]:
+if atr is None or atr <= 0 or close <= 0:
+return False, "ATR unavailable.", None
+atr_pct = (atr / close) * Decimal("100")
+if atr_pct < min_atr_pct:
+return False, f"ATR too low: {atr_pct:.4f}% below {min_atr_pct}%.", atr_pct
+if atr_pct > max_atr_pct:
+return False, f"ATR too high: {atr_pct:.4f}% above {max_atr_pct}%.", atr_pct
+return True, "ATR volatility accepted.", atr_pct
+Usage before entry
+atr_ok, atr_reason, atr_pct = _atr_volatility_filter(
+close=latest.close,
+atr=atr_values[-1],
+min_atr_pct=Decimal("0.35"),
+max_atr_pct=Decimal("3.00"),
+)
+metadata["atr_pct"] = atr_pct
+metadata["atr_filter_reason"] = atr_reason
+if not atr_ok:
+return self._hold(context, atr_reason, metadata)
+19. Make ATR Filter Interval-Aware
+Hardcoding one ATR range is wrong because 5m and 4h candles behave differently. Add interval-based defaults:
+ATR_FILTERS = {
+"5m": {
+"min": Decimal("0.08"),
+"max": Decimal("0.90"),
+},
+"15m": {
+"min": Decimal("0.18"),
+"max": Decimal("1.60"),
+},
+"1h": {
+"min": Decimal("0.35"),
+"max": Decimal("3.00"),
+},
+"4h": {
+"min": Decimal("0.80"),
+"max": Decimal("5.50"),
+},
+}
+Then select the correct config from context.interval:
+filter_config = ATR_FILTERS.get(context.interval, ATR_FILTERS["1h"])
+atr_ok, atr_reason, atr_pct = _atr_volatility_filter(
+close=latest.close,
+atr=atr_values[-1],
+min_atr_pct=filter_config["min"],
+max_atr_pct=filter_config["max"],
+)
+20. Add ATR Regime Filter
+Purpose
+ATR percentage tells absolute volatility. ATR regime tells whether current volatility is abnormal compared to recent volatility.
+atr_ratio = current_atr / average_atr_lookback
+ATR ratio | Interpretation
+< 0.70 | Market is too quiet. Avoid trend entries.
+0.70 to 1.80 | Normal tradable volatility.
+> 1.80 | Market is too hot or unstable. Avoid or reduce size.
+def _atr_regime_filter(
+atr_values: list[Decimal | None],
+*,
+lookback: int = 50,
+min_ratio: Decimal = Decimal("0.70"),
+max_ratio: Decimal = Decimal("1.80"),
+) -> tuple[bool, str, Decimal | None]:
+valid_atrs = [value for value in atr_values if value is not None and value > 0]
+if len(valid_atrs) < lookback:
+return False, "Not enough ATR history for regime filter.", None
+current_atr = valid_atrs[-1]
+baseline = sum(valid_atrs[-lookback:], Decimal("0")) / Decimal(lookback)
+if baseline <= 0:
+return False, "Invalid ATR baseline.", None
+ratio = current_atr / baseline
+if ratio < min_ratio:
+return False, f"ATR regime too quiet: {ratio:.2f}x baseline.", ratio
+if ratio > max_ratio:
+return False, f"ATR regime too hot: {ratio:.2f}x baseline.", ratio
+return True, "ATR regime accepted.", ratio
+21. Recommended ATR System
+Use three ATR layers:
+Layer | Role
+Layer 1: ATR percentage filter | Blocks dead markets and extreme volatility.
+Layer 2: ATR regime filter | Blocks abnormal compression or expansion.
+Layer 3: ATR-based SL/TP | Sizes exits according to volatility.
+Current bot has mostly Layer 3 and a small part of Layer 2 through the spike candle check. It needs full Layer 1 and better Layer 2.
+Suggested strategy config
+enable_atr_filter: bool = True
+min_atr_pct: Decimal = Decimal("0.35")
+max_atr_pct: Decimal = Decimal("3.00")
+atr_regime_lookback: int = 50
+min_atr_regime_ratio: Decimal = Decimal("0.70")
+max_atr_regime_ratio: Decimal = Decimal("1.80")
+Block entry when:
+ATR is unavailable
+ATR% is below min
+ATR% is above max
+ATR regime ratio is too low
+ATR regime ratio is too high
+latest candle range > ATR * max_spike_atr_multiple
+22. ATR-Based Position Sizing
+Once ATR filters are added, position sizing should use ATR stop distance.
+risk_amount = equity * risk_per_trade
+stop_distance = ATR * stop_atr_multiple
+quantity = risk_amount / stop_distance
+Then apply exchange and risk constraints: max leverage, max notional, min quantity, step size, tick size, available margin, and liquidation distance.
+risk_amount = equity * Decimal("0.01")
+stop_distance = atr * Decimal("1.5")
+raw_qty = risk_amount / stop_distance
+qty = round_to_step_size(raw_qty, symbol_step_size)
+notional = qty * entry_price
+if notional > max_allowed_notional:
+reject_trade("Notional too high")
+if liquidation_too_close(entry_price, stop_price, leverage):
+reject_trade("Liquidation too close")
+if qty < min_qty:
+reject_trade("Quantity below exchange minimum")
+23. ATR Filter Soft and Hard Modes
+Recommended behavior:
+Condition | Action
+ATR too low | Reject entry.
+ATR too high | Reject entry or reduce position size.
+ATR regime too hot | Reject entry or halve risk.
+ATR spike candle | Reject entry.
+ATR unavailable | Reject entry.
+Possible config:
+atr_high_volatility_action = "reject"  # or "reduce_size"
+atr_high_volatility_size_multiplier = Decimal("0.50")
+This lets the bot trade smaller during elevated but not insane volatility.
+24. Recommended Order of Work
+Remove .env and runtime junk from archives.
+Rotate keys if ZIP was shared.
+Remove key/signature fragments from auth diagnostics.
+Add basket-level risk validation for scale-ins.
+Add liquidation-distance checks.
+Fix timeframe-aware Sharpe ratio.
+Add candle gap policy.
+Add ATR percentage filter.
+Add ATR regime filter.
+Fix or configure dynamic ATR take-profit behavior.
+Add funding, spread, slippage, and partial fills to backtests.
+Add walk-forward validation.
+Disable 1m/5m live candidates until harsh backtests pass.
+Add SQLite persistence.
+Add idempotency keys.
+Refactor app/main.py.
+Refactor dashboard code.
+25. Suggested Development Tickets
+# | Ticket | Purpose | Acceptance criteria
+1 | Clean export and secret safety | Create a script that builds a shareable ZIP while excluding secrets and runtime files. | No .env/.venv/logs/backtest outputs in ZIP; fail if secret-like strings are found.
+2 | Remove auth diagnostic leakage | Modify auth diagnostic command to print only boolean status. | No key/signature fragments in console or logs; tests verify masking.
+3 | Basket-aware scale-in risk | Before scale-ins, compute combined position risk at stop-loss. | Reject scale-in if basket risk exceeds max risk; long/short tests in paper and live layers.
+4 | Liquidation distance guard | Add liquidation safety validation. | Reject trades where liquidation is too close to stop-loss; support long and short.
+5 | Timeframe-aware Sharpe | Fix Sharpe annualization. | Use interval-specific candles per year; report basis clearly.
+6 | Candle gap policy | Detect missing candles and prevent bad signals. | Signal metadata includes gap warning; entries blocked after large gaps.
+7 | ATR percentage filter | Add ATR% filter to strategies. | Entry blocked below min ATR% and above max ATR%; metadata includes atr_pct.
+8 | ATR regime filter | Compare current ATR with rolling ATR baseline. | Entry blocked when ATR ratio too low/high; metadata includes atr_regime_ratio.
+9 | Dynamic ATR TP mode | Make dynamic take-profit behavior configurable. | Support fixed, entry-anchored, and trailing ATR TP modes.
+10 | Harsh backtesting mode | Add realistic execution simulation. | Model spread, slippage, funding, partial fills, stop slippage, and rejected orders.
+11 | Walk-forward validation | Add rolling train/test validation command. | Report out-of-sample results and reject unstable strategies.
+12 | SQLite persistence | Persist orders, fills, positions, signals, and risk events. | Bot can restart without losing state; all trades are auditable.
+26. Final Assessment
+The bot is currently best described as: good research/paper-trading foundation, but not yet safe for live futures trading.
+Main strengths
+structured strategy code
+ATR calculation
+ATR-based exits
+backtesting support
+unit tests
+some risk controls
+paper-trading functionality
+foundation is modular enough to improve
+Main weaknesses
+scale-in risk is not basket-aware
+liquidation risk is under-modeled
+ATR filtering is incomplete
+backtests are too optimistic
+Sharpe ratio may be misleading across timeframes
+candle gaps can distort signals
+live execution safety is incomplete
+dynamic ATR TP may behave like an escaping target
+project ZIP includes secrets/runtime files
+app/main.py and dashboard code are too large
+Best immediate focus
+security cleanup
+basket-level risk
+liquidation guard
+ATR entry filtering
+backtest realism
+walk-forward validation
+Blunt conclusion: The bot has a workable skeleton, but the dangerous parts are exactly where futures bots usually fail: scale-ins, leverage, liquidation, unrealistic backtests, volatility regime detection, and live execution recovery.
