@@ -198,6 +198,9 @@ class DashboardStateTests(unittest.TestCase):
         self.assertEqual(payload["config"]["pair"], "B-SOL_USDT")
         self.assertEqual(payload["metrics"]["final_equity"], "1053")
         self.assertEqual(payload["counts"]["candles_loaded"], 3)
+        self.assertIn("signal_funnel", payload)
+        self.assertEqual(payload["signal_funnel"]["requested_candles"], 3)
+        self.assertEqual(payload["signal_funnel"]["actual_candles_loaded"], 3)
         self.assertEqual(len(payload["equity_curve"]), 2)
         self.assertEqual(payload["equity_curve"][-1]["equity"], "1053")
         self.assertEqual(payload["run_quality"]["label"], "No Trades")
@@ -417,7 +420,150 @@ class DashboardStateTests(unittest.TestCase):
             fills=[],
         )
 
-        self.assertEqual(classify_run_quality(result)["label"], "Strong Paper Run")
+        self.assertEqual(classify_run_quality(result)["label"], "Watchlist+")
+
+    def test_backtest_payload_contains_signal_funnel_with_blocked_reasons(self) -> None:
+        config = BacktestConfig(
+            pair="B-SOL_USDT",
+            interval="1h",
+            starting_equity=Decimal("1000"),
+            leverage=Decimal("3"),
+            requested_candles=1000,
+        )
+        account = PaperAccountSnapshot(
+            starting_equity=Decimal("1000"),
+            realized_pnl=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            fees_paid=Decimal("0"),
+            equity=Decimal("1000"),
+            open_position_count=0,
+            open_notional=Decimal("0"),
+        )
+        signal = StrategySignal(
+            strategy_name="test",
+            pair="B-SOL_USDT",
+            interval="1h",
+            action=SignalAction.ENTER_LONG,
+            direction=SignalDirection.LONG,
+            confidence=Decimal("1"),
+            reason="test",
+            timestamp_ms=1,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("90"),
+            metadata={"signal_funnel_raw_candidate": True, "signal_funnel_raw_direction": "long"},
+        )
+        reports = [
+            PaperExecutionReport(
+                accepted=False,
+                status=PaperExecutionStatus.REJECTED,
+                reason="Components do not agree on trend.",
+                account=account,
+                signal=signal,
+            ),
+            PaperExecutionReport(
+                accepted=False,
+                status=PaperExecutionStatus.REJECTED,
+                reason="Visual screen blocked entry.",
+                account=account,
+                signal=signal,
+            ),
+        ]
+        result = BacktestResult(
+            config=config,
+            candles_loaded=500,
+            candles_used=500,
+            metrics=BacktestMetrics(
+                starting_equity=Decimal("1000"),
+                final_equity=Decimal("1000"),
+                total_return=Decimal("0"),
+                total_return_pct=Decimal("0"),
+                realized_pnl=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                fees_paid=Decimal("0"),
+                net_pnl=Decimal("0"),
+                trade_count=0,
+                winning_trades=0,
+                losing_trades=4,
+                win_rate_pct=None,
+                average_win=None,
+                average_loss=None,
+                profit_factor=None,
+                max_drawdown=Decimal("0"),
+                max_drawdown_pct=Decimal("0"),
+                sharpe_ratio=None,
+            ),
+            final_account=account,
+            equity_curve=[_equity_point(1, Decimal("1000"))],
+            trades=[],
+            orders=[],
+            fills=[],
+            reports=reports,
+        )
+
+        payload = build_backtest_dashboard_payload(result)
+        funnel = payload["signal_funnel"]
+
+        self.assertEqual(funnel["requested_candles"], 1000)
+        self.assertEqual(funnel["actual_candles_loaded"], 500)
+        self.assertEqual(funnel["block_reasons"]["agreement_below_minimum"], 1)
+        self.assertEqual(funnel["block_reasons"]["visual_screen_blocked"], 1)
+        self.assertEqual(funnel["raw_long_candidates"], 2)
+
+    def test_backtest_payload_handles_missing_funnel_fields(self) -> None:
+        # Simulate a result that might be missing some fields if backtest_signal_funnel was older
+        config = BacktestConfig(
+            pair="B-SOL_USDT",
+            interval="1h",
+            starting_equity=Decimal("1000"),
+            leverage=Decimal("3"),
+        )
+        account = PaperAccountSnapshot(
+            starting_equity=Decimal("1000"),
+            realized_pnl=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            fees_paid=Decimal("0"),
+            equity=Decimal("1000"),
+            open_position_count=0,
+            open_notional=Decimal("0"),
+        )
+        result = BacktestResult(
+            config=config,
+            candles_loaded=1,
+            candles_used=1,
+            metrics=BacktestMetrics(
+                starting_equity=Decimal("1000"),
+                final_equity=Decimal("1000"),
+                total_return=Decimal("0"),
+                total_return_pct=Decimal("0"),
+                realized_pnl=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                fees_paid=Decimal("0"),
+                net_pnl=Decimal("0"),
+                trade_count=0,
+                winning_trades=0,
+                losing_trades=0,
+                win_rate_pct=None,
+                average_win=None,
+                average_loss=None,
+                profit_factor=None,
+                max_drawdown=Decimal("0"),
+                max_drawdown_pct=Decimal("0"),
+                sharpe_ratio=None,
+            ),
+            final_account=account,
+            equity_curve=[_equity_point(1, Decimal("1000"))],
+            trades=[],
+            orders=[],
+            fills=[],
+        )
+
+        payload = build_backtest_dashboard_payload(result)
+        # Even if backtest_signal_funnel was somehow compromised, to_dict should still provide a structure.
+        # We ensure it is present and has the expected keys.
+        self.assertIn("signal_funnel", payload)
+        self.assertIn("requested_candles", payload["signal_funnel"])
+        self.assertIn("block_reasons", payload["signal_funnel"])
+        self.assertIn("cooldown_blocked", payload["signal_funnel"]["block_reasons"])
 
 
 if __name__ == "__main__":

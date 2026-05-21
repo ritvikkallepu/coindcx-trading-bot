@@ -49,9 +49,13 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         settings: Settings,
         defaults: DashboardDefaults,
     ) -> None:
+        import threading
         super().__init__(server_address, DashboardRequestHandler)
         self.settings = settings
         self.defaults = defaults
+        self._paper_thread: threading.Thread | None = None
+        self._paper_loop: Any = None  # PaperTradingLoop instance
+        self._paper_lock = threading.Lock()
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -77,6 +81,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             params = _flatten_query(parse_qs(parsed.query))
             self._send_backtest(params)
             return
+        if parsed.path == "/api/paper-status":
+            from app.live.paper_loop import get_live_state
+            self._send_json(get_live_state())
+            return
+        if parsed.path == "/api/paper-trades":
+            self._send_paper_trades()
+            return
         self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -84,10 +95,117 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/backtest":
             self._send_backtest(self._read_json_body())
             return
+        if parsed.path == "/api/paper-start":
+            self._handle_paper_start(self._read_json_body())
+            return
+        if parsed.path == "/api/paper-stop":
+            self._handle_paper_stop()
+            return
         self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: object) -> None:
         logging.getLogger("app.dashboard").debug(format, *args)
+
+    def _handle_paper_start(self, params: dict[str, Any]) -> None:
+        import threading
+        from app.live.paper_loop import PaperTradingLoop
+        from app.live.paper_loop import get_live_state
+        from app.strategies.defaults import STRATEGY_CHOICES
+        from app.backtest.data_loader import REST_RESOLUTION_BY_INTERVAL
+
+        state = get_live_state()
+        if state["running"]:
+            self._send_json({"error": "Paper loop is already running."}, 
+                            status=HTTPStatus.CONFLICT)
+            return
+
+        pair = str(params.get("pair") or self.server.settings.default_pair)
+        interval = str(params.get("interval") or "15m")
+        strategy = str(params.get("strategy") or "adaptive_hybrid")
+        
+        if interval not in REST_RESOLUTION_BY_INTERVAL:
+            self._send_json({"error": f"Unsupported interval: {interval}"}, 
+                            status=HTTPStatus.BAD_REQUEST)
+            return
+        if strategy not in STRATEGY_CHOICES:
+            self._send_json({"error": f"Unknown strategy: {strategy}"}, 
+                            status=HTTPStatus.BAD_REQUEST)
+            return
+
+        settings = self.server.settings
+        # Override paper_starting_equity and intrabar settings from params if provided
+        from decimal import Decimal, InvalidOperation
+        starting_equity = settings.paper_starting_equity
+        if params.get("starting_equity"):
+            try:
+                starting_equity = Decimal(str(params["starting_equity"]))
+            except InvalidOperation:
+                pass
+
+        paper_intrabar_enabled = bool(params.get("paper_intrabar_enabled", settings.paper_intrabar_enabled))
+        strategy_interval = str(params.get("strategy_interval") or interval)
+        execution_interval = str(params.get("execution_interval") or "1m")
+        use_partial_parent_candle = bool(params.get("use_partial_parent_candle", settings.use_partial_parent_candle))
+        max_entries_per_parent_candle = int(params.get("max_entries_per_parent_candle", settings.max_entries_per_parent_candle))
+
+        # Build a modified settings
+        from dataclasses import replace as dc_replace
+        effective_settings = dc_replace(
+            settings, 
+            paper_starting_equity=starting_equity,
+            paper_intrabar_enabled=paper_intrabar_enabled,
+            strategy_interval=strategy_interval,
+            execution_interval=execution_interval,
+            use_partial_parent_candle=use_partial_parent_candle,
+            max_entries_per_parent_candle=max_entries_per_parent_candle
+        )
+
+        loop = PaperTradingLoop(effective_settings, strategy_name=strategy)
+        
+        with self.server._paper_lock:
+            self.server._paper_loop = loop
+
+        def run_loop():
+            try:
+                loop.run(pair, interval)
+            except Exception as exc:
+                from app.live.paper_loop import _update_live_state
+                _update_live_state(running=False, error=str(exc))
+                logging.getLogger(__name__).exception("Paper loop crashed: %s", exc)
+
+        t = threading.Thread(target=run_loop, daemon=True, name="paper-loop")
+        with self.server._paper_lock:
+            self.server._paper_thread = t
+        t.start()
+        self._send_json({"started": True, "pair": pair, "interval": interval, 
+                         "strategy": strategy})
+
+    def _handle_paper_stop(self) -> None:
+        with self.server._paper_lock:
+            loop = self.server._paper_loop
+        if loop is None:
+            self._send_json({"error": "No paper loop is running."}, 
+                            status=HTTPStatus.CONFLICT)
+            return
+        loop.stop()
+        self._send_json({"stopped": True})
+
+    def _send_paper_trades(self) -> None:
+        import csv
+        from pathlib import Path
+        path = Path("paper_trades.csv")
+        if not path.exists():
+            self._send_json({"trades": []})
+            return
+        trades = []
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    trades.append(dict(row))
+            self._send_json({"trades": trades[-50:]})  # last 50 trades
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _send_backtest(self, params: dict[str, Any]) -> None:
         try:
@@ -185,6 +303,10 @@ def run_backtest_for_dashboard(
         params.get("risk_per_trade_pct"),
         settings.risk.max_risk_per_trade_pct,
     )
+    max_daily_loss_pct = _decimal_param(
+        params.get("max_daily_loss_pct"),
+        settings.risk.max_daily_loss_pct,
+    )
     compound_risk_equity = _bool_param(
         params.get("compound_risk_equity"),
         defaults.compound_risk_equity,
@@ -264,6 +386,10 @@ def run_backtest_for_dashboard(
         params.get("atr_take_profit_multiple"),
         name="atr_take_profit_multiple",
     ) or defaults.atr_take_profit_multiple
+    atr_trailing_multiple = _optional_decimal_param(
+        params.get("atr_trailing_multiple"),
+        name="atr_trailing_multiple",
+    ) or defaults.atr_trailing_multiple
     atr_take_profit_mode = _atr_take_profit_mode_param(
         params.get("atr_take_profit_mode"),
         defaults.atr_take_profit_mode,
@@ -398,6 +524,7 @@ def run_backtest_for_dashboard(
         atr_period=atr_period,
         atr_stop_multiple=atr_stop_multiple,
         atr_take_profit_multiple=atr_take_profit_multiple,
+        atr_trailing_multiple=atr_trailing_multiple,
         atr_take_profit_mode=atr_take_profit_mode,
         execution_interval=execution_interval or None,
         intrabar_reentry_enabled=intrabar_reentry_enabled,
@@ -406,12 +533,20 @@ def run_backtest_for_dashboard(
         stop_loss_cooldown_candles=stop_loss_cooldown_candles,
         max_consecutive_losses=max_consecutive_losses,
         loss_cooldown_candles=loss_cooldown_candles,
+        max_daily_loss_pct=max_daily_loss_pct,
     )
     engine = BacktestEngine(
         config=config,
         strategy_engine=strategy_engine_for_name(strategy),
         risk_manager=RiskManager(
-            replace(settings.risk, max_risk_per_trade_pct=risk_per_trade_pct)
+            replace(
+                settings.risk,
+                max_risk_per_trade_pct=risk_per_trade_pct,
+                max_daily_loss_pct=max_daily_loss_pct,
+                trailing_stop_enabled=trailing_stop_enabled,
+                trailing_stop_activation_pct=trailing_stop_activation_pct,
+                trailing_stop_distance_pct=trailing_stop_distance_pct,
+            )
         ),
         instrument=_instrument_metadata(client, pair=pair, margin_currency=settings.futures_margin_currency),
         open_interest_features=open_interest_features,

@@ -31,6 +31,7 @@ class EMARSICrossoverStrategy(Strategy):
     atr_period: int = 14
     stop_atr_multiple: Decimal = Decimal("1.5")
     take_profit_atr_multiple: Decimal = Decimal("3")
+    atr_trailing_multiple: Decimal = Decimal("2")
     fallback_stop_pct: Decimal = Decimal("0.01")
     fallback_take_profit_pct: Decimal = Decimal("0.02")
 
@@ -158,6 +159,14 @@ class EMARSICrossoverStrategy(Strategy):
 
         rsi_value = metadata.get("rsi") or Decimal("50")
         confidence = Decimal("0.55") + (abs(rsi_value - Decimal("50")) / Decimal("100"))
+
+        metadata = {
+            "stop_atr_multiple": self.stop_atr_multiple,
+            "take_profit_atr_multiple": self.take_profit_atr_multiple,
+            "atr_trailing_multiple": self.atr_trailing_multiple,
+            "trailing_atr_multiple": self.atr_trailing_multiple,
+            **metadata,
+        }
 
         return StrategySignal(
             strategy_name=self.name,

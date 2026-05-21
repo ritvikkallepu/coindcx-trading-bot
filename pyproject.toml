@@ -20,3 +20,6 @@ ws-legacy = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
+
+[project.scripts]
+paper = "app.live.run_paper:main"

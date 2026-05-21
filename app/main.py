@@ -133,10 +133,6 @@ def _fee_rate_from_args(
         return default
     if fee_rate < 0 and not allow_negative:
         raise SystemExit("Fee rate cannot be negative.")
-    if fee_rate < 0:
-        return fee_rate
-    if fee_rate >= Decimal("0.01"):
-        return fee_rate / Decimal("100")
     return fee_rate
 
 
@@ -738,6 +734,32 @@ def backtest_command(
     loss_cooldown_candles: int,
     strategy_name: str,
     recent_count: int,
+    equity_giveback_guard_enabled: bool,
+    equity_giveback_threshold_pct: Decimal,
+    equity_giveback_cooldown_candles: int,
+    loss_streak_cooldown_enabled: bool,
+    consecutive_loss_limit: int,
+    rolling_loss_window: int,
+    rolling_loss_limit: int,
+    rolling_loss_cooldown_candles: int,
+    post_spike_cooldown_enabled: bool,
+    post_spike_lookback_candles: int,
+    post_spike_gain_threshold_pct: Decimal,
+    post_spike_cooldown_candles: int,
+    breakeven_enabled: bool,
+    breakeven_activation_r: Decimal,
+    breakeven_offset_r: Decimal,
+    profit_lock_enabled: bool,
+    profit_lock_activation_r: Decimal,
+    profit_lock_r: Decimal,
+    atr_trail_after_r_enabled: bool,
+    atr_trail_activation_r: Decimal,
+    chop_filter_enabled: bool,
+    min_ema_gap_pct: Decimal,
+    min_atr_pct: Decimal,
+    block_flat_ema_enabled: bool,
+    block_low_atr_enabled: bool,
+    atr_trailing_multiple: Decimal,
 ) -> None:
     settings = load_settings()
     configure_logging(settings)
@@ -853,6 +875,32 @@ def backtest_command(
         stop_loss_cooldown_candles=stop_loss_cooldown_candles,
         max_consecutive_losses=max_consecutive_losses,
         loss_cooldown_candles=loss_cooldown_candles,
+        equity_giveback_guard_enabled=equity_giveback_guard_enabled,
+        equity_giveback_threshold_pct=equity_giveback_threshold_pct / Decimal("100"),
+        equity_giveback_cooldown_candles=equity_giveback_cooldown_candles,
+        loss_streak_cooldown_enabled=loss_streak_cooldown_enabled,
+        consecutive_loss_limit=consecutive_loss_limit,
+        rolling_loss_window=rolling_loss_window,
+        rolling_loss_limit=rolling_loss_limit,
+        rolling_loss_cooldown_candles=rolling_loss_cooldown_candles,
+        post_spike_cooldown_enabled=post_spike_cooldown_enabled,
+        post_spike_lookback_candles=post_spike_lookback_candles,
+        post_spike_gain_threshold_pct=post_spike_gain_threshold_pct / Decimal("100"),
+        post_spike_cooldown_candles=post_spike_cooldown_candles,
+        breakeven_enabled=breakeven_enabled,
+        breakeven_activation_r=breakeven_activation_r,
+        breakeven_offset_r=breakeven_offset_r,
+        profit_lock_enabled=profit_lock_enabled,
+        profit_lock_activation_r=profit_lock_activation_r,
+        profit_lock_r=profit_lock_r,
+        atr_trail_after_r_enabled=atr_trail_after_r_enabled,
+        atr_trail_activation_r=atr_trail_activation_r,
+        chop_filter_enabled=chop_filter_enabled,
+        min_ema_gap_pct=min_ema_gap_pct / Decimal("100"),
+        min_atr_pct=min_atr_pct / Decimal("100"),
+        block_flat_ema_enabled=block_flat_ema_enabled,
+        block_low_atr_enabled=block_low_atr_enabled,
+        atr_trailing_multiple=atr_trailing_multiple,
     )
     engine = BacktestEngine(
         config=config,
@@ -907,6 +955,33 @@ def research_sweep_command(
     atr_stop_multiple: Decimal,
     atr_take_profit_multiple: Decimal,
     atr_take_profit_mode: str,
+    equity_giveback_guard_enabled: bool,
+    equity_giveback_threshold_pct: Decimal,
+    equity_giveback_cooldown_candles: int,
+    loss_streak_cooldown_enabled: bool,
+    consecutive_loss_limit: int,
+    loss_streak_cooldown_candles: int,
+    rolling_loss_window: int,
+    rolling_loss_limit: int,
+    rolling_loss_cooldown_candles: int,
+    post_spike_cooldown_enabled: bool,
+    post_spike_lookback_candles: int,
+    post_spike_gain_threshold_pct: Decimal,
+    post_spike_cooldown_candles: int,
+    breakeven_enabled: bool,
+    breakeven_activation_r: Decimal,
+    breakeven_offset_r: Decimal,
+    profit_lock_enabled: bool,
+    profit_lock_activation_r: Decimal,
+    profit_lock_r: Decimal,
+    atr_trail_after_r_enabled: bool,
+    atr_trail_activation_r: Decimal,
+    chop_filter_enabled: bool,
+    min_ema_gap_pct: Decimal,
+    min_atr_pct: Decimal,
+    block_flat_ema_enabled: bool,
+    block_low_atr_enabled: bool,
+    atr_trailing_multiple: Decimal,
     until: str | None,
     output_dir: str,
     max_runs: int | None,
@@ -984,6 +1059,33 @@ def research_sweep_command(
             atr_stop_multiple=atr_stop_multiple,
             atr_take_profit_multiple=atr_take_profit_multiple,
             atr_take_profit_mode=atr_take_profit_mode,
+            equity_giveback_guard_enabled=equity_giveback_guard_enabled,
+            equity_giveback_threshold_pct=equity_giveback_threshold_pct,
+            equity_giveback_cooldown_candles=equity_giveback_cooldown_candles,
+            loss_streak_cooldown_enabled=loss_streak_cooldown_enabled,
+            consecutive_loss_limit=consecutive_loss_limit,
+            loss_streak_cooldown_candles=loss_streak_cooldown_candles,
+            rolling_loss_window=rolling_loss_window,
+            rolling_loss_limit=rolling_loss_limit,
+            rolling_loss_cooldown_candles=rolling_loss_cooldown_candles,
+            post_spike_cooldown_enabled=post_spike_cooldown_enabled,
+            post_spike_lookback_candles=post_spike_lookback_candles,
+            post_spike_gain_threshold_pct=post_spike_gain_threshold_pct,
+            post_spike_cooldown_candles=post_spike_cooldown_candles,
+            breakeven_enabled=breakeven_enabled,
+            breakeven_activation_r=breakeven_activation_r,
+            breakeven_offset_r=breakeven_offset_r,
+            profit_lock_enabled=profit_lock_enabled,
+            profit_lock_activation_r=profit_lock_activation_r,
+            profit_lock_r=profit_lock_r,
+            atr_trail_after_r_enabled=atr_trail_after_r_enabled,
+            atr_trail_activation_r=atr_trail_activation_r,
+            chop_filter_enabled=chop_filter_enabled,
+            min_ema_gap_pct=min_ema_gap_pct,
+            min_atr_pct=min_atr_pct,
+            block_flat_ema_enabled=block_flat_ema_enabled,
+            block_low_atr_enabled=block_low_atr_enabled,
+            atr_trailing_multiple=atr_trailing_multiple,
             until=parse_until(until),
             output_dir=Path(output_dir),
             max_runs=max_runs,
@@ -1055,7 +1157,7 @@ def build_parser() -> argparse.ArgumentParser:
     risk_parser.add_argument("--pair", default="B-BTC_USDT")
     risk_parser.add_argument("--interval", default="1h")
     risk_parser.add_argument("--lookback", type=int, default=120)
-    risk_parser.add_argument("--equity", type=_decimal_arg, default=Decimal("1000"))
+    risk_parser.add_argument("--equity", type=_decimal_arg, default=None)
     risk_parser.add_argument("--daily-pnl", type=_decimal_arg, default=Decimal("0"))
     risk_parser.add_argument("--open-positions", type=int, default=0)
     risk_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("1"))
@@ -1067,7 +1169,7 @@ def build_parser() -> argparse.ArgumentParser:
     paper_parser.add_argument("--pair", default="B-BTC_USDT")
     paper_parser.add_argument("--interval", default="1h")
     paper_parser.add_argument("--lookback", type=int, default=120)
-    paper_parser.add_argument("--equity", type=_decimal_arg, default=Decimal("1000"))
+    paper_parser.add_argument("--equity", type=_decimal_arg, default=None)
     paper_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("1"))
     paper_parser.add_argument("--fee-rate", type=_decimal_arg, default=None)
     paper_parser.add_argument(
@@ -1119,7 +1221,7 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_parser.add_argument("--pair", default="B-BTC_USDT")
     backtest_parser.add_argument("--interval", default="1h")
     backtest_parser.add_argument("--lookback", type=int, default=500)
-    backtest_parser.add_argument("--equity", type=_decimal_arg, default=Decimal("1000"))
+    backtest_parser.add_argument("--equity", type=_decimal_arg, default=None)
     backtest_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("1"))
     backtest_parser.add_argument(
         "--risk-per-trade-pct",
@@ -1254,6 +1356,141 @@ def build_parser() -> argparse.ArgumentParser:
         help="Strategy set to run",
     )
     backtest_parser.add_argument(
+        "--equity-giveback-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    backtest_parser.add_argument(
+        "--equity-giveback-threshold-pct",
+        type=_decimal_arg,
+        default=Decimal("3.5"),
+    )
+    backtest_parser.add_argument(
+        "--equity-giveback-cooldown-candles",
+        type=int,
+        default=72,
+    )
+    backtest_parser.add_argument(
+        "--loss-streak-cooldown",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    backtest_parser.add_argument(
+        "--consecutive-loss-limit",
+        type=int,
+        default=3,
+    )
+    backtest_parser.add_argument(
+        "--loss-streak-cooldown-candles",
+        type=int,
+        default=12,
+    )
+    backtest_parser.add_argument(
+        "--rolling-loss-window",
+        type=int,
+        default=8,
+    )
+    backtest_parser.add_argument(
+        "--rolling-loss-limit",
+        type=int,
+        default=5,
+    )
+    backtest_parser.add_argument(
+        "--rolling-loss-cooldown-candles",
+        type=int,
+        default=36,
+    )
+    backtest_parser.add_argument(
+        "--post-spike-cooldown",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    backtest_parser.add_argument(
+        "--post-spike-lookback-candles",
+        type=int,
+        default=50,
+    )
+    backtest_parser.add_argument(
+        "--post-spike-gain-threshold-pct",
+        type=_decimal_arg,
+        default=Decimal("5.0"),
+    )
+    backtest_parser.add_argument(
+        "--post-spike-cooldown-candles",
+        type=int,
+        default=24,
+    )
+    backtest_parser.add_argument(
+        "--breakeven-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    backtest_parser.add_argument(
+        "--breakeven-activation-r",
+        type=_decimal_arg,
+        default=Decimal("1.0"),
+    )
+    backtest_parser.add_argument(
+        "--breakeven-offset-r",
+        type=_decimal_arg,
+        default=Decimal("0.0"),
+    )
+    backtest_parser.add_argument(
+        "--profit-lock-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    backtest_parser.add_argument(
+        "--profit-lock-activation-r",
+        type=_decimal_arg,
+        default=Decimal("1.5"),
+    )
+    backtest_parser.add_argument(
+        "--profit-lock-r",
+        type=_decimal_arg,
+        default=Decimal("0.5"),
+    )
+    backtest_parser.add_argument(
+        "--atr-trail-after-r",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    backtest_parser.add_argument(
+        "--atr-trail-activation-r",
+        type=_decimal_arg,
+        default=Decimal("2.0"),
+    )
+    backtest_parser.add_argument(
+        "--chop-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    backtest_parser.add_argument(
+        "--min-ema-gap-pct",
+        type=_decimal_arg,
+        default=Decimal("0.15"),
+    )
+    backtest_parser.add_argument(
+        "--min-atr-pct",
+        type=_decimal_arg,
+        default=Decimal("0.2"),
+    )
+    backtest_parser.add_argument(
+        "--block-flat-ema",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    backtest_parser.add_argument(
+        "--block-low-atr",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    backtest_parser.add_argument(
+        "--atr-trailing-multiple",
+        type=_decimal_arg,
+        default=Decimal("2.0"),
+    )
+    backtest_parser.add_argument(
         "--recent-count",
         type=int,
         default=10,
@@ -1280,7 +1517,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated strategy variants to test, e.g. hybrid_meta,adaptive_hybrid.",
     )
     sweep_parser.add_argument("--lookback", type=int, default=1000)
-    sweep_parser.add_argument("--equity", type=_decimal_arg, default=Decimal("1000"))
+    sweep_parser.add_argument("--equity", type=_decimal_arg, default=None)
     sweep_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("3"))
     sweep_parser.add_argument(
         "--leverage-grid",
@@ -1406,6 +1643,141 @@ def build_parser() -> argparse.ArgumentParser:
         help="How dynamic ATR exits manage take profit levels.",
     )
     sweep_parser.add_argument(
+        "--equity-giveback-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    sweep_parser.add_argument(
+        "--equity-giveback-threshold-pct",
+        type=_decimal_arg,
+        default=Decimal("3.5"),
+    )
+    sweep_parser.add_argument(
+        "--equity-giveback-cooldown-candles",
+        type=int,
+        default=72,
+    )
+    sweep_parser.add_argument(
+        "--loss-streak-cooldown",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    sweep_parser.add_argument(
+        "--consecutive-loss-limit",
+        type=int,
+        default=3,
+    )
+    sweep_parser.add_argument(
+        "--loss-streak-cooldown-candles",
+        type=int,
+        default=12,
+    )
+    sweep_parser.add_argument(
+        "--rolling-loss-window",
+        type=int,
+        default=8,
+    )
+    sweep_parser.add_argument(
+        "--rolling-loss-limit",
+        type=int,
+        default=5,
+    )
+    sweep_parser.add_argument(
+        "--rolling-loss-cooldown-candles",
+        type=int,
+        default=36,
+    )
+    sweep_parser.add_argument(
+        "--post-spike-cooldown",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    sweep_parser.add_argument(
+        "--post-spike-lookback-candles",
+        type=int,
+        default=50,
+    )
+    sweep_parser.add_argument(
+        "--post-spike-gain-threshold-pct",
+        type=_decimal_arg,
+        default=Decimal("5.0"),
+    )
+    sweep_parser.add_argument(
+        "--post-spike-cooldown-candles",
+        type=int,
+        default=24,
+    )
+    sweep_parser.add_argument(
+        "--breakeven-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    sweep_parser.add_argument(
+        "--breakeven-activation-r",
+        type=_decimal_arg,
+        default=Decimal("1.0"),
+    )
+    sweep_parser.add_argument(
+        "--breakeven-offset-r",
+        type=_decimal_arg,
+        default=Decimal("0.0"),
+    )
+    sweep_parser.add_argument(
+        "--profit-lock-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    sweep_parser.add_argument(
+        "--profit-lock-activation-r",
+        type=_decimal_arg,
+        default=Decimal("1.5"),
+    )
+    sweep_parser.add_argument(
+        "--profit-lock-r",
+        type=_decimal_arg,
+        default=Decimal("0.5"),
+    )
+    sweep_parser.add_argument(
+        "--atr-trail-after-r",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    sweep_parser.add_argument(
+        "--atr-trail-activation-r",
+        type=_decimal_arg,
+        default=Decimal("2.0"),
+    )
+    sweep_parser.add_argument(
+        "--chop-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    sweep_parser.add_argument(
+        "--min-ema-gap-pct",
+        type=_decimal_arg,
+        default=Decimal("0.15"),
+    )
+    sweep_parser.add_argument(
+        "--min-atr-pct",
+        type=_decimal_arg,
+        default=Decimal("0.2"),
+    )
+    sweep_parser.add_argument(
+        "--block-flat-ema",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    sweep_parser.add_argument(
+        "--block-low-atr",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    sweep_parser.add_argument(
+        "--atr-trailing-multiple",
+        type=_decimal_arg,
+        default=Decimal("2.0"),
+    )
+    sweep_parser.add_argument(
         "--until",
         default=None,
         help="Local cutoff time like 08:30, or ISO datetime. Stops before starting the next run.",
@@ -1431,7 +1803,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser.add_argument("--pair", default="B-SOL_USDT")
     dashboard_parser.add_argument("--interval", default="1h")
     dashboard_parser.add_argument("--lookback", type=int, default=1000)
-    dashboard_parser.add_argument("--equity", type=_decimal_arg, default=Decimal("1000"))
+    dashboard_parser.add_argument("--equity", type=_decimal_arg, default=None)
     dashboard_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("3"))
     dashboard_parser.add_argument("--risk-per-trade-pct", type=_decimal_arg, default=None)
     dashboard_parser.add_argument(
@@ -1488,6 +1860,141 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
     )
     dashboard_parser.add_argument(
+        "--equity-giveback-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    dashboard_parser.add_argument(
+        "--equity-giveback-threshold-pct",
+        type=_decimal_arg,
+        default=Decimal("3.5"),
+    )
+    dashboard_parser.add_argument(
+        "--equity-giveback-cooldown-candles",
+        type=int,
+        default=72,
+    )
+    dashboard_parser.add_argument(
+        "--loss-streak-cooldown",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    dashboard_parser.add_argument(
+        "--consecutive-loss-limit",
+        type=int,
+        default=3,
+    )
+    dashboard_parser.add_argument(
+        "--loss-streak-cooldown-candles",
+        type=int,
+        default=12,
+    )
+    dashboard_parser.add_argument(
+        "--rolling-loss-window",
+        type=int,
+        default=8,
+    )
+    dashboard_parser.add_argument(
+        "--rolling-loss-limit",
+        type=int,
+        default=5,
+    )
+    dashboard_parser.add_argument(
+        "--rolling-loss-cooldown-candles",
+        type=int,
+        default=36,
+    )
+    dashboard_parser.add_argument(
+        "--post-spike-cooldown",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    dashboard_parser.add_argument(
+        "--post-spike-lookback-candles",
+        type=int,
+        default=50,
+    )
+    dashboard_parser.add_argument(
+        "--post-spike-gain-threshold-pct",
+        type=_decimal_arg,
+        default=Decimal("5.0"),
+    )
+    dashboard_parser.add_argument(
+        "--post-spike-cooldown-candles",
+        type=int,
+        default=24,
+    )
+    dashboard_parser.add_argument(
+        "--breakeven-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    dashboard_parser.add_argument(
+        "--breakeven-activation-r",
+        type=_decimal_arg,
+        default=Decimal("1.0"),
+    )
+    dashboard_parser.add_argument(
+        "--breakeven-offset-r",
+        type=_decimal_arg,
+        default=Decimal("0.0"),
+    )
+    dashboard_parser.add_argument(
+        "--profit-lock-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    dashboard_parser.add_argument(
+        "--profit-lock-activation-r",
+        type=_decimal_arg,
+        default=Decimal("1.5"),
+    )
+    dashboard_parser.add_argument(
+        "--profit-lock-r",
+        type=_decimal_arg,
+        default=Decimal("0.5"),
+    )
+    dashboard_parser.add_argument(
+        "--atr-trail-after-r",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    dashboard_parser.add_argument(
+        "--atr-trail-activation-r",
+        type=_decimal_arg,
+        default=Decimal("2.0"),
+    )
+    dashboard_parser.add_argument(
+        "--chop-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    dashboard_parser.add_argument(
+        "--min-ema-gap-pct",
+        type=_decimal_arg,
+        default=Decimal("0.15"),
+    )
+    dashboard_parser.add_argument(
+        "--min-atr-pct",
+        type=_decimal_arg,
+        default=Decimal("0.2"),
+    )
+    dashboard_parser.add_argument(
+        "--block-flat-ema",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    dashboard_parser.add_argument(
+        "--block-low-atr",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    dashboard_parser.add_argument(
+        "--atr-trailing-multiple",
+        type=_decimal_arg,
+        default=Decimal("2.0"),
+    )
+    dashboard_parser.add_argument(
         "--strategy",
         choices=STRATEGY_CHOICES,
         default="bb_dynamic_grid",
@@ -1498,6 +2005,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    settings = load_settings()
 
     if args.command == "config-check":
         config_check()
@@ -1528,7 +2036,7 @@ def main() -> None:
             pair=args.pair,
             interval=args.interval,
             lookback=args.lookback,
-            account_equity=args.equity,
+            account_equity=args.equity if args.equity is not None else settings.paper_starting_equity,
             daily_realized_pnl=args.daily_pnl,
             open_positions=args.open_positions,
             leverage=args.leverage,
@@ -1550,7 +2058,7 @@ def main() -> None:
             pair=args.pair,
             interval=args.interval,
             lookback=args.lookback,
-            account_equity=args.equity,
+            account_equity=args.equity if args.equity is not None else settings.paper_starting_equity,
             leverage=args.leverage,
             maker_fee_rate=maker_fee_rate,
             taker_fee_rate=taker_fee_rate,
@@ -1584,7 +2092,7 @@ def main() -> None:
             pair=args.pair,
             interval=args.interval,
             lookback=args.lookback,
-            account_equity=args.equity,
+            account_equity=args.equity if args.equity is not None else settings.paper_starting_equity,
             leverage=args.leverage,
             risk_per_trade_pct=args.risk_per_trade_pct,
             compound_risk_equity=args.compound_risk_equity,
@@ -1616,6 +2124,33 @@ def main() -> None:
             loss_cooldown_candles=args.loss_cooldown_candles,
             strategy_name=args.strategy,
             recent_count=args.recent_count,
+            equity_giveback_guard_enabled=args.equity_giveback_guard,
+            equity_giveback_threshold_pct=args.equity_giveback_threshold_pct / Decimal("100"),
+            equity_giveback_cooldown_candles=args.equity_giveback_cooldown_candles,
+            loss_streak_cooldown_enabled=args.loss_streak_cooldown,
+            consecutive_loss_limit=args.consecutive_loss_limit,
+            loss_streak_cooldown_candles=args.loss_streak_cooldown_candles,
+            rolling_loss_window=args.rolling_loss_window,
+            rolling_loss_limit=args.rolling_loss_limit,
+            rolling_loss_cooldown_candles=args.rolling_loss_cooldown_candles,
+            post_spike_cooldown_enabled=args.post_spike_cooldown,
+            post_spike_lookback_candles=args.post_spike_lookback_candles,
+            post_spike_gain_threshold_pct=args.post_spike_gain_threshold_pct / Decimal("100"),
+            post_spike_cooldown_candles=args.post_spike_cooldown_candles,
+            breakeven_enabled=args.breakeven_enabled,
+            breakeven_activation_r=args.breakeven_activation_r,
+            breakeven_offset_r=args.breakeven_offset_r,
+            profit_lock_enabled=args.profit_lock_enabled,
+            profit_lock_activation_r=args.profit_lock_activation_r,
+            profit_lock_r=args.profit_lock_r,
+            atr_trail_after_r_enabled=args.atr_trail_after_r,
+            atr_trail_activation_r=args.atr_trail_activation_r,
+            chop_filter_enabled=args.chop_filter,
+            min_ema_gap_pct=args.min_ema_gap_pct / Decimal("100"),
+            min_atr_pct=args.min_atr_pct / Decimal("100"),
+            block_flat_ema_enabled=args.block_flat_ema,
+            block_low_atr_enabled=args.block_low_atr,
+            atr_trailing_multiple=args.atr_trailing_multiple,
         )
     elif args.command == "research-sweep":
         maker_fee_rate, taker_fee_rate = _fee_rates_from_args(
@@ -1639,7 +2174,7 @@ def main() -> None:
             intervals=args.intervals,
             variant_names=args.variant_names,
             lookback=args.lookback,
-            account_equity=args.equity,
+            account_equity=args.equity if args.equity is not None else settings.paper_starting_equity,
             leverage=args.leverage,
             risk_per_trade_pct=args.risk_per_trade_pct,
             risk_grid=args.risk_grid,
@@ -1667,6 +2202,33 @@ def main() -> None:
             atr_stop_multiple=args.atr_stop_multiple,
             atr_take_profit_multiple=args.atr_take_profit_multiple,
             atr_take_profit_mode=args.atr_take_profit_mode,
+            equity_giveback_guard_enabled=args.equity_giveback_guard,
+            equity_giveback_threshold_pct=args.equity_giveback_threshold_pct / Decimal("100"),
+            equity_giveback_cooldown_candles=args.equity_giveback_cooldown_candles,
+            loss_streak_cooldown_enabled=args.loss_streak_cooldown,
+            consecutive_loss_limit=args.consecutive_loss_limit,
+            loss_streak_cooldown_candles=args.loss_streak_cooldown_candles,
+            rolling_loss_window=args.rolling_loss_window,
+            rolling_loss_limit=args.rolling_loss_limit,
+            rolling_loss_cooldown_candles=args.rolling_loss_cooldown_candles,
+            post_spike_cooldown_enabled=args.post_spike_cooldown,
+            post_spike_lookback_candles=args.post_spike_lookback_candles,
+            post_spike_gain_threshold_pct=args.post_spike_gain_threshold_pct / Decimal("100"),
+            post_spike_cooldown_candles=args.post_spike_cooldown_candles,
+            breakeven_enabled=args.breakeven_enabled,
+            breakeven_activation_r=args.breakeven_activation_r,
+            breakeven_offset_r=args.breakeven_offset_r,
+            profit_lock_enabled=args.profit_lock_enabled,
+            profit_lock_activation_r=args.profit_lock_activation_r,
+            profit_lock_r=args.profit_lock_r,
+            atr_trail_after_r_enabled=args.atr_trail_after_r,
+            atr_trail_activation_r=args.atr_trail_activation_r,
+            chop_filter_enabled=args.chop_filter,
+            min_ema_gap_pct=args.min_ema_gap_pct / Decimal("100"),
+            min_atr_pct=args.min_atr_pct / Decimal("100"),
+            block_flat_ema_enabled=args.block_flat_ema,
+            block_low_atr_enabled=args.block_low_atr,
+            atr_trailing_multiple=args.atr_trailing_multiple,
             until=args.until,
             output_dir=args.output_dir,
             max_runs=args.max_runs,
@@ -1695,10 +2257,10 @@ def main() -> None:
                 pair=args.pair,
                 interval=args.interval,
                 lookback=args.lookback,
-                equity=args.equity,
+                equity=args.equity if args.equity is not None else settings.paper_starting_equity,
                 leverage=args.leverage,
                 risk_per_trade_pct=(
-                    load_settings().risk.max_risk_per_trade_pct
+                    settings.risk.max_risk_per_trade_pct
                     if args.risk_per_trade_pct is None
                     else args.risk_per_trade_pct
                 ),
@@ -1719,6 +2281,33 @@ def main() -> None:
                 atr_stop_multiple=args.atr_stop_multiple,
                 atr_take_profit_multiple=args.atr_take_profit_multiple,
                 atr_take_profit_mode=args.atr_take_profit_mode,
+                equity_giveback_guard_enabled=args.equity_giveback_guard,
+                equity_giveback_threshold_pct=args.equity_giveback_threshold_pct / Decimal("100"),
+                equity_giveback_cooldown_candles=args.equity_giveback_cooldown_candles,
+                loss_streak_cooldown_enabled=args.loss_streak_cooldown,
+                consecutive_loss_limit=args.consecutive_loss_limit,
+                loss_streak_cooldown_candles=args.loss_streak_cooldown_candles,
+                rolling_loss_window=args.rolling_loss_window,
+                rolling_loss_limit=args.rolling_loss_limit,
+                rolling_loss_cooldown_candles=args.rolling_loss_cooldown_candles,
+                post_spike_cooldown_enabled=args.post_spike_cooldown,
+                post_spike_lookback_candles=args.post_spike_lookback_candles,
+                post_spike_gain_threshold_pct=args.post_spike_gain_threshold_pct / Decimal("100"),
+                post_spike_cooldown_candles=args.post_spike_cooldown_candles,
+                breakeven_enabled=args.breakeven_enabled,
+                breakeven_activation_r=args.breakeven_activation_r,
+                breakeven_offset_r=args.breakeven_offset_r,
+                profit_lock_enabled=args.profit_lock_enabled,
+                profit_lock_activation_r=args.profit_lock_activation_r,
+                profit_lock_r=args.profit_lock_r,
+                atr_trail_after_r_enabled=args.atr_trail_after_r,
+                atr_trail_activation_r=args.atr_trail_activation_r,
+                chop_filter_enabled=args.chop_filter,
+                min_ema_gap_pct=args.min_ema_gap_pct / Decimal("100"),
+                min_atr_pct=args.min_atr_pct / Decimal("100"),
+                block_flat_ema_enabled=args.block_flat_ema,
+                block_low_atr_enabled=args.block_low_atr,
+                atr_trailing_multiple=args.atr_trailing_multiple,
                 strategy=args.strategy,
             ),
         )

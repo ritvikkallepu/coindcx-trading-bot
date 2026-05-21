@@ -70,6 +70,7 @@ class CoinDCXFuturesWebSocketClient:
         self._received_events = 0
         self._max_events: int | None = None
         self._stop_requested = threading.Event()
+        self._sio: Any | None = None
 
     def run(
         self,
@@ -78,11 +79,12 @@ class CoinDCXFuturesWebSocketClient:
         max_events: int | None = None,
     ) -> None:
         socketio = self._import_socketio()
-        sio = socketio.Client(
+        self._sio = socketio.Client(
             reconnection=True,
             logger=False,
             engineio_logger=False,
         )
+        sio = self._sio
         self._received_events = 0
         self._max_events = max_events
         self._stop_requested.clear()
@@ -115,6 +117,8 @@ class CoinDCXFuturesWebSocketClient:
 
     def stop(self) -> None:
         self._stop_requested.set()
+        if self._sio and self._sio.connected:
+            self._sio.disconnect()
 
     def _handler_for(self, event_name: str, sio: Any):
         def handle(payload: Any) -> None:

@@ -24,6 +24,7 @@ class BollingerVolumeMeanReversionStrategy(Strategy):
     volume_multiplier: Decimal = Decimal("1.15")
     atr_period: int = 14
     stop_atr_multiple: Decimal = Decimal("1.2")
+    atr_trailing_multiple: Decimal = Decimal("2")
     fallback_stop_pct: Decimal = Decimal("0.008")
 
     def evaluate(self, context: StrategyContext) -> StrategySignal:
@@ -125,6 +126,13 @@ class BollingerVolumeMeanReversionStrategy(Strategy):
 
         squeeze_rank = metadata.get("squeeze_rank") or Decimal("1")
         confidence = Decimal("0.6") + ((Decimal("1") - squeeze_rank) * Decimal("0.25"))
+
+        metadata = {
+            "stop_atr_multiple": self.stop_atr_multiple,
+            "atr_trailing_multiple": self.atr_trailing_multiple,
+            "trailing_atr_multiple": self.atr_trailing_multiple,
+            **metadata,
+        }
 
         return StrategySignal(
             strategy_name=self.name,

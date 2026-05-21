@@ -44,6 +44,8 @@ def _redact(secret: str | None) -> str:
     return f"{secret[:4]}...{secret[-4:]}"
 
 
+# These are conservative paper-trading defaults.
+# They should be overridden via .env for live trading.
 @dataclass(frozen=True)
 class RiskSettings:
     max_risk_per_trade_pct: Decimal = Decimal("5")
@@ -51,8 +53,8 @@ class RiskSettings:
     max_open_positions: int = 1
     max_leverage: int = 30
     max_total_open_notional_pct: Decimal = Decimal("0")
-    max_total_risk_pct: Decimal = Decimal("0")
-    liquidation_buffer_pct: Decimal = Decimal("1")
+    max_total_risk_pct: Decimal = Decimal("20")
+    liquidation_buffer_pct: Decimal = Decimal("2")
     trailing_stop_enabled: bool = False
     trailing_stop_activation_pct: Decimal = Decimal("1")
     trailing_stop_distance_pct: Decimal = Decimal("2")
@@ -68,6 +70,14 @@ class Settings:
     coindcx_public_base_url: str = "https://public.coindcx.com"
     coindcx_ws_url: str = "wss://stream.coindcx.com"
     futures_margin_currency: str = "INR"
+    paper_starting_equity: Decimal = Decimal("10000")
+    paper_starting_equity_currency: str = "USDT"
+    paper_intrabar_enabled: bool = False
+    strategy_interval: str = "15m"
+    execution_interval: str = "1m"
+    use_partial_parent_candle: bool = False
+    max_entries_per_parent_candle: int = 1
+    enter_on_execution_close: bool = True
     default_pair: str = "B-BTC_USDT"
     http_timeout_seconds: float = 15.0
     api_max_retries: int = 3
@@ -112,8 +122,8 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         max_total_open_notional_pct=_decimal(
             _get(merged, "MAX_TOTAL_OPEN_NOTIONAL_PCT", "0")
         ),
-        max_total_risk_pct=_decimal(_get(merged, "MAX_TOTAL_RISK_PCT", "0")),
-        liquidation_buffer_pct=_decimal(_get(merged, "LIQUIDATION_BUFFER_PCT", "1")),
+        max_total_risk_pct=_decimal(_get(merged, "MAX_TOTAL_RISK_PCT", "20")),
+        liquidation_buffer_pct=_decimal(_get(merged, "LIQUIDATION_BUFFER_PCT", "2")),
         trailing_stop_enabled=_bool(_get(merged, "TRAILING_STOP_ENABLED", "false")),
         trailing_stop_activation_pct=_decimal(
             _get(merged, "TRAILING_STOP_ACTIVATION_PCT", "1")
@@ -136,6 +146,14 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         ).rstrip("/"),
         coindcx_ws_url=_get(merged, "COINDCX_WS_URL", "wss://stream.coindcx.com"),
         futures_margin_currency=_get(merged, "FUTURES_MARGIN_CURRENCY", "INR").upper(),
+        paper_starting_equity=_decimal(_get(merged, "PAPER_STARTING_EQUITY", "10000")),
+        paper_starting_equity_currency=_get(merged, "PAPER_STARTING_EQUITY_CURRENCY", "USDT"),
+        paper_intrabar_enabled=_bool(_get(merged, "PAPER_INTRABAR_ENABLED", "false")),
+        strategy_interval=_get(merged, "STRATEGY_INTERVAL", "15m"),
+        execution_interval=_get(merged, "EXECUTION_INTERVAL", "1m"),
+        use_partial_parent_candle=_bool(_get(merged, "USE_PARTIAL_PARENT_CANDLE", "false")),
+        max_entries_per_parent_candle=int(_get(merged, "MAX_ENTRIES_PER_PARENT_CANDLE", "1")),
+        enter_on_execution_close=_bool(_get(merged, "ENTER_ON_EXECUTION_CLOSE", "true")),
         default_pair=_get(merged, "DEFAULT_PAIR", "B-BTC_USDT"),
         http_timeout_seconds=float(_get(merged, "HTTP_TIMEOUT_SECONDS", "15")),
         api_max_retries=int(_get(merged, "API_MAX_RETRIES", "3")),

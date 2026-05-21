@@ -365,22 +365,23 @@ class PaperBrokerTests(unittest.TestCase):
         )
         position = broker.open_positions()[0]
 
-        self.assertEqual(position.stop_loss, Decimal("106"))
+        # Close-confirmed: best_price=108. stop=108-(2*2)=104.
+        self.assertEqual(position.stop_loss, Decimal("104"))
         self.assertEqual(position.take_profit, Decimal("110"))
         self.assertTrue(position.metadata["atr_dynamic_exit_active"])
 
         reports = engine.process_candle(
             _candle(
-                open_price=Decimal("107"),
-                low=Decimal("105"),
-                high=Decimal("109"),
-                close=Decimal("106"),
+                open_price=Decimal("105"),
+                low=Decimal("103"),
+                high=Decimal("107"),
+                close=Decimal("104"),
             )
         )
 
         self.assertEqual(len(reports), 1)
         self.assertEqual(reports[0].reason, "Dynamic ATR stop triggered.")
-        self.assertEqual(reports[0].fill.price, Decimal("106"))  # type: ignore[union-attr]
+        self.assertEqual(reports[0].fill.price, Decimal("104"))  # type: ignore[union-attr]
 
     def test_snapshot_includes_unrealized_pnl_at_mark_price(self) -> None:
         broker = PaperBroker(starting_equity=Decimal("1000"))

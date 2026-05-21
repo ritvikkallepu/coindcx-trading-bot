@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import Mapping
+from typing import Mapping, Any
 
 from app.broker.models import (
     PaperAccountSnapshot,
@@ -17,6 +17,7 @@ from app.broker.models import (
 )
 from app.data.candle_builder import OHLCVCandle
 from app.fees import effective_fee_rate
+from app.persistence.paper_state import PaperStateStore
 from app.risk.limits import is_entry_signal, is_exit_signal
 from app.risk.models import RiskDecision
 from app.strategies.base import SignalAction, SignalDirection, StrategySignal
@@ -47,6 +48,7 @@ class PaperBroker:
         trailing_stop_activation_pct: Decimal = Decimal("1"),
         trailing_stop_distance_pct: Decimal = Decimal("2"),
         logger: logging.Logger | None = None,
+        state_store: PaperStateStore | None = None,
     ) -> None:
         if starting_equity <= 0:
             raise ValueError("starting_equity must be positive.")
@@ -83,6 +85,8 @@ class PaperBroker:
         self.trailing_stop_activation_pct = trailing_stop_activation_pct
         self.trailing_stop_distance_pct = trailing_stop_distance_pct
         self.logger = logger or logging.getLogger(__name__)
+        self.state_store = state_store
+        
         self.realized_pnl = Decimal("0")
         self.fees_paid = Decimal("0")
         self.funding_paid = Decimal("0")
@@ -91,6 +95,41 @@ class PaperBroker:
         self.fills: list[PaperFill] = []
         self._order_sequence = 0
         self._fill_sequence = 0
+
+        if self.state_store:
+            saved = self.state_store.load()
+            if saved:
+                # Restore state with proper object reconstruction
+                self.positions = {
+                    pair: self.state_store._restore_position(pos_dict)
+                    for pair, pos_dict in saved["positions"].items()
+                }
+                self.fills = [
+                    self.state_store._restore_fill(f) for f in saved["fills"]
+                ]
+                self.fees_paid = saved.get("fees_paid", Decimal("0"))
+                self.funding_paid = saved.get("funding_paid", Decimal("0"))
+                self.realized_pnl = saved.get(
+                    "realized_pnl", saved.get("daily_pnl", Decimal("0"))
+                )
+
+                self.logger.info(
+                    f"Restored paper state: equity={saved['equity']}, "
+                    f"open_positions={len(self.positions)}"
+                )
+
+    def _save_state(self) -> None:
+        if self.state_store:
+            state = {
+                "equity": self.snapshot().equity,
+                "positions": self.positions,
+                "fills": self.fills,
+                "realized_pnl": self.realized_pnl,
+                "fees_paid": self.fees_paid,
+                "funding_paid": self.funding_paid,
+                "daily_limit_equity": self.starting_equity,  # Fallback
+            }
+            self.state_store.save(state)
 
     def execute_decision(
         self,
@@ -144,6 +183,7 @@ class PaperBroker:
         trigger = self._trigger_for_position(position, candle)
         if trigger is None:
             self._update_trailing_stop(position, candle)
+            self._save_state()
             return reports
 
         signal = StrategySignal(
@@ -167,6 +207,7 @@ class PaperBroker:
                 reason=trigger.reason,
             )
         )
+        self._save_state()
         return reports
 
     def apply_funding(
@@ -199,10 +240,19 @@ class PaperBroker:
         atr: Decimal | None,
         stop_multiple: Decimal,
         take_profit_multiple: Decimal,
+        trailing_multiple: Decimal | None = None,
         stop_enabled: bool = True,
         take_profit_enabled: bool = True,
         trailing_enabled: bool = True,
         take_profit_mode: str = "fixed",
+        breakeven_enabled: bool = False,
+        breakeven_activation_r: Decimal = Decimal("1.0"),
+        breakeven_offset_r: Decimal = Decimal("0"),
+        profit_lock_enabled: bool = False,
+        profit_lock_activation_r: Decimal = Decimal("1.5"),
+        profit_lock_r: Decimal = Decimal("0.5"),
+        atr_trail_after_r_enabled: bool = False,
+        atr_trail_activation_r: Decimal = Decimal("2.0"),
     ) -> None:
         if atr is None or atr <= 0:
             return
@@ -210,9 +260,9 @@ class PaperBroker:
         position = self.positions.get(candle.pair)
         if position is None:
             return
-        if not position.metadata.get("atr_dynamic_exits_enabled"):
+        if not _bool_metadata(position.metadata, "atr_dynamic_exits_enabled", False):
             return
-        if position.opened_at_ms >= candle.close_time_ms:
+        if position.opened_at_ms > candle.close_time_ms:
             return
 
         stop_enabled = _bool_metadata(position.metadata, "atr_stop_enabled", stop_enabled)
@@ -226,7 +276,13 @@ class PaperBroker:
             "atr_trailing_enabled",
             trailing_enabled,
         )
-        if not stop_enabled and not take_profit_enabled:
+        
+        # Task 5 config extraction
+        breakeven_enabled = _bool_metadata(position.metadata, "breakeven_enabled", breakeven_enabled)
+        profit_lock_enabled = _bool_metadata(position.metadata, "profit_lock_enabled", profit_lock_enabled)
+        atr_trail_after_r_enabled = _bool_metadata(position.metadata, "atr_trail_after_r_enabled", atr_trail_after_r_enabled)
+
+        if not stop_enabled and not take_profit_enabled and not breakeven_enabled and not profit_lock_enabled:
             return
 
         stop_multiple = _decimal_metadata(
@@ -240,7 +296,7 @@ class PaperBroker:
             _decimal_metadata(
                 position.metadata,
                 "trailing_atr_multiple",
-                stop_multiple,
+                trailing_multiple if trailing_multiple is not None else stop_multiple,
             ),
         )
         take_profit_multiple = _decimal_metadata(
@@ -254,11 +310,15 @@ class PaperBroker:
             take_profit_enabled = False
         if trailing_multiple <= 0:
             trailing_multiple = stop_multiple
-        if not stop_enabled and not take_profit_enabled:
+        if not stop_enabled and not take_profit_enabled and not breakeven_enabled and not profit_lock_enabled:
             return
 
+        # Entry ATR Cap: trailing_distance = min(current_atr, entry_atr) * trailing_multiple
+        entry_atr = _decimal_metadata(position.metadata, "atr_entry_atr", atr)
+        trailing_effective_atr = min(atr, entry_atr) if entry_atr > 0 else atr
+        
         stop_distance = atr * stop_multiple
-        trailing_distance = atr * trailing_multiple
+        trailing_distance = trailing_effective_atr * trailing_multiple
         target_distance = atr * take_profit_multiple
         tiny_price = Decimal("0.00000001")
         take_profit_mode = str(
@@ -275,26 +335,68 @@ class PaperBroker:
         if not take_profit_enabled:
             take_profit_mode = "none"
 
+        # Task 5 R-based management
+        initial_stop = _decimal_metadata(position.metadata, "initial_stop_loss", None)
+        r_unit = abs(position.entry_price - initial_stop) if (initial_stop is not None and initial_stop > 0) else None
+        current_profit = (candle.close - position.entry_price) if position.direction == SignalDirection.LONG else (position.entry_price - candle.close)
+        current_r = (current_profit / r_unit) if (r_unit is not None and r_unit > 0) else Decimal("0")
+        
+        management_stop = None
+        stop_type = "atr"
+        if breakeven_enabled and current_r >= breakeven_activation_r:
+            offset = breakeven_offset_r * r_unit if r_unit else Decimal("0")
+            if position.direction == SignalDirection.LONG:
+                management_stop = position.entry_price + offset
+            else:
+                management_stop = position.entry_price - offset
+            stop_type = "breakeven"
+                
+        if profit_lock_enabled and current_r >= profit_lock_activation_r:
+            lock_offset = profit_lock_r * r_unit if r_unit else Decimal("0")
+            if position.direction == SignalDirection.LONG:
+                candidate = position.entry_price + lock_offset
+                if management_stop is None or candidate > management_stop:
+                    management_stop = candidate
+                    stop_type = "profit_lock"
+            else:
+                candidate = position.entry_price - lock_offset
+                if management_stop is None or candidate < management_stop:
+                    management_stop = candidate
+                    stop_type = "profit_lock"
+
+        # ATR Trail after R activation
+        actual_trailing_enabled = trailing_enabled
+        if atr_trail_after_r_enabled:
+            actual_trailing_enabled = (current_r >= atr_trail_activation_r)
+
         if position.direction == SignalDirection.LONG:
-            if trailing_enabled:
+            if actual_trailing_enabled:
                 best_price = max(
                     _decimal_metadata(position.metadata, "atr_best_price", position.entry_price),
-                    candle.high,
                     candle.close,
                     position.entry_price,
                 )
             else:
                 best_price = position.entry_price
             stop_candidate = position.stop_loss
-            if stop_enabled:
-                distance = trailing_distance if trailing_enabled else stop_distance
-                stop_candidate = max(best_price - distance, tiny_price)
+            if stop_enabled or management_stop:
+                distance = trailing_distance if actual_trailing_enabled else stop_distance
+                # Combine ATR stop and Management stop
+                atr_stop = max(best_price - distance, tiny_price) if stop_enabled else None
+                
+                if atr_stop and management_stop:
+                    stop_candidate = max(atr_stop, management_stop)
+                elif atr_stop:
+                    stop_candidate = atr_stop
+                else:
+                    stop_candidate = management_stop
+                
                 if position.stop_loss is not None:
                     stop_candidate = max(position.stop_loss, stop_candidate)
             entry_target = max(position.entry_price + target_distance, tiny_price)
             if take_profit_mode == "none":
                 take_profit = position.take_profit if position.metadata.get("manual_take_profit_pct") else None
-            elif take_profit_mode == "fixed":
+            elif take_profit_mode in {"fixed", "trailing_atr"}:
                 take_profit = position.take_profit
             elif take_profit_mode == "entry_atr":
                 take_profit = entry_target
@@ -302,27 +404,36 @@ class PaperBroker:
                 ratchet_target = max(best_price + target_distance, tiny_price)
                 take_profit = max(position.take_profit or entry_target, ratchet_target)
             else:
-                take_profit = max(candle.close + target_distance, tiny_price)
+                # Default behavior: trail using current close, but never loosen (move down for long)
+                candidate = max(candle.close + target_distance, tiny_price)
+                take_profit = max(position.take_profit or candidate, candidate)
         else:
-            if trailing_enabled:
+            if actual_trailing_enabled:
                 best_price = min(
                     _decimal_metadata(position.metadata, "atr_best_price", position.entry_price),
-                    candle.low,
                     candle.close,
                     position.entry_price,
                 )
             else:
                 best_price = position.entry_price
             stop_candidate = position.stop_loss
-            if stop_enabled:
-                distance = trailing_distance if trailing_enabled else stop_distance
-                stop_candidate = best_price + distance
+            if stop_enabled or management_stop:
+                distance = trailing_distance if actual_trailing_enabled else stop_distance
+                atr_stop = best_price + distance if stop_enabled else None
+                
+                if atr_stop and management_stop:
+                    stop_candidate = min(atr_stop, management_stop)
+                elif atr_stop:
+                    stop_candidate = atr_stop
+                else:
+                    stop_candidate = management_stop
+                    
                 if position.stop_loss is not None:
                     stop_candidate = min(position.stop_loss, stop_candidate)
             entry_target = max(position.entry_price - target_distance, tiny_price)
             if take_profit_mode == "none":
                 take_profit = position.take_profit if position.metadata.get("manual_take_profit_pct") else None
-            elif take_profit_mode == "fixed":
+            elif take_profit_mode in {"fixed", "trailing_atr"}:
                 take_profit = position.take_profit
             elif take_profit_mode == "entry_atr":
                 take_profit = entry_target
@@ -330,7 +441,9 @@ class PaperBroker:
                 ratchet_target = max(best_price - target_distance, tiny_price)
                 take_profit = min(position.take_profit or entry_target, ratchet_target)
             else:
-                take_profit = max(candle.close - target_distance, tiny_price)
+                # Default behavior: trail using current close, but never loosen (move up for short)
+                candidate = max(candle.close - target_distance, tiny_price)
+                take_profit = min(position.take_profit or candidate, candidate)
 
         metadata = {
             **position.metadata,
@@ -352,6 +465,7 @@ class PaperBroker:
                 position.metadata.get("atr_exit_update_count", 0)
             )
             + 1,
+            "stop_type": stop_type if stop_candidate == management_stop else "atr",
         }
         self.positions[position.pair] = replace(
             position,
@@ -527,6 +641,7 @@ class PaperBroker:
         self.positions[signal.pair] = position
         self.orders.append(order)
         self.fills.append(fill)
+        self._save_state()
 
         return PaperExecutionReport(
             accepted=True,
@@ -650,6 +765,7 @@ class PaperBroker:
         self.positions[signal.pair] = updated_position
         self.orders.append(order)
         self.fills.append(fill)
+        self._save_state()
 
         return PaperExecutionReport(
             accepted=True,
@@ -741,6 +857,7 @@ class PaperBroker:
         closed_position = self.positions.pop(position.pair)
         self.orders.append(order)
         self.fills.append(fill)
+        self._save_state()
 
         return PaperExecutionReport(
             accepted=True,
@@ -770,12 +887,14 @@ class PaperBroker:
         required_margin = notional / leverage if leverage > 0 else notional
         planned_risk = decision.max_loss or Decimal("0")
         max_notional = snapshot.equity * leverage if snapshot.equity > 0 else Decimal("0")
+        
         margin_ok = (
             not account_blown
             and required_margin <= snapshot.equity
             and planned_risk <= snapshot.equity
             and notional <= max_notional
         )
+        
         metadata: dict[str, object] = {
             "equity_before_trade": snapshot.equity,
             "available_equity": snapshot.equity,
@@ -786,22 +905,27 @@ class PaperBroker:
             "max_position_notional": max_notional,
             "margin_ok": margin_ok,
             "account_blown": account_blown,
+            "risk_base_amount": decision.metadata.get("risk_base_amount"),
+            "risk_base_mode": decision.metadata.get("risk_base_mode"),
+            "risk_multiplier": decision.metadata.get("risk_multiplier"),
+            "risk_percent_used": decision.metadata.get("risk_percent_used"),
         }
+        
         if account_blown:
-            return "Paper broker rejected entry: account equity is depleted.", metadata
-        if required_margin > snapshot.equity:
+            return "Paper broker rejected entry: account equity is depleted (bankrupt).", metadata
+        if snapshot.equity < required_margin:
             return (
-                "Paper broker rejected entry: required margin exceeds available equity.",
+                f"Paper broker rejected entry: required margin {required_margin} exceeds available equity {snapshot.equity}.",
                 metadata,
             )
-        if planned_risk > snapshot.equity:
+        if snapshot.equity < planned_risk:
             return (
-                "Paper broker rejected entry: planned risk exceeds available equity.",
+                f"Paper broker rejected entry: planned risk {planned_risk} exceeds available equity {snapshot.equity}.",
                 metadata,
             )
         if notional > max_notional:
             return (
-                "Paper broker rejected entry: position notional exceeds equity times leverage.",
+                f"Paper broker rejected entry: position notional {notional} exceeds equity times leverage {max_notional}.",
                 metadata,
             )
         return None, metadata
@@ -1045,6 +1169,10 @@ class PaperBroker:
     ) -> None:
         if not self.trailing_stop_enabled:
             return
+        # If this position has ATR trailing enabled (via metadata or fallback), it takes 
+        # precedence over the fixed percentage trailing stop.
+        if _bool_metadata(position.metadata, "atr_trailing_enabled", False):
+            return
         if position.stop_loss is None or candle.close <= 0:
             return
 
@@ -1216,6 +1344,11 @@ def _decimal_metadata(
 
 def _stop_reason(position: PaperPosition) -> str:
     if position.metadata.get("atr_dynamic_exit_active") and position.metadata.get("atr_stop_enabled"):
+        stop_type = position.metadata.get("stop_type", "atr")
+        if stop_type == "breakeven":
+            return "Breakeven stop triggered."
+        if stop_type == "profit_lock":
+            return "Profit lock triggered."
         return "Dynamic ATR stop triggered."
     if position.metadata.get("trailing_stop_active"):
         return "Trailing stop triggered."
@@ -1230,8 +1363,13 @@ def _take_profit_reason(position: PaperPosition) -> str:
 
 def _gap_stop_reason(position: PaperPosition) -> str:
     if position.metadata.get("atr_dynamic_exit_active") and position.metadata.get("atr_stop_enabled"):
+        stop_type = position.metadata.get("stop_type", "atr")
+        if stop_type == "breakeven":
+            return "Breakeven stop gapped through; filled at candle open."
+        if stop_type == "profit_lock":
+            return "Profit lock gapped through; filled at candle open."
         return "Dynamic ATR stop gapped through; filled at candle open."
-    if position.metadata.get("trailing_stop_active"):
+    if position.metadata.get("trailing_stop_active") and not position.metadata.get("fixed_trailing_stop_suppressed"):
         return "Trailing stop gapped through; filled at candle open."
     return "Stop loss gapped through; filled at candle open."
 

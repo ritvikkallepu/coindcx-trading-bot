@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -11,7 +12,7 @@ from app.broker.models import (
     PaperOrder,
 )
 from app.risk.models import convert_for_json
-from app.strategies.base import SignalDirection
+from app.strategies.base import SignalAction, SignalDirection, SignalFunnelReason
 
 
 @dataclass(frozen=True)
@@ -58,14 +59,57 @@ class BacktestConfig:
     atr_period: int = 14
     atr_stop_multiple: Decimal = Decimal("1.5")
     atr_take_profit_multiple: Decimal = Decimal("3")
+    atr_trailing_multiple: Decimal = Decimal("2.0")
     atr_take_profit_mode: str = "none"
     execution_interval: str | None = None
+    paper_intrabar_enabled: bool = False
+    strategy_interval: str | None = None
+    use_partial_parent_candle: bool = False
+    max_entries_per_parent_candle: int = 1
+    enter_on_execution_close: bool = True
     intrabar_reentry_enabled: bool = False
     max_reentries_per_candle: int = 0
     reentry_cooldown_candles: int = 1
     stop_loss_cooldown_candles: int = 1
     max_consecutive_losses: int = 2
     loss_cooldown_candles: int = 4
+    max_daily_loss_pct: Decimal = Decimal("10")
+    
+    # Task 2: Equity giveback guard
+    equity_giveback_guard_enabled: bool = False
+    equity_giveback_threshold_pct: Decimal = Decimal("0.035")
+    equity_giveback_cooldown_candles: int = 72
+    
+    # Task 3: Loss-streak cooldown enhancements
+    loss_streak_cooldown_enabled: bool = False
+    consecutive_loss_limit: int = 3
+    loss_streak_cooldown_candles: int = 12
+    rolling_loss_window: int = 8
+    rolling_loss_limit: int = 5
+    rolling_loss_cooldown_candles: int = 36
+    
+    # Task 4: Post-spike cooldown
+    post_spike_cooldown_enabled: bool = False
+    post_spike_lookback_candles: int = 50
+    post_spike_gain_threshold_pct: Decimal = Decimal("0.05")
+    post_spike_cooldown_candles: int = 24
+    
+    # Task 5: Breakeven and profit-lock
+    breakeven_enabled: bool = False
+    breakeven_activation_r: Decimal = Decimal("1.0")
+    breakeven_offset_r: Decimal = Decimal("0")
+    profit_lock_enabled: bool = False
+    profit_lock_activation_r: Decimal = Decimal("1.5")
+    profit_lock_r: Decimal = Decimal("0.5")
+    atr_trail_after_r_enabled: bool = False
+    atr_trail_activation_r: Decimal = Decimal("2.0")
+    
+    # Task 6: Chop/regime filter
+    chop_filter_enabled: bool = False
+    min_ema_gap_pct: Decimal = Decimal("0.0015")
+    min_atr_pct: Decimal = Decimal("0.002")
+    block_flat_ema_enabled: bool = False
+    block_low_atr_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.requested_candles is not None and self.requested_candles <= 0:
@@ -104,6 +148,8 @@ class BacktestConfig:
             raise ValueError("atr_stop_multiple must be positive.")
         if self.atr_take_profit_multiple <= 0:
             raise ValueError("atr_take_profit_multiple must be positive.")
+        if self.atr_trailing_multiple <= 0:
+            raise ValueError("atr_trailing_multiple must be positive.")
         if self.max_reentries_per_candle < 0:
             raise ValueError("max_reentries_per_candle cannot be negative.")
         if self.reentry_cooldown_candles < 0:
@@ -114,6 +160,8 @@ class BacktestConfig:
             raise ValueError("max_consecutive_losses cannot be negative.")
         if self.loss_cooldown_candles < 0:
             raise ValueError("loss_cooldown_candles cannot be negative.")
+        if self.max_daily_loss_pct <= 0:
+            raise ValueError("max_daily_loss_pct must be positive.")
         if self.atr_take_profit_mode not in {
             "fixed",
             "entry_atr",
@@ -214,7 +262,7 @@ class BacktestResult:
         recent_count = max(recent_count, 0)
         recent_slice = slice(-recent_count, None) if recent_count else slice(0, 0)
         accepted_reports = [report for report in self.reports if report.accepted]
-        diagnostics = backtest_report_diagnostics(self.reports, self.trades)
+        diagnostics = backtest_report_diagnostics(self.reports, self.trades, self.equity_curve)
         signal_funnel = backtest_signal_funnel(
             config=self.config,
             reports=self.reports,
@@ -247,6 +295,7 @@ class BacktestResult:
 def backtest_report_diagnostics(
     reports: list[PaperExecutionReport],
     trades: list[BacktestTrade] | None = None,
+    equity_curve: list[BacktestEquityPoint] | None = None,
 ) -> dict[str, Any]:
     signal_action_counts: dict[str, int] = {}
     filled_action_counts: dict[str, int] = {}
@@ -308,7 +357,8 @@ def backtest_report_diagnostics(
         else:
             _increment(other_rejection_reasons, reason)
 
-    for trade in trades or []:
+    all_trades = trades or []
+    for trade in all_trades:
         _increment(exit_reason_counts, trade.exit_reason)
         exit_reason_total_net_pnl[trade.exit_reason] = (
             exit_reason_total_net_pnl.get(trade.exit_reason, Decimal("0"))
@@ -354,6 +404,60 @@ def backtest_report_diagnostics(
                 exit_reason_total_net_pnl[reason] / Decimal(count)
             )
 
+    # Advanced Fragility Metrics
+    long_trades = [t for t in all_trades if t.direction == SignalDirection.LONG]
+    short_trades = [t for t in all_trades if t.direction == SignalDirection.SHORT]
+    
+    total_net_pnl = sum(net_pnls, Decimal("0"))
+    winning_trades = [t for t in all_trades if t.won]
+    top_5_winners = sorted(winning_trades, key=lambda t: t.net_pnl, reverse=True)[:5]
+    top_5_winners_pnl = sum((t.net_pnl for t in top_5_winners), Decimal("0"))
+    
+    dependency = {
+        "largest_win": max(net_pnls) if net_pnls else None,
+        "largest_loss": min(net_pnls) if net_pnls else None,
+        "top_5_winners_total_pnl": top_5_winners_pnl,
+        "top_5_dependency_pct": (
+            (top_5_winners_pnl / total_net_pnl * 100)
+            if total_net_pnl > 0
+            else Decimal("0")
+        ),
+        "net_pnl_excluding_top_5": total_net_pnl - top_5_winners_pnl,
+    }
+
+    direction_perf = {
+        "long": _perf_summary(long_trades),
+        "short": _perf_summary(short_trades),
+    }
+
+    # PnL Split by Thirds
+    thirds_pnl = {"first": Decimal("0"), "middle": Decimal("0"), "final": Decimal("0")}
+    if all_trades:
+        first_third_idx = len(all_trades) // 3
+        second_third_idx = (len(all_trades) * 2) // 3
+        thirds_pnl["first"] = sum((t.net_pnl for t in all_trades[:first_third_idx]), Decimal("0"))
+        thirds_pnl["middle"] = sum((t.net_pnl for t in all_trades[first_third_idx:second_third_idx]), Decimal("0"))
+        thirds_pnl["final"] = sum((t.net_pnl for t in all_trades[second_third_idx:]), Decimal("0"))
+
+    # Best/Worst Day (based on equity curve)
+    daily_stats = {}
+    if equity_curve:
+        for point in equity_curve:
+            # Simple day grouping: YYYY-MM-DD
+            day = datetime.fromtimestamp(point.timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            if day not in daily_stats:
+                daily_stats[day] = {"start": point.realized_pnl, "end": point.realized_pnl}
+            daily_stats[day]["end"] = point.realized_pnl
+            
+    best_day = None
+    worst_day = None
+    if daily_stats:
+        day_pnls = {day: stats["end"] - stats["start"] for day, stats in daily_stats.items()}
+        best_day_str = max(day_pnls, key=lambda d: day_pnls[d])
+        worst_day_str = min(day_pnls, key=lambda d: day_pnls[d])
+        best_day = {"date": best_day_str, "pnl": day_pnls[best_day_str]}
+        worst_day = {"date": worst_day_str, "pnl": day_pnls[worst_day_str]}
+
     return {
         "signal_action_counts": signal_action_counts,
         "filled_action_counts": filled_action_counts,
@@ -372,8 +476,13 @@ def backtest_report_diagnostics(
         "average_mfe": _average(mfe_values),
         "average_mae": _average(mae_values),
         "average_r_multiple": _average(r_values),
-        "largest_win": max(net_pnls) if net_pnls else None,
-        "largest_loss": min(net_pnls) if net_pnls else None,
+        "largest_win": dependency["largest_win"],
+        "largest_loss": dependency["largest_loss"],
+        "dependency": dependency,
+        "direction_performance_v2": direction_perf,
+        "thirds_pnl": thirds_pnl,
+        "best_day": best_day,
+        "worst_day": worst_day,
         "profile_distribution": profile_distribution,
         "setup_tier_distribution": setup_tier_distribution,
         "setup_tier_performance": _group_performance(
@@ -390,6 +499,30 @@ def backtest_report_diagnostics(
     }
 
 
+def _perf_summary(trades: list[BacktestTrade]) -> dict[str, Any]:
+    if not trades:
+        return {
+            "count": 0,
+            "net_pnl": Decimal("0"),
+            "win_rate_pct": Decimal("0"),
+            "profit_factor": Decimal("0"),
+        }
+    
+    net_pnl = sum((t.net_pnl for t in trades), Decimal("0"))
+    wins = [t for t in trades if t.won]
+    losses = [t for t in trades if not t.won]
+    
+    total_wins = sum((t.net_pnl for t in wins), Decimal("0"))
+    total_losses = abs(sum((t.net_pnl for t in losses), Decimal("0")))
+    
+    return {
+        "count": len(trades),
+        "net_pnl": net_pnl,
+        "win_rate_pct": Decimal(len(wins)) / Decimal(len(trades)) * 100,
+        "profit_factor": (total_wins / total_losses) if total_losses > 0 else (Decimal("100") if total_wins > 0 else Decimal("0")),
+    }
+
+
 def backtest_signal_funnel(
     *,
     config: BacktestConfig,
@@ -398,74 +531,114 @@ def backtest_signal_funnel(
     candles_loaded: int,
     candles_used: int,
 ) -> dict[str, Any]:
+    buckets = {reason.value: 0 for reason in SignalFunnelReason}
+    
+    # Initialize funnel accounting
     counts: dict[str, int] = {
         "requested_candles": config.requested_candles or candles_loaded,
         "actual_candles_loaded": candles_loaded,
         "candles_evaluated": candles_used,
         "raw_long_candidates": 0,
         "raw_short_candidates": 0,
-        "blocked_by_component_disagreement": 0,
-        "blocked_by_visual_screen": 0,
-        "blocked_by_atr_low_volatility": 0,
-        "blocked_by_atr_high_volatility": 0,
-        "blocked_by_cooldown": 0,
-        "blocked_by_existing_open_position": 0,
-        "blocked_by_daily_loss_guard": 0,
-        "blocked_by_max_exposure_margin": 0,
-        "blocked_by_oi_short_restriction": 0,
-        "final_executed_entries": 0,
+        "raw_candidates_total": 0,
+        "executed_entries": 0,
+        "explained_rejections_total": 0,
+        "unexplained_candidates_total": 0,
+        "accounted_candidates_total": 0,
         "closed_trades": len(trades),
     }
 
+    processed_reports = 0
+
     for report in reports:
         signal = _report_signal(report)
-        action = signal.action.value if signal is not None else ""
-        metadata = signal.metadata if signal is not None else {}
-        reason = _report_reason(report).lower()
-
+        if signal is None:
+            continue
+            
+        metadata = signal.metadata or {}
+        
+        # Only account for reports that were originally raw entry candidates
+        is_raw = metadata.get("signal_funnel_raw_candidate", False)
+        # If metadata is missing, we infer from action
+        if not is_raw and signal.action in {SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT}:
+            is_raw = True
+            
+        if not is_raw:
+            continue
+            
+        processed_reports += 1
+        
         raw_direction = metadata.get("signal_funnel_raw_direction")
         if raw_direction == "long":
             counts["raw_long_candidates"] += 1
         elif raw_direction == "short":
             counts["raw_short_candidates"] += 1
-        elif action == "enter_long":
+        elif signal.direction == SignalDirection.LONG:
             counts["raw_long_candidates"] += 1
-        elif action == "enter_short":
+        elif signal.direction == SignalDirection.SHORT:
             counts["raw_short_candidates"] += 1
-
+            
+        # 1. Executed
         if report.accepted and report.order is not None:
-            filled_action = report.order.action.value
-            if filled_action in {"enter_long", "enter_short"}:
-                counts["final_executed_entries"] += 1
+            filled_action = report.order.action
+            if filled_action in {SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT}:
+                counts["executed_entries"] += 1
+                buckets[SignalFunnelReason.EXECUTED.value] += 1
+                continue
+
+        # 2. Blocked by Strategy Reason Code
+        funnel_reason = signal.funnel_reason
+        if funnel_reason:
+            buckets[funnel_reason.value] += 1
+            counts["explained_rejections_total"] += 1
             continue
-
-        if "components do not agree" in reason or "component" in reason:
-            counts["blocked_by_component_disagreement"] += 1
-        if "visual" in reason or _metadata_visual_blocked(metadata):
-            counts["blocked_by_visual_screen"] += 1
-        if "low volatility" in reason or "natr is too low" in reason:
-            counts["blocked_by_atr_low_volatility"] += 1
-        if "high volatility" in reason or "volatility is overheated" in reason:
-            counts["blocked_by_atr_high_volatility"] += 1
+            
+        # 3. Fallback to Textual Parsing for Risk/Execution
+        reason = _report_reason(report).lower()
+        mapped_reason = None
+        
         if "cooldown" in reason:
-            counts["blocked_by_cooldown"] += 1
-        if "already open" in reason or "max open positions" in reason:
-            counts["blocked_by_existing_open_position"] += 1
-        if "max daily loss" in reason or "kill switch" in reason:
-            counts["blocked_by_daily_loss_guard"] += 1
-        if (
-            "open notional" in reason
-            or "total exposure" in reason
-            or "total risk" in reason
-            or "margin" in reason
-            or "planned risk" in reason
-            or "position notional" in reason
-        ):
-            counts["blocked_by_max_exposure_margin"] += 1
-        if "open-interest" in reason or "open interest" in reason or "short setup" in reason:
-            counts["blocked_by_oi_short_restriction"] += 1
+            mapped_reason = SignalFunnelReason.COOLDOWN_BLOCKED
+        elif any(x in reason for x in ["already long", "already short", "already open", "max open positions", "position open"]):
+            mapped_reason = SignalFunnelReason.EXISTING_POSITION_BLOCKED
+        elif any(x in reason for x in ["max daily loss", "kill switch", "equity is depleted", "equity must be positive"]):
+            mapped_reason = SignalFunnelReason.DAILY_LOSS_GUARD_BLOCKED
+        elif any(x in reason for x in ["open notional", "total exposure", "total risk", "margin", "planned risk", "position notional", "leverage exceeds"]):
+            mapped_reason = SignalFunnelReason.EXPOSURE_MARGIN_BLOCKED
+        elif any(x in reason for x in ["open-interest", "open interest", "short setup", "short restriction"]):
+            mapped_reason = SignalFunnelReason.OI_SHORT_RESTRICTION
+        elif "atr policy" in reason:
+            mapped_reason = SignalFunnelReason.ATR_POLICY_ENTRY_BLOCKED
+        elif any(x in reason for x in ["components do not agree", "secondary strategy disagrees", "agreement below"]):
+            mapped_reason = SignalFunnelReason.AGREEMENT_BELOW_MINIMUM
+        elif "visual" in reason:
+            mapped_reason = SignalFunnelReason.VISUAL_SCREEN_BLOCKED
+        elif "threshold" in reason:
+            mapped_reason = SignalFunnelReason.BELOW_ENTRY_THRESHOLD
 
-    return counts
+        if mapped_reason:
+            buckets[mapped_reason.value] += 1
+            counts["explained_rejections_total"] += 1
+        else:
+            # Check for strategy-level hold that wasn't mapped
+            if signal.action == SignalAction.HOLD:
+                buckets[SignalFunnelReason.STRATEGY_HOLD_UNMAPPED.value] += 1
+                counts["explained_rejections_total"] += 1
+            else:
+                counts["unexplained_candidates_total"] += 1
+                buckets[SignalFunnelReason.UNEXPLAINED_CANDIDATE.value] += 1
+
+    counts["raw_candidates_total"] = counts["raw_long_candidates"] + counts["raw_short_candidates"]
+    counts["accounted_candidates_total"] = counts["executed_entries"] + counts["explained_rejections_total"] + counts["unexplained_candidates_total"]
+    
+    # Sanity check: If total raw > processed, the discrepancy is unexplained
+    if counts["raw_candidates_total"] > processed_reports:
+        diff = counts["raw_candidates_total"] - processed_reports
+        counts["unexplained_candidates_total"] += diff
+        counts["accounted_candidates_total"] += diff
+        buckets[SignalFunnelReason.UNEXPLAINED_CANDIDATE.value] += diff
+
+    return {**counts, "block_reasons": buckets}
 
 
 def _group_performance(

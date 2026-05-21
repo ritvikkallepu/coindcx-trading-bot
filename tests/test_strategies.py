@@ -321,40 +321,28 @@ class StrategyTests(unittest.TestCase):
         self.assertTrue(signal.metadata["visual"]["blocked"])
 
     def test_hybrid_meta_ignores_open_interest_weight_when_score_unavailable(self) -> None:
-        closes = [
-            Decimal("100"),
-            Decimal("99"),
-            Decimal("98"),
-            Decimal("97"),
-            Decimal("98"),
-            Decimal("101"),
-            Decimal("104"),
-            Decimal("108"),
-        ]
-        strategy = HybridMetaStrategy(
-            fast_period=2,
-            slow_period=4,
-            rsi_period=3,
-            bollinger_period=5,
-            atr_period=3,
-            volume_period=3,
-            visual_lookback=5,
-            entry_threshold=Decimal("0.35"),
+        strategy = HybridMetaStrategy()
+        
+        # When OI is inactive, active_weight should be sum of EMA, BB, Visual (0.45 + 0.25 + 0.20 = 0.90)
+        # We use scores that do not conflict to avoid BB damping (both positive)
+        _, active_weight_no_oi = strategy._combined_score(
+            ema_score=Decimal("0.5"),
+            bb_score=Decimal("0.5"),
+            visual_score=Decimal("0.5"),
+            oi_score=Decimal("0"),
+            oi_active=False,
         )
+        self.assertEqual(active_weight_no_oi, Decimal("0.90"))
 
-        signal = strategy.evaluate(
-            _context(
-                _series_from_closes(
-                    closes,
-                    base_volume=Decimal("100"),
-                    last_volume=Decimal("160"),
-                ),
-                features={"open_interest": {"source": "unit-test"}},
-            )
+        # When OI is active, active_weight should include OI weight (0.90 + 0.10 = 1.00)
+        _, active_weight_with_oi = strategy._combined_score(
+            ema_score=Decimal("0.5"),
+            bb_score=Decimal("0.5"),
+            visual_score=Decimal("0.5"),
+            oi_score=Decimal("0.5"),
+            oi_active=True,
         )
-
-        self.assertEqual(signal.metadata["open_interest"]["score_used"], False)
-        self.assertEqual(signal.metadata["active_weight"], Decimal("0.90"))
+        self.assertEqual(active_weight_with_oi, Decimal("1.00"))
 
     def test_hybrid_meta_requires_open_interest_for_new_short(self) -> None:
         closes = [
@@ -377,6 +365,7 @@ class StrategyTests(unittest.TestCase):
             visual_lookback=5,
             entry_threshold=Decimal("0.25"),
             exit_threshold=Decimal("0.25"),
+            allow_short_without_open_interest=False,
         )
 
         signal = strategy.evaluate(

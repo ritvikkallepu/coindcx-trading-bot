@@ -112,12 +112,50 @@ class SweepConfig:
     atr_period: int = 14
     atr_stop_multiple: Decimal = Decimal("1.5")
     atr_take_profit_multiple: Decimal = Decimal("3")
+    atr_trailing_multiple: Decimal = Decimal("2.0")
     atr_take_profit_mode: str = "none"
     risk_per_trade_pct_values: tuple[Decimal, ...] = ()
     leverage_values: tuple[Decimal, ...] = ()
     take_profit_pct_values: tuple[Decimal | None, ...] = ()
     trailing_profiles: tuple[TrailingProfile, ...] = ()
     atr_dynamic_exits_values: tuple[bool, ...] = ()
+    
+    # Task 2: Equity giveback guard
+    equity_giveback_guard_enabled: bool = False
+    equity_giveback_threshold_pct: Decimal = Decimal("0.035")
+    equity_giveback_cooldown_candles: int = 72
+    
+    # Task 3: Loss-streak cooldown enhancements
+    loss_streak_cooldown_enabled: bool = False
+    consecutive_loss_limit: int = 3
+    loss_streak_cooldown_candles: int = 12
+    rolling_loss_window: int = 8
+    rolling_loss_limit: int = 5
+    rolling_loss_cooldown_candles: int = 36
+    
+    # Task 4: Post-spike cooldown
+    post_spike_cooldown_enabled: bool = False
+    post_spike_lookback_candles: int = 50
+    post_spike_gain_threshold_pct: Decimal = Decimal("0.05")
+    post_spike_cooldown_candles: int = 24
+    
+    # Task 5: Breakeven and profit-lock
+    breakeven_enabled: bool = False
+    breakeven_activation_r: Decimal = Decimal("1.0")
+    breakeven_offset_r: Decimal = Decimal("0")
+    profit_lock_enabled: bool = False
+    profit_lock_activation_r: Decimal = Decimal("1.5")
+    profit_lock_r: Decimal = Decimal("0.5")
+    atr_trail_after_r_enabled: bool = False
+    atr_trail_activation_r: Decimal = Decimal("2.0")
+    
+    # Task 6: Chop/regime filter
+    chop_filter_enabled: bool = False
+    min_ema_gap_pct: Decimal = Decimal("0.0015")
+    min_atr_pct: Decimal = Decimal("0.002")
+    block_flat_ema_enabled: bool = False
+    block_low_atr_enabled: bool = False
+
     until: datetime | None = None
     output_dir: Path = Path("research/backtests")
     max_runs: int | None = None
@@ -177,6 +215,7 @@ SUMMARY_FIELDS = (
     "atr_period",
     "atr_stop_multiple",
     "atr_take_profit_multiple",
+    "atr_trailing_multiple",
     "atr_take_profit_mode",
     "accepted_reports",
     "rejected_reports",
@@ -749,7 +788,34 @@ def _run_one(
         atr_period=config.atr_period,
         atr_stop_multiple=config.atr_stop_multiple,
         atr_take_profit_multiple=config.atr_take_profit_multiple,
+        atr_trailing_multiple=config.atr_trailing_multiple,
         atr_take_profit_mode=config.atr_take_profit_mode,
+        equity_giveback_guard_enabled=config.equity_giveback_guard_enabled,
+        equity_giveback_threshold_pct=config.equity_giveback_threshold_pct,
+        equity_giveback_cooldown_candles=config.equity_giveback_cooldown_candles,
+        loss_streak_cooldown_enabled=config.loss_streak_cooldown_enabled,
+        consecutive_loss_limit=config.consecutive_loss_limit,
+        loss_streak_cooldown_candles=config.loss_streak_cooldown_candles,
+        rolling_loss_window=config.rolling_loss_window,
+        rolling_loss_limit=config.rolling_loss_limit,
+        rolling_loss_cooldown_candles=config.rolling_loss_cooldown_candles,
+        post_spike_cooldown_enabled=config.post_spike_cooldown_enabled,
+        post_spike_lookback_candles=config.post_spike_lookback_candles,
+        post_spike_gain_threshold_pct=config.post_spike_gain_threshold_pct,
+        post_spike_cooldown_candles=config.post_spike_cooldown_candles,
+        breakeven_enabled=config.breakeven_enabled,
+        breakeven_activation_r=config.breakeven_activation_r,
+        breakeven_offset_r=config.breakeven_offset_r,
+        profit_lock_enabled=config.profit_lock_enabled,
+        profit_lock_activation_r=config.profit_lock_activation_r,
+        profit_lock_r=config.profit_lock_r,
+        atr_trail_after_r_enabled=config.atr_trail_after_r_enabled,
+        atr_trail_activation_r=config.atr_trail_activation_r,
+        chop_filter_enabled=config.chop_filter_enabled,
+        min_ema_gap_pct=config.min_ema_gap_pct,
+        min_atr_pct=config.min_atr_pct,
+        block_flat_ema_enabled=config.block_flat_ema_enabled,
+        block_low_atr_enabled=config.block_low_atr_enabled,
     )
     engine = BacktestEngine(
         config=backtest_config,
@@ -871,6 +937,7 @@ def _assumptions(config: SweepConfig, *, status: str) -> dict[str, object]:
         "atr_period": config.atr_period,
         "atr_stop_multiple": config.atr_stop_multiple,
         "atr_take_profit_multiple": config.atr_take_profit_multiple,
+        "atr_trailing_multiple": config.atr_trailing_multiple,
         "atr_take_profit_mode": config.atr_take_profit_mode,
         "risk_grid": _grid_label(config.risk_per_trade_pct_values),
         "leverage_grid": _grid_label(config.leverage_values),
@@ -995,6 +1062,7 @@ def _summary_row(result: BacktestResult, variant: StrategyVariant) -> dict[str, 
         "atr_period": result.config.atr_period,
         "atr_stop_multiple": result.config.atr_stop_multiple,
         "atr_take_profit_multiple": result.config.atr_take_profit_multiple,
+        "atr_trailing_multiple": result.config.atr_trailing_multiple,
         "atr_take_profit_mode": result.config.atr_take_profit_mode,
         "accepted_reports": summary["accepted_report_count"],
         "rejected_reports": summary["rejected_report_count"],
@@ -1069,6 +1137,7 @@ def _error_row(
         "atr_period": "",
         "atr_stop_multiple": "",
         "atr_take_profit_multiple": "",
+        "atr_trailing_multiple": "",
         "atr_take_profit_mode": "",
         "accepted_reports": "",
         "rejected_reports": "",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Iterable
@@ -24,6 +24,7 @@ from app.risk.models import InstrumentMetadata, OpenPosition, RiskDecision
 from app.strategies.base import (
     SignalAction,
     SignalDirection,
+    SignalFunnelReason,
     StrategyContext,
     StrategyEngine,
     StrategySignal,
@@ -64,17 +65,34 @@ class _ATRExecutionSettings:
 
 
 @dataclass
-class _LossStreakState:
-    max_consecutive_losses: int
-    cooldown_ms: int
-    stop_cooldown_ms: int
+class _BacktestSafetyState:
+    config: BacktestConfig
+    interval_ms: int
+    peak_equity: Decimal
     consecutive_losses: int = 0
+    recent_trades: list[BacktestTrade] = field(default_factory=list)
+    equity_history: list[tuple[int, Decimal]] = field(default_factory=list)
+    
     cooldown_until_ms: int = 0
     stop_cooldown_until_ms: int = 0
-    blocked_entries: int = 0
+    giveback_cooldown_until_ms: int = 0
+    post_spike_cooldown_until_ms: int = 0
+    
+    blocked_count_streak: int = 0
+    blocked_count_rolling: int = 0
+    blocked_count_giveback: int = 0
+    blocked_count_post_spike: int = 0
 
     def active(self, timestamp_ms: int) -> bool:
-        return timestamp_ms < max(self.cooldown_until_ms, self.stop_cooldown_until_ms)
+        return timestamp_ms < self.max_cooldown(timestamp_ms)
+
+    def max_cooldown(self, timestamp_ms: int) -> int:
+        return max(
+            self.cooldown_until_ms,
+            self.stop_cooldown_until_ms,
+            self.giveback_cooldown_until_ms,
+            self.post_spike_cooldown_until_ms
+        )
 
     def reason(self, timestamp_ms: int) -> str:
         if timestamp_ms < self.stop_cooldown_until_ms:
@@ -83,33 +101,101 @@ class _LossStreakState:
                 "Stop-loss cooldown active after a losing stop exit; "
                 f"remaining_ms={remaining_ms}."
             )
-        remaining_ms = max(self.cooldown_until_ms - timestamp_ms, 0)
-        return (
-            "Loss-streak cooldown active after "
-            f"{self.consecutive_losses} consecutive losing trade(s); "
-            f"remaining_ms={remaining_ms}."
-        )
+        if timestamp_ms < self.giveback_cooldown_until_ms:
+            return "equity_giveback_guard"
+        if timestamp_ms < self.post_spike_cooldown_until_ms:
+            return "post_spike_cooldown"
+        if timestamp_ms < self.cooldown_until_ms:
+            remaining_ms = max(self.cooldown_until_ms - timestamp_ms, 0)
+            return (
+                "Loss-streak cooldown active after "
+                f"{self.consecutive_losses} consecutive losing trade(s); "
+                f"remaining_ms={remaining_ms}."
+            )
+        return "none"
+
+    def observe_candle(self, candle: OHLCVCandle, equity: Decimal) -> None:
+        self.equity_history.append((candle.close_time_ms, equity))
+        if len(self.equity_history) > max(100, self.config.post_spike_lookback_candles + 1):
+            self.equity_history.pop(0)
+
+        # Task 2: Equity giveback
+        if self.config.equity_giveback_guard_enabled:
+            self.peak_equity = max(self.peak_equity, equity)
+            if self.peak_equity > 0:
+                giveback = (self.peak_equity - equity) / self.peak_equity
+                if giveback >= self.config.equity_giveback_threshold_pct:
+                    self.giveback_cooldown_until_ms = max(
+                        self.giveback_cooldown_until_ms,
+                        candle.close_time_ms + self.config.equity_giveback_cooldown_candles * self.interval_ms
+                    )
+
+        # Task 4: Post-spike cooldown
+        if self.config.post_spike_cooldown_enabled:
+            lookback = self.config.post_spike_lookback_candles
+            if len(self.equity_history) > lookback:
+                past_equity = self.equity_history[-lookback][1]
+                if past_equity > 0:
+                    gain = (equity - past_equity) / past_equity
+                    if gain >= self.config.post_spike_gain_threshold_pct:
+                        self.post_spike_cooldown_until_ms = max(
+                            self.post_spike_cooldown_until_ms,
+                            candle.close_time_ms + self.config.post_spike_cooldown_candles * self.interval_ms
+                        )
 
     def observe_trade(self, trade: BacktestTrade) -> None:
+        self.recent_trades.append(trade)
+        if len(self.recent_trades) > 50:
+            self.recent_trades.pop(0)
+
         if trade.net_pnl < 0:
-            if self.stop_cooldown_ms > 0 and _is_stop_exit_reason(trade.exit_reason):
+            # Existing stop cooldown logic
+            stop_cooldown_ms = self.config.stop_loss_cooldown_candles * self.interval_ms
+            if stop_cooldown_ms > 0 and _is_stop_exit_reason(trade.exit_reason):
                 self.stop_cooldown_until_ms = max(
                     self.stop_cooldown_until_ms,
-                    trade.exit_time_ms + self.stop_cooldown_ms,
+                    trade.exit_time_ms + stop_cooldown_ms,
                 )
-            if self.max_consecutive_losses <= 0 or self.cooldown_ms <= 0:
-                return
+
+            # Task 3: Loss-streak cooldown
             self.consecutive_losses += 1
-            if self.consecutive_losses >= self.max_consecutive_losses:
+            
+            # Consecutive limit
+            consecutive_limit = self.config.consecutive_loss_limit if self.config.loss_streak_cooldown_enabled else self.config.max_consecutive_losses
+            streak_cooldown_ms = (self.config.loss_streak_cooldown_candles if self.config.loss_streak_cooldown_enabled else self.config.loss_cooldown_candles) * self.interval_ms
+            
+            if consecutive_limit > 0 and self.consecutive_losses >= consecutive_limit:
                 self.cooldown_until_ms = max(
                     self.cooldown_until_ms,
-                    trade.exit_time_ms + self.cooldown_ms,
+                    trade.exit_time_ms + streak_cooldown_ms,
                 )
-            return
-        if trade.net_pnl > 0:
+
+            # Rolling window
+            if self.config.loss_streak_cooldown_enabled:
+                window = self.config.rolling_loss_window
+                rolling_limit = self.config.rolling_loss_limit
+                if len(self.recent_trades) >= window:
+                    window_trades = self.recent_trades[-window:]
+                    losses_in_window = sum(1 for t in window_trades if t.net_pnl < 0)
+                    if losses_in_window >= rolling_limit:
+                        self.cooldown_until_ms = max(
+                            self.cooldown_until_ms,
+                            trade.exit_time_ms + self.config.rolling_loss_cooldown_candles * self.interval_ms,
+                        )
+        else:
             self.consecutive_losses = 0
             if trade.exit_time_ms >= self.cooldown_until_ms:
                 self.cooldown_until_ms = 0
+
+    def record_blocked(self, reason: str) -> None:
+        if "equity_giveback_guard" in reason:
+            self.blocked_count_giveback += 1
+        elif "post_spike_cooldown" in reason:
+            self.blocked_count_post_spike += 1
+        elif "loss_streak_cooldown" in reason:
+            # We don't distinguish between rolling and consecutive for count currently
+            # but we could if we want. Let's just count it as streak for now.
+            self.blocked_count_streak += 1
 
 
 class BacktestEngine:
@@ -163,12 +249,10 @@ class BacktestEngine:
         daily_net_pnl: dict[str, Decimal] = {}
         daily_start_equity: dict[str, Decimal] = {}
         halted_days: set[str] = set()
-        loss_streak = _LossStreakState(
-            max_consecutive_losses=self.config.max_consecutive_losses,
-            cooldown_ms=self.config.loss_cooldown_candles
-            * interval_to_ms(self.config.interval),
-            stop_cooldown_ms=self.config.stop_loss_cooldown_candles
-            * interval_to_ms(self.config.interval),
+        safety_state = _BacktestSafetyState(
+            config=self.config,
+            interval_ms=interval_to_ms(self.config.interval),
+            peak_equity=self.config.starting_equity,
         )
 
         for candle in all_candles:
@@ -185,7 +269,7 @@ class BacktestEngine:
                     trades=trades,
                     open_trade_legs=open_trade_legs,
                     daily_net_pnl=daily_net_pnl,
-                    loss_streak=loss_streak,
+                    safety_state=safety_state,
                 )
 
             for report in execution.process_candle(candle):
@@ -195,7 +279,7 @@ class BacktestEngine:
                     trades=trades,
                     open_trade_legs=open_trade_legs,
                     daily_net_pnl=daily_net_pnl,
-                    loss_streak=loss_streak,
+                    safety_state=safety_state,
                 )
 
             funding_paid = _apply_funding_if_due(
@@ -207,6 +291,11 @@ class BacktestEngine:
                 daily_net_pnl[day] = daily_net_pnl.get(day, Decimal("0")) - funding_paid
 
             series.add(candle)
+            
+            # Update safety state with latest equity
+            current_snapshot = broker.snapshot({self.config.pair: candle.close})
+            safety_state.observe_candle(candle, current_snapshot.equity)
+
             if _daily_loss_kill_switch_reached(
                 broker=broker,
                 candle=candle,
@@ -222,7 +311,7 @@ class BacktestEngine:
                         trades=trades,
                         open_trade_legs=open_trade_legs,
                         daily_net_pnl=daily_net_pnl,
-                        loss_streak=loss_streak,
+                        safety_state=safety_state,
                     )
                 )
                 halted_days.add(day)
@@ -251,6 +340,18 @@ class BacktestEngine:
             )
 
             for signal in self.strategy_engine.evaluate(context):
+                # Ensure every signal from evaluate is marked as a raw candidate if it has directional intent
+                if signal.direction is not None and signal.action in {SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT, SignalAction.HOLD}:
+                    if not signal.metadata.get("signal_funnel_raw_candidate"):
+                        signal = replace(
+                            signal,
+                            metadata={
+                                **signal.metadata,
+                                "signal_funnel_raw_candidate": True,
+                                "signal_funnel_raw_direction": signal.direction.value
+                            }
+                        )
+
                 signal = _apply_exit_overrides(
                     signal,
                     self.config,
@@ -286,15 +387,20 @@ class BacktestEngine:
                 )
                 if _entry_blocked_by_loss_cooldown(
                     decision.signal,
-                    loss_streak=loss_streak,
+                    safety_state=safety_state,
                     timestamp_ms=candle.close_time_ms,
                 ):
+                    reason = safety_state.reason(candle.close_time_ms)
                     decision = RiskDecision(
                         approved=False,
-                        reason=loss_streak.reason(candle.close_time_ms),
-                        signal=decision.signal,
+                        reason=reason,
+                        signal=replace(
+                            decision.signal, 
+                            metadata={**decision.signal.metadata, "funnel_reason": SignalFunnelReason.COOLDOWN_BLOCKED.value}
+                        ),
                     )
-                    loss_streak.blocked_entries += 1
+                    safety_state.record_blocked(reason)
+
                 if _should_defer_decision(decision):
                     pending_decisions.append(
                         _PendingDecision(
@@ -314,7 +420,7 @@ class BacktestEngine:
                     trades=trades,
                     open_trade_legs=open_trade_legs,
                     daily_net_pnl=daily_net_pnl,
-                    loss_streak=loss_streak,
+                    safety_state=safety_state,
                 )
                 if not report.accepted:
                     continue
@@ -333,7 +439,7 @@ class BacktestEngine:
                             trades=trades,
                             open_trade_legs=open_trade_legs,
                             daily_net_pnl=daily_net_pnl,
-                            loss_streak=loss_streak,
+                            safety_state=safety_state,
                         )
                     )
                     halted_days.add(day)
@@ -345,10 +451,19 @@ class BacktestEngine:
                     atr=indicators.atr,
                     stop_multiple=self.config.atr_stop_multiple,
                     take_profit_multiple=self.config.atr_take_profit_multiple,
+                    trailing_multiple=self.config.atr_trailing_multiple,
                     stop_enabled=self.config.atr_stop_enabled,
                     take_profit_enabled=self.config.atr_take_profit_enabled,
                     trailing_enabled=self.config.atr_trailing_enabled,
                     take_profit_mode=self.config.atr_take_profit_mode,
+                    breakeven_enabled=self.config.breakeven_enabled,
+                    breakeven_activation_r=self.config.breakeven_activation_r,
+                    breakeven_offset_r=self.config.breakeven_offset_r,
+                    profit_lock_enabled=self.config.profit_lock_enabled,
+                    profit_lock_activation_r=self.config.profit_lock_activation_r,
+                    profit_lock_r=self.config.profit_lock_r,
+                    atr_trail_after_r_enabled=self.config.atr_trail_after_r_enabled,
+                    atr_trail_activation_r=self.config.atr_trail_activation_r,
                 )
 
             equity_curve.append(_equity_point(broker, candle))
@@ -375,7 +490,7 @@ class BacktestEngine:
                     trades=trades,
                     open_trade_legs=open_trade_legs,
                     daily_net_pnl=daily_net_pnl,
-                    loss_streak=loss_streak,
+                    safety_state=safety_state,
                 )
             )
             if equity_curve:
@@ -437,12 +552,10 @@ class BacktestEngine:
         daily_net_pnl: dict[str, Decimal] = {}
         daily_start_equity: dict[str, Decimal] = {}
         halted_days: set[str] = set()
-        loss_streak = _LossStreakState(
-            max_consecutive_losses=self.config.max_consecutive_losses,
-            cooldown_ms=self.config.loss_cooldown_candles
-            * interval_to_ms(self.config.interval),
-            stop_cooldown_ms=self.config.stop_loss_cooldown_candles
-            * interval_to_ms(self.config.interval),
+        safety_state = _BacktestSafetyState(
+            config=self.config,
+            interval_ms=interval_to_ms(self.config.interval),
+            peak_equity=self.config.starting_equity,
         )
 
         child_by_parent = _execution_candles_by_parent(all_candles, execution_list)
@@ -470,7 +583,7 @@ class BacktestEngine:
                         trades=trades,
                         open_trade_legs=open_trade_legs,
                         daily_net_pnl=daily_net_pnl,
-                        loss_streak=loss_streak,
+                        safety_state=safety_state,
                     )
                     for report in reports[before_reports:]:
                         active_bias = _entry_bias_from_report(report, active_bias)
@@ -483,9 +596,8 @@ class BacktestEngine:
                         trades=trades,
                         open_trade_legs=open_trade_legs,
                         daily_net_pnl=daily_net_pnl,
-                        loss_streak=loss_streak,
+                        safety_state=safety_state,
                     )
-
                 closed_trades = trades[before_trades:]
                 if closed_trades:
                     reentry_cooldown_until_ms = max(
@@ -496,6 +608,10 @@ class BacktestEngine:
                             * interval_to_ms(execution_interval)
                         ),
                     )
+
+                # Update safety state with latest equity
+                current_snapshot = broker.snapshot({self.config.pair: child.close})
+                safety_state.observe_candle(child, current_snapshot.equity)
 
                 if _daily_loss_kill_switch_reached(
                     broker=broker,
@@ -512,7 +628,7 @@ class BacktestEngine:
                             trades=trades,
                             open_trade_legs=open_trade_legs,
                             daily_net_pnl=daily_net_pnl,
-                            loss_streak=loss_streak,
+                            safety_state=safety_state,
                         )
                     )
                     halted_days.add(day)
@@ -525,7 +641,7 @@ class BacktestEngine:
                     and parent_reentries < self.config.max_reentries_per_candle
                     and not broker.open_positions()
                     and child.close_time_ms >= reentry_cooldown_until_ms
-                    and not loss_streak.active(child.close_time_ms)
+                    and not safety_state.active(child.close_time_ms)
                     and _favorable_reentry_candle(child, active_bias)
                 ):
                     parent_reentries += 1
@@ -568,15 +684,19 @@ class BacktestEngine:
                     )
                     if _entry_blocked_by_loss_cooldown(
                         decision.signal,
-                        loss_streak=loss_streak,
+                        safety_state=safety_state,
                         timestamp_ms=child.close_time_ms,
                     ):
+                        reason = safety_state.reason(child.close_time_ms)
                         decision = RiskDecision(
                             approved=False,
-                            reason=loss_streak.reason(child.close_time_ms),
-                            signal=decision.signal,
+                            reason=reason,
+                            signal=replace(
+                                decision.signal, 
+                                metadata={**decision.signal.metadata, "funnel_reason": SignalFunnelReason.COOLDOWN_BLOCKED.value}
+                            ),
                         )
-                        loss_streak.blocked_entries += 1
+                        safety_state.record_blocked(reason)
                     if _should_defer_decision(decision):
                         pending_decisions.append(
                             _PendingDecision(
@@ -596,9 +716,8 @@ class BacktestEngine:
                             trades=trades,
                             open_trade_legs=open_trade_legs,
                             daily_net_pnl=daily_net_pnl,
-                            loss_streak=loss_streak,
+                            safety_state=safety_state,
                         )
-
             funding_paid = _apply_funding_if_due(
                 broker=broker,
                 config=self.config,
@@ -662,15 +781,19 @@ class BacktestEngine:
                     )
                     if _entry_blocked_by_loss_cooldown(
                         decision.signal,
-                        loss_streak=loss_streak,
+                        safety_state=safety_state,
                         timestamp_ms=parent_candle.close_time_ms,
                     ):
+                        reason = safety_state.reason(parent_candle.close_time_ms)
                         decision = RiskDecision(
                             approved=False,
-                            reason=loss_streak.reason(parent_candle.close_time_ms),
-                            signal=decision.signal,
+                            reason=reason,
+                            signal=replace(
+                                decision.signal, 
+                                metadata={**decision.signal.metadata, "funnel_reason": SignalFunnelReason.COOLDOWN_BLOCKED.value}
+                            ),
                         )
-                        loss_streak.blocked_entries += 1
+                        safety_state.record_blocked(reason)
                     if _should_defer_decision(decision):
                         pending_decisions.append(
                             _PendingDecision(
@@ -690,19 +813,27 @@ class BacktestEngine:
                             trades=trades,
                             open_trade_legs=open_trade_legs,
                             daily_net_pnl=daily_net_pnl,
-                            loss_streak=loss_streak,
+                            safety_state=safety_state,
                         )
-
                 if self.config.atr_dynamic_exits_enabled:
                     broker.update_dynamic_atr_exits(
                         parent_candle,
                         atr=indicators.atr,
                         stop_multiple=self.config.atr_stop_multiple,
                         take_profit_multiple=self.config.atr_take_profit_multiple,
+                        trailing_multiple=self.config.atr_trailing_multiple,
                         stop_enabled=self.config.atr_stop_enabled,
                         take_profit_enabled=self.config.atr_take_profit_enabled,
                         trailing_enabled=self.config.atr_trailing_enabled,
                         take_profit_mode=self.config.atr_take_profit_mode,
+                        breakeven_enabled=self.config.breakeven_enabled,
+                        breakeven_activation_r=self.config.breakeven_activation_r,
+                        breakeven_offset_r=self.config.breakeven_offset_r,
+                        profit_lock_enabled=self.config.profit_lock_enabled,
+                        profit_lock_activation_r=self.config.profit_lock_activation_r,
+                        profit_lock_r=self.config.profit_lock_r,
+                        atr_trail_after_r_enabled=self.config.atr_trail_after_r_enabled,
+                        atr_trail_activation_r=self.config.atr_trail_activation_r,
                     )
 
             equity_curve.append(_equity_point(broker, parent_candle))
@@ -729,7 +860,7 @@ class BacktestEngine:
                     trades=trades,
                     open_trade_legs=open_trade_legs,
                     daily_net_pnl=daily_net_pnl,
-                    loss_streak=loss_streak,
+                    safety_state=safety_state,
                 )
             )
             if equity_curve:
@@ -772,12 +903,12 @@ def _should_defer_decision(decision: RiskDecision) -> bool:
 def _entry_blocked_by_loss_cooldown(
     signal: StrategySignal,
     *,
-    loss_streak: _LossStreakState,
+    safety_state: _BacktestSafetyState,
     timestamp_ms: int,
 ) -> bool:
     if signal.action not in {SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT}:
         return False
-    return loss_streak.active(timestamp_ms)
+    return safety_state.active(timestamp_ms)
 
 
 def _apply_entry_safety_filter(
@@ -794,11 +925,12 @@ def _apply_entry_safety_filter(
     if signal.action not in {SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT}:
         return decision
 
+    atr = getattr(indicators, "atr", None)
     reason = _entry_safety_rejection_reason(
         signal,
         series=series,
         latest_candle=latest_candle,
-        atr=indicators.atr if indicators is not None else None,
+        atr=atr,
         config=config,
     )
     if reason is None:
@@ -823,7 +955,27 @@ def _entry_safety_rejection_reason(
     config: BacktestConfig,
 ) -> str | None:
     direction = signal.direction
-    if direction is None or atr is None or atr <= 0 or not config.atr_entry_filter_enabled:
+    if direction is None or atr is None or atr <= 0:
+        return None
+
+    # Task 6: Chop/regime filter
+    if config.chop_filter_enabled:
+        if config.block_low_atr_enabled:
+            atr_ratio = (atr / latest_candle.close) if latest_candle.close > 0 else Decimal("0")
+            if atr_ratio < config.min_atr_pct:
+                return "atr_too_low"
+        
+        if config.block_flat_ema_enabled:
+            fast = signal.metadata.get("ema_fast")
+            slow = signal.metadata.get("ema_slow")
+            if isinstance(fast, (Decimal, float, int)) and isinstance(slow, (Decimal, float, int)):
+                fast_dec = Decimal(str(fast))
+                slow_dec = Decimal(str(slow))
+                gap_ratio = abs(fast_dec - slow_dec) / latest_candle.close if latest_candle.close > 0 else Decimal("0")
+                if gap_ratio < config.min_ema_gap_pct:
+                    return "ema_gap_too_small"
+
+    if not config.atr_entry_filter_enabled:
         return _component_agreement_rejection(signal, config=config)
 
     candle_range = latest_candle.high - latest_candle.low
@@ -1106,7 +1258,7 @@ def _fill_pending_decisions(
     trades: list[BacktestTrade],
     open_trade_legs: dict[str, _OpenTradeLeg],
     daily_net_pnl: dict[str, Decimal],
-    loss_streak: _LossStreakState,
+    safety_state: _BacktestSafetyState,
 ) -> list[_PendingDecision]:
     still_pending: list[_PendingDecision] = []
     for pending in pending_decisions:
@@ -1124,7 +1276,7 @@ def _fill_pending_decisions(
             trades=trades,
             open_trade_legs=open_trade_legs,
             daily_net_pnl=daily_net_pnl,
-            loss_streak=loss_streak,
+            safety_state=safety_state,
         )
     return still_pending
 
@@ -1180,7 +1332,7 @@ def _atr_execution_settings(
     trailing_enabled = config.atr_trailing_enabled
     stop_multiple = config.atr_stop_multiple
     take_profit_multiple = config.atr_take_profit_multiple
-    trailing_multiple = config.atr_stop_multiple
+    trailing_multiple = config.atr_trailing_multiple
     take_profit_mode = config.atr_take_profit_mode
     risk_multiplier = Decimal("1")
 
@@ -1208,8 +1360,12 @@ def _atr_execution_settings(
         )
         trailing_multiple = _metadata_decimal(
             signal.metadata,
-            "trailing_atr_multiple",
-            trailing_multiple,
+            "atr_trailing_multiple",
+            _metadata_decimal(
+                signal.metadata,
+                "trailing_atr_multiple",
+                trailing_multiple,
+            ),
         )
         take_profit_mode = str(
             signal.metadata.get("atr_take_profit_mode", take_profit_mode)
@@ -1225,7 +1381,7 @@ def _atr_execution_settings(
     if take_profit_multiple <= 0:
         take_profit_multiple = config.atr_take_profit_multiple
     if trailing_multiple <= 0:
-        trailing_multiple = stop_multiple
+        trailing_multiple = config.atr_trailing_multiple
     if take_profit_mode not in {"fixed", "entry_atr", "ratchet", "trailing_atr", "none"}:
         take_profit_mode = config.atr_take_profit_mode
     if not take_profit_enabled:
@@ -1303,6 +1459,7 @@ def _apply_exit_overrides(
                 "ATR policy blocked entry: "
                 f"{signal.metadata.get('atr_policy_reason', 'no policy reason')}"
             ),
+            funnel_reason=SignalFunnelReason.ATR_POLICY_ENTRY_BLOCKED,
             metadata={**signal.metadata, "atr_policy_blocked_entry": True},
         )
     if (
@@ -1425,7 +1582,7 @@ def _force_close_open_positions(
     trades: list[BacktestTrade],
     open_trade_legs: dict[str, _OpenTradeLeg],
     daily_net_pnl: dict[str, Decimal],
-    loss_streak: _LossStreakState,
+    safety_state: _BacktestSafetyState,
 ) -> list[PaperExecutionReport]:
     reports: list[PaperExecutionReport] = []
     for position in list(broker.open_positions()):
@@ -1458,7 +1615,7 @@ def _force_close_open_positions(
             trades=trades,
             open_trade_legs=open_trade_legs,
             daily_net_pnl=daily_net_pnl,
-            loss_streak=loss_streak,
+            safety_state=safety_state,
         )
     return reports
 
@@ -1469,7 +1626,7 @@ def _record_report(
     trades: list[BacktestTrade],
     open_trade_legs: dict[str, _OpenTradeLeg],
     daily_net_pnl: dict[str, Decimal],
-    loss_streak: _LossStreakState,
+    safety_state: _BacktestSafetyState,
 ) -> BacktestTrade | None:
     if not report.accepted or report.order is None or report.fill is None:
         return None
@@ -1492,6 +1649,17 @@ def _record_report(
     entry_leg = open_trade_legs.pop(report.order.pair, _OpenTradeLeg(Decimal("0")))
     fees = entry_leg.entry_fee + report.fill.fee
     gross_pnl = report.fill.realized_pnl
+    
+    # Collate metadata from position and report
+    metadata = {
+        **report.position.metadata,
+        **(report.signal.metadata if report.signal is not None else {}),
+        **report.fill.metadata,
+        "equity_after_trade": report.account.equity,
+        "account_blown": report.account.equity <= 0,
+        "available_equity": report.account.equity,
+    }
+    
     trade = BacktestTrade(
         pair=report.order.pair,
         strategy_name=report.position.strategy_name,
@@ -1505,16 +1673,10 @@ def _record_report(
         fees=fees,
         net_pnl=gross_pnl - fees,
         exit_reason=report.reason,
-        metadata={
-            **report.position.metadata,
-            **(report.signal.metadata if report.signal is not None else {}),
-            **report.fill.metadata,
-            "equity_after_trade": report.account.equity,
-            "account_blown": report.account.equity <= 0,
-        },
+        metadata=metadata,
     )
     trades.append(trade)
-    loss_streak.observe_trade(trade)
+    safety_state.observe_trade(trade)
     return trade
 
 
@@ -1591,10 +1753,15 @@ def _annotate_trade_diagnostics(
     return annotated
 
 
-def _pct(value: Decimal, base: Decimal) -> Decimal:
-    if base <= 0:
+def _pct(value: Any, base: Any) -> Decimal:
+    try:
+        v = Decimal(str(value))
+        b = Decimal(str(base))
+        if b <= 0:
+            return Decimal("0")
+        return (v / b) * Decimal("100")
+    except Exception:
         return Decimal("0")
-    return (value / base) * Decimal("100")
 
 
 def _is_stop_exit_reason(reason: str) -> bool:

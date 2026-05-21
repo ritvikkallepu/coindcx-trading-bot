@@ -5,7 +5,12 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from app.backtest.models import BacktestEquityPoint, BacktestResult, BacktestTrade
+from app.backtest.models import (
+    BacktestEquityPoint,
+    BacktestResult,
+    BacktestTrade,
+    backtest_report_diagnostics,
+)
 from app.config import Settings
 from app.fees import (
     COINDCX_FEE_GST_RATE,
@@ -47,6 +52,7 @@ class DashboardDefaults:
     atr_period: int = 14
     atr_stop_multiple: Decimal = Decimal("1.5")
     atr_take_profit_multiple: Decimal = Decimal("3")
+    atr_trailing_multiple: Decimal = Decimal("2.0")
     atr_take_profit_mode: str = "none"
     execution_interval: str = ""
     intrabar_reentry_enabled: bool = True
@@ -55,6 +61,44 @@ class DashboardDefaults:
     stop_loss_cooldown_candles: int = 1
     max_consecutive_losses: int = 2
     loss_cooldown_candles: int = 4
+    max_daily_loss_pct: Decimal = Decimal("10")
+    
+    # Task 2: Equity giveback guard
+    equity_giveback_guard_enabled: bool = False
+    equity_giveback_threshold_pct: Decimal = Decimal("0.035")
+    equity_giveback_cooldown_candles: int = 72
+    
+    # Task 3: Loss-streak cooldown enhancements
+    loss_streak_cooldown_enabled: bool = False
+    consecutive_loss_limit: int = 3
+    loss_streak_cooldown_candles: int = 12
+    rolling_loss_window: int = 8
+    rolling_loss_limit: int = 5
+    rolling_loss_cooldown_candles: int = 36
+    
+    # Task 4: Post-spike cooldown
+    post_spike_cooldown_enabled: bool = False
+    post_spike_lookback_candles: int = 50
+    post_spike_gain_threshold_pct: Decimal = Decimal("0.05")
+    post_spike_cooldown_candles: int = 24
+    
+    # Task 5: Breakeven and profit-lock
+    breakeven_enabled: bool = False
+    breakeven_activation_r: Decimal = Decimal("1.0")
+    breakeven_offset_r: Decimal = Decimal("0")
+    profit_lock_enabled: bool = False
+    profit_lock_activation_r: Decimal = Decimal("1.5")
+    profit_lock_r: Decimal = Decimal("0.5")
+    atr_trail_after_r_enabled: bool = False
+    atr_trail_activation_r: Decimal = Decimal("2.0")
+    
+    # Task 6: Chop/regime filter
+    chop_filter_enabled: bool = False
+    min_ema_gap_pct: Decimal = Decimal("0.0015")
+    min_atr_pct: Decimal = Decimal("0.002")
+    block_flat_ema_enabled: bool = False
+    block_low_atr_enabled: bool = False
+    
     strategy: str = "bb_dynamic_grid"
 
     def to_dict(self) -> dict[str, Any]:
@@ -139,6 +183,7 @@ def build_backtest_dashboard_payload(
             "rejected_reports": summary["rejected_report_count"],
         },
         "diagnostics": summary["diagnostics"],
+        "signal_funnel": summary["signal_funnel"],
         "strategy_profile": build_strategy_profile(
             strategy=result.config.strategy_name,
             interval=result.config.interval,
@@ -296,25 +341,64 @@ def classify_run_quality(result: BacktestResult) -> dict[str, str]:
             "tone": "warn",
             "detail": "No closed trades in this backtest window.",
         }
+    if metrics.trade_count < 10:
+        return {
+            "label": "Insignificant",
+            "tone": "warn",
+            "detail": f"Too few trades ({metrics.trade_count}) for statistical significance.",
+        }
 
     return_pct = metrics.total_return_pct
     drawdown_pct = metrics.max_drawdown_pct
     profit_factor = metrics.profit_factor or Decimal("0")
+    
+    # Advanced diagnostics for penalty - using raw objects to avoid string conversion issues
+    diag = backtest_report_diagnostics(result.reports, result.trades, result.equity_curve)
+    dependency_pct = diag.get("dependency", {}).get("top_5_dependency_pct", Decimal("0"))
+    thirds = diag.get("thirds_pnl", {})
+    one_regime_result = False
+    if thirds:
+        vals = [abs(v) for v in thirds.values()]
+        if max(vals) > 0 and (sum(1 for v in thirds.values() if v > 0) <= 1):
+             one_regime_result = True # Profit coming from only one third
 
-    if return_pct >= Decimal("8") and profit_factor >= Decimal("1.5") and drawdown_pct <= Decimal("5"):
+    # Return/DD ratio
+    ret_dd_ratio = return_pct / drawdown_pct if drawdown_pct > 0 else return_pct
+
+    if (
+        return_pct >= Decimal("10") 
+        and profit_factor >= Decimal("1.5") 
+        and drawdown_pct <= Decimal("6")
+        and dependency_pct < Decimal("40")
+        and not one_regime_result
+    ):
         return {
-            "label": "Strong Paper Run",
+            "label": "Strong Approved",
             "tone": "good",
-            "detail": "Positive return, healthy profit factor, and controlled drawdown.",
+            "detail": "Robust multi-regime performance with controlled dependency.",
         }
+        
+    if (
+        return_pct >= Decimal("5") 
+        and profit_factor >= Decimal("1.25") 
+        and ret_dd_ratio >= Decimal("0.8")
+        and dependency_pct < Decimal("60")
+    ):
+        return {
+            "label": "Watchlist+",
+            "tone": "good",
+            "detail": "Healthy metrics, suitable for careful paper testing.",
+        }
+
     if return_pct > 0 and profit_factor >= Decimal("1.1"):
         return {
             "label": "Watchlist",
             "tone": "warn",
-            "detail": "Positive result, but needs more validation before paper automation.",
+            "detail": "Positive result, but fragile or too dependent on few trades.",
         }
+        
     return {
         "label": "Weak Run",
         "tone": "bad",
-        "detail": "Result does not pass the paper-quality filter.",
+        "detail": "Result does not pass the quality filter (low PF, high DD, or high dependency).",
     }

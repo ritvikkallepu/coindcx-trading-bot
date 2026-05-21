@@ -4,10 +4,11 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from app.data.indicators import bollinger_bands, exponential_moving_average
+from app.data.indicators import average_true_range, bollinger_bands, exponential_moving_average
 from app.strategies.base import (
     SignalAction,
     SignalDirection,
+    SignalFunnelReason,
     Strategy,
     StrategyContext,
     StrategySignal,
@@ -131,6 +132,7 @@ class AdaptiveHybridStrategy(Strategy):
                 interval=context.interval,
                 timestamp_ms=latest.close_time_ms if latest is not None else 0,
                 reason=f"Adaptive hybrid waiting: {primary_signal.reason}",
+                funnel_reason=primary_signal.funnel_reason or SignalFunnelReason.BELOW_ENTRY_THRESHOLD,
                 metadata=metadata,
             )
 
@@ -162,6 +164,7 @@ class AdaptiveHybridStrategy(Strategy):
                 interval=context.interval,
                 timestamp_ms=latest.close_time_ms if latest is not None else 0,
                 reason=f"Adaptive hybrid visual filter blocked entry: {visual_metadata.get('reason')}",
+                funnel_reason=SignalFunnelReason.VISUAL_SCREEN_BLOCKED,
                 metadata=metadata,
             )
 
@@ -179,6 +182,7 @@ class AdaptiveHybridStrategy(Strategy):
                 interval=context.interval,
                 timestamp_ms=latest.close_time_ms if latest is not None else 0,
                 reason="Adaptive hybrid blocked short: open interest is not bearish enough.",
+                funnel_reason=SignalFunnelReason.OI_SHORT_RESTRICTION,
                 metadata=metadata,
             )
 
@@ -190,6 +194,7 @@ class AdaptiveHybridStrategy(Strategy):
                 interval=context.interval,
                 timestamp_ms=latest.close_time_ms if latest is not None else 0,
                 reason="Adaptive hybrid blocked entry: secondary strategy disagrees.",
+                funnel_reason=SignalFunnelReason.AGREEMENT_BELOW_MINIMUM,
                 metadata=metadata,
             )
 
@@ -315,12 +320,27 @@ class AdaptiveHybridStrategy(Strategy):
         if lookback_start > 0:
             lookback_move_pct = ((latest.close - lookback_start) / lookback_start) * Decimal("100")
 
+        # Instrument-agnostic normalization:
+        # Instead of static percentage thresholds, use ATR-derived ones.
+        atr_values = average_true_range(context.candles, self.ema_strategy.atr_period)
+        atr = atr_values[-1]
+        
+        effective_spread_ref = self.trend_spread_reference_pct
+        effective_move_ref = self.trend_move_reference_pct
+        
+        if atr is not None and atr > 0 and latest.close > 0:
+            natr_pct = (atr / latest.close) * Decimal("100")
+            # A healthy trend spread is roughly 0.4x ATR.
+            # A healthy lookback move is roughly 1.5x ATR.
+            effective_spread_ref = natr_pct * Decimal("0.4")
+            effective_move_ref = natr_pct * Decimal("1.5")
+
         trend_score = _clamp(
             (
-                _ratio(ema_spread_pct, self.trend_spread_reference_pct) * Decimal("0.65")
+                _ratio(ema_spread_pct, effective_spread_ref) * Decimal("0.65")
             )
             + (
-                _ratio(abs(lookback_move_pct), self.trend_move_reference_pct)
+                _ratio(abs(lookback_move_pct), effective_move_ref)
                 * Decimal("0.35")
             ),
             Decimal("0"),

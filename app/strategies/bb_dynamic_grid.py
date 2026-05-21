@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Mapping
 
 from app.data.indicators import BollingerBandPoint, average_true_range, bollinger_bands
+from app.persistence.paper_state import PaperStateStore
 from app.strategies.base import (
     SignalAction,
     SignalDirection,
@@ -38,7 +39,51 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
     fallback_stop_pct: Decimal = Decimal("0.035")
     trail_activation_pct: Decimal = Decimal("1")
     trail_distance_pct: Decimal = Decimal("2")
+    state_store: PaperStateStore | None = None
     _states: dict[str, _GridTrailState] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.state_store:
+             # We need to know which pair/interval to load for.
+             # Strategy.evaluate() is called per pair.
+             # Strategy objects are often shared.
+             # Wait, the instructions said:
+             # "On init: call load_strategy_state() with key = f"{self.name}:{pair}:{interval}" 
+             # and restore _states dict if found"
+             # But __init__ doesn't know the pair/interval yet.
+             # Let's check where it's instantiated.
+             pass
+
+    def _get_state(self, context: StrategyContext) -> _GridTrailState | None:
+        state_key = f"{self.name}:{context.pair}:{context.interval}"
+        if state_key not in self._states and self.state_store:
+            saved = self.state_store.load_strategy_state(state_key)
+            if saved:
+                # Convert dict back to _GridTrailState
+                self._states[state_key] = _GridTrailState(
+                    direction=SignalDirection(saved["direction"]),
+                    entries=int(saved["entries"]),
+                    last_grid_entry_price=Decimal(str(saved["last_grid_entry_price"])),
+                    entry_price=Decimal(str(saved["entry_price"])),
+                    best_close=Decimal(str(saved["best_close"])) if saved.get("best_close") else None,
+                    trailing_level=Decimal(str(saved["trailing_level"])) if saved.get("trailing_level") else None,
+                    trailing_active=bool(saved["trailing_active"]),
+                )
+        return self._states.get(state_key)
+
+    def _set_state(self, context: StrategyContext, state: _GridTrailState) -> None:
+        state_key = f"{self.name}:{context.pair}:{context.interval}"
+        self._states[state_key] = state
+        if self.state_store:
+            self.state_store.save_strategy_state(state_key, asdict(state))
+
+    def _pop_state(self, context: StrategyContext) -> None:
+        state_key = f"{self.name}:{context.pair}:{context.interval}"
+        self._states.pop(state_key, None)
+        if self.state_store:
+            # Maybe clear? Instructions didn't say to clear, just to save after every mutation.
+            # Pop is a mutation.
+            self.state_store.save_strategy_state(state_key, {})
 
     def evaluate(self, context: StrategyContext) -> StrategySignal:
         latest = context.latest_candle
@@ -58,9 +103,8 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
             return self._hold(context, "Bollinger Bands are still warming up.")
 
         position = _open_position(context)
-        state_key = _state_key(context)
         if position is None:
-            self._states.pop(state_key, None)
+            self._pop_state(context)
             return self._evaluate_new_grid(
                 context=context,
                 band=current_band,
@@ -148,6 +192,7 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
             activation_pct=activation_pct,
             distance_pct=distance_pct,
         )
+        self._set_state(context, state)
 
         metadata = self._base_metadata(band, atr, context)
         metadata.update(
@@ -185,7 +230,7 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
                 metadata=metadata,
             )
 
-        spacing = self._grid_spacing(latest.close, band)
+        spacing = self._grid_spacing(latest.close, band, atr)
         metadata["grid_spacing"] = spacing
         if self._scale_in_due(state, latest.close, spacing):
             return self._entry_signal(
@@ -272,7 +317,7 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
             entry_price,
         )
 
-        state = self._states.get(key)
+        state = self._get_state(context)
         if (
             state is None
             or state.direction != direction
@@ -287,12 +332,13 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
                 trailing_level=_decimal_or_none(metadata.get("grid_trailing_level")),
                 trailing_active=bool(metadata.get("grid_trailing_active", False)),
             )
-            self._states[key] = state
+            self._set_state(context, state)
             return state
 
         if entries > state.entries:
             state.entries = entries
             state.last_grid_entry_price = last_grid_entry
+            self._set_state(context, state)
         return state
 
     def _update_dynamic_trail(
@@ -349,10 +395,14 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
             return latest_close <= state.last_grid_entry_price - spacing
         return latest_close >= state.last_grid_entry_price + spacing
 
-    def _grid_spacing(self, latest_close: Decimal, band: BollingerBandPoint) -> Decimal:
+    def _grid_spacing(self, latest_close: Decimal, band: BollingerBandPoint, atr: Decimal | None) -> Decimal:
         band_spacing = (band.upper - band.lower) / Decimal(max(self.grid_levels, 1))
-        minimum_spacing = latest_close * self.min_grid_spacing_pct
-        return max(band_spacing, minimum_spacing)
+        minimum_spacing_pct = latest_close * self.min_grid_spacing_pct
+        
+        # ATR-relative spacing: at least 0.25x ATR
+        minimum_spacing_atr = (atr * Decimal("0.25")) if atr is not None and atr > 0 else Decimal("0")
+        
+        return max(band_spacing, minimum_spacing_pct, minimum_spacing_atr)
 
     def _disaster_stop(
         self,
