@@ -134,6 +134,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/paper-reset":
             self._handle_paper_reset()
             return
+        if parsed.path == "/api/paper-add-pair":
+            self._handle_paper_add_pair(self._read_json_body())
+            return
         self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: object) -> None:
@@ -291,6 +294,64 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
         loop.stop()
         self._send_json({"stopped": True})
+
+    def _handle_paper_add_pair(self, params: dict[str, Any]) -> None:
+        pair = params.get("pair")
+        if not pair:
+            self._send_json({"error": "No pair provided"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        
+        pair = _normalize_dashboard_pair(pair)
+        with self.server._paper_lock:
+            loop = self.server._paper_loop
+            
+        if not loop:
+            self._send_json({"error": "Paper loop not running"}, status=HTTPStatus.CONFLICT)
+            return
+            
+        if pair in loop._watchlist:
+            self._send_json({"error": f"{pair} already in watchlist"}, status=HTTPStatus.CONFLICT)
+            return
+            
+        # Add to watchlist and initialize if possible
+        loop._watchlist.append(pair)
+        # Note: In a real environment, we'd need to tell the running loop to subscribe 
+        # but for this requirement we'll just update the list so the user sees it.
+        # Ideally the loop's 'run' would need to be dynamic. 
+        # But per the prompt "Add selected pair to watchlist" button is enough for now.
+        # I will also add a dynamic subscription if it's easy.
+        
+        if hasattr(loop, "_ws_client") and loop._ws_client:
+             try:
+                 # Attempt dynamic warmup and subscription
+                 import threading
+                 def async_add():
+                     try:
+                        strategy_interval = loop.settings.strategy_interval if loop.settings.paper_intrabar_enabled else loop._current_interval
+                        loop.gap_guards[pair] = CandleGapGuard(strategy_interval)
+                        loop._warm_up(pair, strategy_interval)
+                        if loop.settings.paper_intrabar_enabled:
+                            loop._warm_up_execution(pair, loop.settings.execution_interval)
+                        
+                        from app.exchange.coindcx_ws import MarketSubscription
+                        from app.exchange.coindcx_channels import futures_candle_channel, futures_orderbook_channel
+                        subs = [
+                            MarketSubscription(futures_candle_channel(pair, strategy_interval), "candlestick"),
+                            MarketSubscription(futures_orderbook_channel(pair, 50), "depth-snapshot"),
+                            MarketSubscription(futures_orderbook_channel(pair, 50), "depth-update")
+                        ]
+                        if loop.settings.paper_intrabar_enabled and strategy_interval != loop.settings.execution_interval:
+                            subs.append(MarketSubscription(futures_candle_channel(pair, loop.settings.execution_interval), "candlestick"))
+                        
+                        loop._ws_client.subscribe(subs)
+                     except Exception as e:
+                         logging.getLogger("app.dashboard").error("Failed to add pair %s dynamically: %s", pair, e)
+                 
+                 threading.Thread(target=async_add, daemon=True).start()
+             except Exception:
+                 pass
+
+        self._send_json({"added": True, "pair": pair})
 
     def _handle_paper_reset(self) -> None:
         from app.live.paper_loop import get_active_loop, _update_live_state

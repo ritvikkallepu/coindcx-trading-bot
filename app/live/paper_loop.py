@@ -4,7 +4,7 @@ import logging
 import threading
 import json
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -33,6 +33,8 @@ from app.live.summary_logger import PaperTradingSummaryLogger
 class LivePaperState:
     running: bool = False
     pair: str = ""
+    watchlist: list[str] = field(default_factory=list)
+    scanned_pairs: dict[str, str] = field(default_factory=dict)
     interval: str = ""
     strategy: str = ""
     candle_count: int = 0
@@ -125,9 +127,36 @@ class PaperTradingLoop:
         self._entries_this_parent_candle: dict[str, int] = {}
         self._current_parent_open_ms: dict[str, int] = {}
         self._pending_stream_candles: dict[tuple[str, str], OHLCVCandle] = {}
+        
+        self._init_audit_log()
 
         # Task 4: Restore state
         self._load_session()
+
+    def _init_audit_log(self) -> None:
+        import os
+        import csv
+        from pathlib import Path
+        path = Path("data/paper_intrabar_audit.csv")
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "pair", "strategy_interval", "execution_interval",
+                    "open", "high", "low", "close", "volume",
+                    "previous_parent_high", "previous_parent_low",
+                    "breakout_candidate_side", "decision", "rejection_reason",
+                    "open_position_count", "same_pair_position_open",
+                    "total_open_positions", "risk_approved"
+                ])
+
+    def _log_audit(self, row: list[Any]) -> None:
+        import csv
+        with open("data/paper_intrabar_audit.csv", "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
 
     def _positions_payload(self) -> list[dict[str, Any]]:
         return [
@@ -211,6 +240,20 @@ class PaperTradingLoop:
         error: str | None = None,
     ) -> None:
         snapshot = self.broker.snapshot()
+        
+        # Build scanned pairs status
+        scanned: dict[str, str] = {}
+        for pair in self._watchlist:
+            if pair in self.series:
+                latest = self.series[pair].latest()
+                if latest:
+                    ts = time.strftime('%H:%M:%S', time.gmtime(latest.close_time_ms / 1000))
+                    scanned[pair] = f"Closed: {ts} @ {latest.close}"
+                else:
+                    scanned[pair] = "Waiting for data..."
+            else:
+                scanned[pair] = "Not initialized"
+
         update: dict[str, Any] = {
             "candle_count": self.candle_count,
             "equity": str(snapshot.equity),
@@ -221,6 +264,8 @@ class PaperTradingLoop:
             "positions_json": json.dumps(to_jsonable(self._positions_payload())),
             "equity_history_json": json.dumps(to_jsonable(self.equity_history[-500:])),
             "candles_json": json.dumps(to_jsonable(self._candles_payload())),
+            "watchlist": self._watchlist,
+            "scanned_pairs": scanned,
         }
         if interval is not None:
             update["interval"] = interval
@@ -583,6 +628,25 @@ class PaperTradingLoop:
 
         signals = self.strategy_engine.evaluate(context)
         
+        # Task 4: Audit logging prep
+        breakout_rejection = "no_candidate"
+        breakout_side = None
+        
+        # Check if breakout was even attempted
+        for s in signals:
+            if s.metadata.get("intrabar_reversal_breakout"):
+                breakout_side = "long"
+                breakout_rejection = s.metadata.get("breakout_rejection", "entered")
+                break
+        
+        # If no breakout signal was returned, it might have been rejected inside
+        if breakout_side is None:
+            # We can check the parent metadata if we modify the strategy to return it, 
+            # or just look at what the strategy updated. 
+            # In our case, the strategy updates parent_metadata which is usually part of some signal or context.
+            # But the signals list might be empty.
+            pass
+
         for signal in signals:
             if signal.action == SignalAction.HOLD:
                 continue
@@ -614,6 +678,11 @@ class PaperTradingLoop:
                 requested_leverage=self.settings.paper_leverage,
             )
             
+            # Task 4: Audit Decision
+            if signal.metadata.get("intrabar_reversal_breakout"):
+                if not decision.approved:
+                    breakout_rejection = f"risk_rejected: {decision.reason}"
+
             if decision.approved:
                 report = self.broker.execute_decision(
                     decision, market_price=candle.close, timestamp_ms=candle.close_time_ms
@@ -637,6 +706,46 @@ class PaperTradingLoop:
                         )
                         self.summary_logger.on_trade_closed(trade_dict)
                         self._closed_count += 1
+
+        # Task 4: Finalize Audit Log for this execution candle
+        snapshot = self.broker.snapshot({candle.pair: candle.close})
+        open_positions = self.broker.open_positions()
+        same_pair = any(p.pair == candle.pair for p in open_positions)
+        
+        # If we didn't find a breakout signal, let's see if the strategy left a rejection reason in metadata
+        # We need to peek into the strategy's evaluation state if possible, but for now 
+        # let's assume if no signal, we might need to find where it failed.
+        # Actually, let's modify the strategy to ALWAYS return a "signal" with action HOLD if it was a breakout candidate but failed.
+        # Or just rely on the strategy updating some shared state.
+        
+        # Let's use a simpler approach: the strategy evaluate might have multiple signals.
+        # If no breakout signal found, check if it was explicitly rejected.
+        # We'll need another evaluate pass or the strategy needs to provide this.
+        
+        features = context.features.get("backtest_config", {})
+        prev_h = features.get("previous_parent_high", Decimal("0"))
+        prev_l = features.get("previous_parent_low", Decimal("0"))
+
+        self._log_audit([
+            datetime.now(timezone.utc).isoformat(),
+            candle.pair,
+            self.settings.strategy_interval,
+            candle.interval,
+            str(candle.open),
+            str(candle.high),
+            str(candle.low),
+            str(candle.close),
+            str(candle.volume),
+            str(prev_h),
+            str(prev_l),
+            breakout_side or "none",
+            "entered" if breakout_rejection == "entered" else "rejected" if breakout_side else "no_candidate",
+            breakout_rejection,
+            len(open_positions),
+            "yes" if same_pair else "no",
+            len(self.broker.positions),
+            "yes" if breakout_rejection == "entered" else "no"
+        ])
 
         reports = self.broker.process_candle(candle)
         for report in reports:
@@ -680,6 +789,16 @@ class PaperTradingLoop:
         if exec_series is not None:
             execution_candles = list(exec_series)[-30:]
 
+        # Get the high/low of the last fully closed parent candle for breakout checks
+        previous_parent_high = Decimal("0")
+        previous_parent_low = Decimal("0")
+        htf_series = self.series.get(pair)
+        if htf_series is not None and len(htf_series) > 0:
+            last_closed = htf_series.latest()
+            if last_closed is not None:
+                previous_parent_high = last_closed.high
+                previous_parent_low = last_closed.low
+
         strategy_name = (
             self.strategy_engine.strategies[0].name
             if self.strategy_engine.strategies
@@ -716,6 +835,8 @@ class PaperTradingLoop:
                     self.settings.paper_intrabar_enabled
                     and strategy_name == "hybrid_meta_v2"
                 ),
+                "previous_parent_high": previous_parent_high,
+                "previous_parent_low": previous_parent_low,
                 "reversal_breakout_volume_ratio": Decimal("2.0"),
                 "reversal_breakout_body_ratio": Decimal("0.65"),
                 "reversal_breakout_close_position_ratio": Decimal("0.70"),

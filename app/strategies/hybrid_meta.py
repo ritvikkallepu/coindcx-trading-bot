@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from app.data.candle_builder import OHLCVCandle, interval_to_ms
 from app.data.indicators import (
     average_true_range,
     bollinger_bands,
@@ -211,6 +212,18 @@ class HybridMetaStrategy(Strategy):
                 "Already short; hybrid score has not invalidated the position.",
                 {**metadata, "funnel_reason": SignalFunnelReason.EXISTING_POSITION_BLOCKED},
             )
+
+        reversal_breakout = self._intrabar_reversal_breakout_signal(
+            context=context,
+            parent_metadata=metadata,
+            atr=atr_values[-1],
+            fast_ema=fast[-1],
+            ema_score=ema_score,
+            visual_score=visual["score"],
+            final_score=final_score,
+        )
+        if reversal_breakout is not None:
+            return reversal_breakout
 
         if visual["blocked"]:
             return self._hold(context, f"Visual screen blocked: {visual['reason']}", {**metadata, "funnel_reason": SignalFunnelReason.VISUAL_SCREEN_BLOCKED})
@@ -541,12 +554,14 @@ class HybridMetaStrategy(Strategy):
         atr: Decimal | None,
         reason: str,
         metadata: dict[str, Any],
+        entry_candle: OHLCVCandle | None = None,
     ) -> StrategySignal:
         latest = context.latest_candle
         assert latest is not None
+        signal_candle = entry_candle or latest
         policy = ATRPolicyRouter().select(
             direction=direction,
-            entry_price=latest.close,
+            entry_price=signal_candle.close,
             atr=atr,
             metadata=metadata,
         )
@@ -572,35 +587,216 @@ class HybridMetaStrategy(Strategy):
         stop_distance = (
             atr * self.stop_atr_multiple
             if atr is not None and atr > 0
-            else latest.close * self.fallback_stop_pct
+            else signal_candle.close * self.fallback_stop_pct
         )
         take_profit_distance = (
             atr * self.take_profit_atr_multiple
             if atr is not None and atr > 0
-            else latest.close * self.fallback_take_profit_pct
+            else signal_candle.close * self.fallback_take_profit_pct
         )
         if direction == SignalDirection.LONG:
             action = SignalAction.ENTER_LONG
-            stop_loss = latest.close - stop_distance
-            take_profit = latest.close + take_profit_distance
+            stop_loss = signal_candle.close - stop_distance
+            take_profit = signal_candle.close + take_profit_distance
         else:
             action = SignalAction.ENTER_SHORT
-            stop_loss = latest.close + stop_distance
-            take_profit = latest.close - take_profit_distance
+            stop_loss = signal_candle.close + stop_distance
+            take_profit = signal_candle.close - take_profit_distance
+        if (
+            metadata.get("entry_type") == "intrabar_reversal_breakout"
+            and (not policy.atr_take_profit_enabled or policy.atr_take_profit_mode == "none")
+        ):
+            take_profit = None
 
         return StrategySignal(
             strategy_name=self.name,
             pair=context.pair,
-            interval=context.interval,
+            interval=signal_candle.interval,
             action=action,
             direction=direction,
             confidence=clamp_confidence(abs(final_score)),
             reason=reason,
-            timestamp_ms=latest.close_time_ms,
-            entry_price=latest.close,
+            timestamp_ms=signal_candle.close_time_ms,
+            entry_price=signal_candle.close,
             stop_loss=max(stop_loss, Decimal("0")),
-            take_profit=max(take_profit, Decimal("0")),
+            take_profit=max(take_profit, Decimal("0")) if take_profit is not None else None,
             metadata=metadata,
+        )
+
+    def _intrabar_reversal_breakout_signal(
+        self,
+        *,
+        context: StrategyContext,
+        parent_metadata: dict[str, Any],
+        atr: Decimal | None,
+        fast_ema: Decimal | None,
+        ema_score: Decimal,
+        visual_score: Decimal,
+        final_score: Decimal,
+    ) -> StrategySignal | None:
+        raw_config = context.features.get("backtest_config")
+        config = raw_config if isinstance(raw_config, dict) else {}
+        
+        # Diagnostics collection
+        rejection_reason = "no_candidate"
+
+        if not _bool_value(config.get("intrabar_reversal_breakout_enabled"), False):
+            parent_metadata["breakout_rejection"] = "breakout_disabled"
+            return None
+
+        execution_candles = _execution_candles(context.features.get("execution_candles"))
+        if len(execution_candles) < 3:
+            parent_metadata["breakout_rejection"] = "not_enough_execution_candles"
+            return None
+
+        latest_exec = execution_candles[-1]
+        parent_candle = context.latest_candle
+        if parent_candle is None or latest_exec.pair != context.pair:
+            parent_metadata["breakout_rejection"] = "invalid_context_or_pair"
+            return None
+
+        if latest_exec.close <= latest_exec.open:
+            parent_metadata["breakout_rejection"] = "not_bullish_execution_candle"
+            return None
+
+        # Fix: Use previous_parent_high from features if available, otherwise fallback to parent_candle.high
+        # During live/paper loop, previous_parent_high should be the high of the LAST CLOSED strategy candle.
+        parent_high = _decimal_from_metadata(
+            config.get("previous_parent_high"),
+            parent_candle.high,
+        )
+        if latest_exec.close <= parent_high:
+            parent_metadata["breakout_rejection"] = "did_not_break_previous_parent_high"
+            return None
+
+        prior_volumes = [candle.volume for candle in execution_candles[:-1] if candle.volume > 0]
+        lookback = min(len(prior_volumes), 20)
+        if lookback == 0:
+            parent_metadata["breakout_rejection"] = "no_volume_history"
+            return None
+        
+        average_volume = sum(prior_volumes[-lookback:], Decimal("0")) / Decimal(lookback)
+        volume_ratio = (
+            latest_exec.volume / average_volume
+            if average_volume > 0
+            else Decimal("1")
+        )
+        min_volume_ratio = _decimal_from_metadata(
+            config.get("reversal_breakout_volume_ratio"),
+            Decimal("2.0"),
+        )
+        if volume_ratio < min_volume_ratio:
+            parent_metadata["breakout_rejection"] = f"volume_ratio_too_low_{volume_ratio:.2f}"
+            return None
+
+        candle_range = latest_exec.high - latest_exec.low
+        if candle_range <= 0:
+            parent_metadata["breakout_rejection"] = "zero_candle_range"
+            return None
+            
+        body_ratio = abs(latest_exec.close - latest_exec.open) / candle_range
+        close_position_ratio = (latest_exec.close - latest_exec.low) / candle_range
+        min_body_ratio = _decimal_from_metadata(
+            config.get("reversal_breakout_body_ratio"),
+            Decimal("0.65"),
+        )
+        min_close_position_ratio = _decimal_from_metadata(
+            config.get("reversal_breakout_close_position_ratio"),
+            Decimal("0.70"),
+        )
+        if body_ratio < min_body_ratio:
+            parent_metadata["breakout_rejection"] = f"body_ratio_too_low_{body_ratio:.2f}"
+            return None
+        if close_position_ratio < min_close_position_ratio:
+            parent_metadata["breakout_rejection"] = f"close_position_too_low_{close_position_ratio:.2f}"
+            return None
+
+        if fast_ema is not None and fast_ema > 0 and latest_exec.close <= fast_ema:
+            parent_metadata["breakout_rejection"] = "below_fast_ema"
+            return None
+
+        extension_atr = Decimal("0")
+        if atr is not None and atr > 0 and fast_ema is not None and fast_ema > 0:
+            extension_atr = (latest_exec.close - fast_ema) / atr
+            max_extension = _decimal_from_metadata(
+                config.get("reversal_breakout_max_extension_atr"),
+                Decimal("2.2"),
+            )
+            if extension_atr > max_extension:
+                parent_metadata["breakout_rejection"] = f"too_extended_from_ema_{extension_atr:.2f}"
+                return None
+
+        hard_bearish_context = (
+            final_score <= Decimal("-0.85")
+            or (ema_score <= Decimal("-0.85") and visual_score <= Decimal("-0.60"))
+        )
+        if hard_bearish_context:
+            parent_metadata["breakout_rejection"] = "hard_bearish_context"
+            return None
+
+        risk_multiplier = _decimal_from_metadata(
+            config.get("reversal_breakout_risk_multiplier"),
+            Decimal("0.50"),
+        )
+        risk_multiplier = min(max(risk_multiplier, Decimal("0.05")), Decimal("1"))
+        time_stop_candles = int(
+            _decimal_from_metadata(
+                config.get("reversal_breakout_time_stop_candles"),
+                Decimal("8"),
+            )
+        )
+        parent_metadata["breakout_rejection"] = "entered"
+        metadata = {
+            **parent_metadata,
+            "entry_type": "intrabar_reversal_breakout",
+            "intrabar_reversal_breakout": True,
+            "signal_funnel_raw_candidate": True,
+            "signal_funnel_raw_direction": SignalDirection.LONG.value,
+            "setup_tier": "B",
+            "setup_tier_reason": "B setup: intrabar reversal breakout override.",
+            "setup_tier_risk_multiplier": risk_multiplier,
+            "risk_multiplier": risk_multiplier,
+            "risk_multiplier_applies": risk_multiplier < Decimal("1"),
+            "agreement_ratio": parent_metadata.get("long_agreement_ratio", Decimal("0")),
+            "execution_interval": latest_exec.interval,
+            "parent_interval": context.interval,
+            "previous_parent_high": parent_high,
+            "execution_open": latest_exec.open,
+            "execution_high": latest_exec.high,
+            "execution_low": latest_exec.low,
+            "execution_close": latest_exec.close,
+            "execution_volume": latest_exec.volume,
+            "execution_volume_ratio": volume_ratio,
+            "execution_body_ratio": body_ratio,
+            "execution_close_position_ratio": close_position_ratio,
+            "execution_extension_atr": extension_atr,
+            "breakeven_enabled": True,
+            "breakeven_activation_r": _decimal_from_metadata(
+                config.get("reversal_breakout_breakeven_activation_r"),
+                Decimal("0.70"),
+            ),
+            "breakeven_offset_r": Decimal("0"),
+            "profit_lock_enabled": True,
+            "profit_lock_activation_r": _decimal_from_metadata(
+                config.get("reversal_breakout_profit_lock_activation_r"),
+                Decimal("1.20"),
+            ),
+            "profit_lock_r": _decimal_from_metadata(
+                config.get("reversal_breakout_profit_lock_r"),
+                Decimal("0.35"),
+            ),
+            "time_stop_candles": time_stop_candles,
+            "time_stop_ms": time_stop_candles * interval_to_ms(latest_exec.interval),
+        }
+        parent_metadata["breakout_rejection"] = "entered"
+        return self._entry_signal(
+            context=context,
+            direction=SignalDirection.LONG,
+            final_score=max(abs(final_score), Decimal("0.50")),
+            atr=atr,
+            reason="Intrabar reversal breakout: lower-timeframe impulse broke above parent high.",
+            metadata=metadata,
+            entry_candle=latest_exec,
         )
 
     def _hold(
@@ -830,6 +1026,16 @@ def _decimal_from_metadata(value: Any, default: Decimal) -> Decimal:
         return Decimal(str(value))
     except Exception:
         return default
+
+
+def _execution_candles(value: Any) -> list[OHLCVCandle]:
+    if not isinstance(value, list):
+        return []
+    candles: list[OHLCVCandle] = []
+    for item in value:
+        if isinstance(item, OHLCVCandle):
+            candles.append(item)
+    return candles
 
 
 @dataclass(frozen=True)
