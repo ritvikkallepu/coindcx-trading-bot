@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
-
+from app.utils.json import to_jsonable
 
 class PaperStateStore:
     def __init__(self, db_path: str = "paper_state.db") -> None:
@@ -13,12 +13,12 @@ class PaperStateStore:
         self._init_db()
 
     def _init_db(self) -> None:
+        # Task: Ensure schema is stable but allows updates
         with sqlite3.connect(self.db_path) as conn:
-            # Paper trading: drop and recreate on schema change to ensure columns exist.
-            conn.execute("DROP TABLE IF EXISTS broker_state")
+            # We don't DROP if we want persistence across restarts
             conn.execute(
                 """
-                CREATE TABLE broker_state (
+                CREATE TABLE IF NOT EXISTS broker_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     equity TEXT,
                     positions TEXT,
@@ -43,9 +43,12 @@ class PaperStateStore:
 
     def _serialize_decimal(self, obj: Any) -> Any:
         from dataclasses import asdict, is_dataclass
+        from enum import Enum
 
         if is_dataclass(obj):
             obj = asdict(obj)
+        if isinstance(obj, Enum):
+            return obj.value
         if isinstance(obj, Decimal):
             return str(obj)
         if isinstance(obj, dict):
@@ -70,8 +73,8 @@ class PaperStateStore:
 
     def save(self, snapshot: dict[str, Any]) -> None:
         equity = str(snapshot.get("equity", "0"))
-        positions = json.dumps(self._serialize_decimal(snapshot.get("positions", {})))
-        fills = json.dumps(self._serialize_decimal(snapshot.get("fills", [])))
+        positions = json.dumps(to_jsonable(snapshot.get("positions", {})))
+        fills = json.dumps(to_jsonable(snapshot.get("fills", [])))
         daily_pnl = str(snapshot.get("realized_pnl", snapshot.get("daily_pnl", "0")))
         daily_limit_equity = str(snapshot.get("daily_limit_equity", "0"))
         fees_paid = str(snapshot.get("fees_paid", "0"))
@@ -134,8 +137,8 @@ class PaperStateStore:
 
         return {
             "equity": Decimal(equity),
-            "positions": json.loads(positions_json),
-            "fills": json.loads(fills_json),
+            "positions": self._restore_decimals(json.loads(positions_json)),
+            "fills": self._restore_decimals(json.loads(fills_json)),
             "daily_pnl": Decimal(daily_pnl),
             "realized_pnl": Decimal(daily_pnl),
             "daily_limit_equity": Decimal(daily_limit_equity),
@@ -203,7 +206,7 @@ class PaperStateStore:
             conn.commit()
 
     def save_strategy_state(self, key: str, state: dict[str, Any]) -> None:
-        state_json = json.dumps(self._serialize_decimal(state))
+        state_json = json.dumps(to_jsonable(state))
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -232,3 +235,65 @@ class PaperStateStore:
         # But we can force a GC or just wait. 
         import gc
         gc.collect()
+
+
+class PaperSessionStore:
+    def __init__(self, file_path: str = "data/paper_state.json") -> None:
+        from pathlib import Path
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _serialize(self, obj: Any) -> Any:
+        from enum import Enum
+        if isinstance(obj, Decimal):
+            return str(obj)
+        if isinstance(obj, Enum):
+            return obj.value
+        if isinstance(obj, (datetime)):
+            return obj.isoformat()
+        if isinstance(obj, dict):
+            return {k: self._serialize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._serialize(i) for i in obj]
+        return obj
+
+    def _deserialize(self, obj: Any) -> Any:
+        if isinstance(obj, str):
+            # Try decimal
+            s = obj.lstrip("-")
+            if s.replace(".", "", 1).isdigit() and "." in s:
+                try: return Decimal(obj)
+                except: pass
+            if s.isdigit() and len(s) < 20: # avoid big ints
+                try: return Decimal(obj)
+                except: pass
+            # Try date
+            try:
+                return datetime.fromisoformat(obj)
+            except:
+                pass
+            return obj
+        if isinstance(obj, dict):
+            return {k: self._deserialize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._deserialize(i) for i in obj]
+        return obj
+
+    def save_session(self, state: dict[str, Any]) -> None:
+        serializable = to_jsonable(state)
+        with open(self.file_path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2)
+
+    def load_session(self) -> dict[str, Any] | None:
+        if not self.file_path.exists():
+            return None
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return self._deserialize(data)
+        except Exception:
+            return None
+
+    def clear(self) -> None:
+        if self.file_path.exists():
+            self.file_path.unlink()

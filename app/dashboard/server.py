@@ -35,10 +35,37 @@ from app.risk.manager import RiskManager
 from app.risk.models import InstrumentMetadata
 from app.research.history import record_backtest_result
 from app.strategies.defaults import STRATEGY_CHOICES, strategy_engine_for_name
+from app.utils.json import to_jsonable
 from app.utils.logging import configure_logging
 
 
 OPEN_INTEREST_STRATEGIES = {"hybrid_meta", "hybrid_meta_v2", "adaptive_hybrid"}
+
+
+def _normalize_dashboard_pair(value: object) -> str:
+    """Accept dashboard display pairs and convert them to CoinDCX internal pairs.
+
+    The searchable dropdown stores values like B-BSB_USDT, but the free-text
+    watchlist is easy to fill with display labels like BSB-USDT or B-BSB-USDT.
+    REST candles use the internal underscore form.
+    """
+    text = str(value or "").strip().upper().replace(" ", "")
+    if not text:
+        return text
+
+    if text.startswith("B-"):
+        body = text[2:]
+    else:
+        body = text
+
+    if "_" in body:
+        base, quote = body.split("_", 1)
+    elif "-" in body:
+        base, quote = body.rsplit("-", 1)
+    else:
+        return text if text.startswith("B-") else f"B-{text}"
+
+    return f"B-{base}_{quote}"
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -77,6 +104,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if parsed.path == "/api/pairs":
+            self._send_pairs()
+            return
         if parsed.path == "/api/backtest":
             params = _flatten_query(parse_qs(parsed.query))
             self._send_backtest(params)
@@ -101,6 +131,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/paper-stop":
             self._handle_paper_stop()
             return
+        if parsed.path == "/api/paper-reset":
+            self._handle_paper_reset()
+            return
         self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: object) -> None:
@@ -119,7 +152,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                             status=HTTPStatus.CONFLICT)
             return
 
-        pair = str(params.get("pair") or self.server.settings.default_pair)
+        pair_val = params.get("pair") or params.get("pairs") or self.server.settings.default_pair
+        if isinstance(pair_val, str):
+            pairs = [_normalize_dashboard_pair(p) for p in pair_val.split(",") if p.strip()]
+        elif isinstance(pair_val, list):
+            pairs = [_normalize_dashboard_pair(p) for p in pair_val if str(p).strip()]
+        else:
+            pairs = [_normalize_dashboard_pair(self.server.settings.default_pair)]
+
         interval = str(params.get("interval") or "15m")
         strategy = str(params.get("strategy") or "adaptive_hybrid")
         
@@ -133,7 +173,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         settings = self.server.settings
-        # Override paper_starting_equity and intrabar settings from params if provided
         from decimal import Decimal, InvalidOperation
         starting_equity = settings.paper_starting_equity
         if params.get("starting_equity"):
@@ -142,22 +181,85 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             except InvalidOperation:
                 pass
 
-        paper_intrabar_enabled = bool(params.get("paper_intrabar_enabled", settings.paper_intrabar_enabled))
+        try:
+            leverage = Decimal(str(params.get("leverage", settings.paper_leverage)))
+            risk_pct = Decimal(str(params.get("risk_pct", settings.risk.max_risk_per_trade_pct)))
+            max_daily_loss_pct = Decimal(
+                str(params.get("max_daily_loss_pct", settings.risk.max_daily_loss_pct))
+            )
+            max_open = int(params.get("max_open_positions", settings.risk.max_open_positions))
+            allow_multi = _bool_param(
+                params.get("allow_multi_pair_positions"),
+                settings.risk.allow_multi_pair_positions,
+            )
+            allow_pyramid = _bool_param(
+                params.get("allow_same_pair_pyramiding"),
+                settings.risk.allow_same_pair_pyramiding,
+            )
+            max_margin_usage = Decimal(
+                str(params.get("max_margin_usage_pct", settings.risk.max_margin_usage_pct))
+            )
+            paper_intrabar_enabled = _bool_param(
+                params.get("paper_intrabar_enabled"),
+                settings.paper_intrabar_enabled,
+            )
+            use_partial_parent_candle = _bool_param(
+                params.get("use_partial_parent_candle"),
+                settings.use_partial_parent_candle,
+            )
+            max_entries_per_parent_candle = int(
+                params.get(
+                    "max_entries_per_parent_candle",
+                    settings.max_entries_per_parent_candle,
+                )
+            )
+            trailing_stop_enabled = _bool_param(
+                params.get("trailing_stop_enabled"),
+                settings.risk.trailing_stop_enabled,
+            )
+            atr_exits_enabled = _bool_param(
+                params.get("atr_dynamic_exits_enabled"),
+                False,
+            )
+            profit_lock_enabled = _bool_param(
+                params.get("profit_lock_enabled"),
+                True,
+            )
+        except (ValueError, InvalidOperation) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
         strategy_interval = str(params.get("strategy_interval") or interval)
         execution_interval = str(params.get("execution_interval") or "1m")
-        use_partial_parent_candle = bool(params.get("use_partial_parent_candle", settings.use_partial_parent_candle))
-        max_entries_per_parent_candle = int(params.get("max_entries_per_parent_candle", settings.max_entries_per_parent_candle))
+
+        # Build modified risk settings
+        new_risk = replace(
+            settings.risk,
+            max_risk_per_trade_pct=risk_pct,
+            max_daily_loss_pct=max_daily_loss_pct,
+            max_open_positions=max_open,
+            allow_multi_pair_positions=allow_multi,
+            allow_same_pair_pyramiding=allow_pyramid,
+            max_margin_usage_pct=max_margin_usage,
+            trailing_stop_enabled=trailing_stop_enabled,
+            atr_stop_enabled=atr_exits_enabled,
+            atr_take_profit_enabled=atr_exits_enabled,
+            atr_trailing_enabled=atr_exits_enabled,
+            profit_lock_enabled=profit_lock_enabled,
+        )
 
         # Build a modified settings
         from dataclasses import replace as dc_replace
         effective_settings = dc_replace(
             settings, 
             paper_starting_equity=starting_equity,
+            paper_leverage=leverage,
             paper_intrabar_enabled=paper_intrabar_enabled,
             strategy_interval=strategy_interval,
             execution_interval=execution_interval,
             use_partial_parent_candle=use_partial_parent_candle,
-            max_entries_per_parent_candle=max_entries_per_parent_candle
+            max_entries_per_parent_candle=max_entries_per_parent_candle,
+            risk=new_risk
         )
 
         loop = PaperTradingLoop(effective_settings, strategy_name=strategy)
@@ -167,7 +269,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         def run_loop():
             try:
-                loop.run(pair, interval)
+                loop.run(pairs, interval)
             except Exception as exc:
                 from app.live.paper_loop import _update_live_state
                 _update_live_state(running=False, error=str(exc))
@@ -177,7 +279,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         with self.server._paper_lock:
             self.server._paper_thread = t
         t.start()
-        self._send_json({"started": True, "pair": pair, "interval": interval, 
+        self._send_json({"started": True, "pairs": pairs, "interval": interval, 
                          "strategy": strategy})
 
     def _handle_paper_stop(self) -> None:
@@ -190,6 +292,100 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         loop.stop()
         self._send_json({"stopped": True})
 
+    def _handle_paper_reset(self) -> None:
+        from app.live.paper_loop import get_active_loop, _update_live_state
+        from app.persistence.paper_state import PaperStateStore, PaperSessionStore
+        import os
+        
+        loop = get_active_loop()
+        if loop:
+            loop.stop()
+        
+        # Clear persistent stores
+        PaperStateStore().clear()
+        PaperSessionStore().clear()
+        
+        # Clear summary csv
+        if os.path.exists("paper_trades.csv"):
+            os.remove("paper_trades.csv")
+            
+        # Reset live state
+        _update_live_state(
+            candle_count=0,
+            equity="0",
+            realized_pnl="0",
+            fees_paid="0",
+            open_positions=0,
+            total_fills=0,
+            positions_json="[]",
+            last_updated=None,
+        )
+        
+        self._send_json({"reset": True})
+
+    def _send_pairs(self) -> None:
+        from pathlib import Path
+        import time
+        cache_path = Path("data/coindcx_inr_futures_pairs_cache.json")
+        now = time.time()
+        
+        # Try load cache
+        if cache_path.exists():
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                # Cache valid for 1 hour
+                if now - cached.get("timestamp", 0) < 3600:
+                    self._send_json(cached["data"])
+                    return
+            except Exception:
+                pass
+        
+        # Fetch live
+        client = CoinDCXFuturesClient(self.server.settings)
+        try:
+            # CoinDCX active_instruments returns list of strings like "B-BTC_USDT"
+            # for a given margin currency.
+            margin = "INR"
+            raw_pairs = client.get_active_instruments(margin_currency=margin)
+            
+            pairs = []
+            for p in sorted(raw_pairs):
+                # "B-BTC_USDT" -> "BTC-USDT"
+                display = p
+                if p.startswith("B-"):
+                    display = p[2:].replace("_", "-")
+                
+                pairs.append({
+                    "pair": p,
+                    "display_name": display,
+                    "margin_currency": margin,
+                    "active": True
+                })
+            
+            data = {
+                "market": "futures",
+                "margin": margin,
+                "source": "live",
+                "pairs": pairs
+            }
+            
+            # Save to cache
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump({"timestamp": now, "data": data}, f, indent=2)
+                
+            self._send_json(data)
+        except Exception as exc:
+            logging.getLogger("app.dashboard").error("Failed to fetch pairs: %s", exc)
+            # Fallback to empty or previous cache if available
+            self._send_json({
+                "market": "futures",
+                "margin": "INR",
+                "source": "fallback",
+                "pairs": []
+            })
+
     def _send_paper_trades(self) -> None:
         import csv
         from pathlib import Path
@@ -198,14 +394,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"trades": []})
             return
         trades = []
-        try:
-            with open(path, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    trades.append(dict(row))
-            self._send_json({"trades": trades[-50:]})  # last 50 trades
-        except Exception as exc:
-            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                trades.append(dict(row))
+        self._send_json({"trades": list(reversed(trades[-100:]))})
 
     def _send_backtest(self, params: dict[str, Any]) -> None:
         try:
@@ -257,7 +450,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         *,
         status: HTTPStatus = HTTPStatus.OK,
     ) -> None:
-        encoded = json.dumps(payload, indent=2, sort_keys=True, default=str).encode("utf-8")
+        # Pre-process payload to be JSON-safe (handles Decimals, datetimes, dataclasses)
+        jsonable_payload = to_jsonable(payload)
+        encoded = json.dumps(
+            jsonable_payload, 
+            indent=2, 
+            sort_keys=True, 
+            default=str
+        ).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
@@ -293,7 +493,7 @@ def run_backtest_for_dashboard(
     defaults: DashboardDefaults,
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    pair = str(params.get("pair") or defaults.pair)
+    pair = _normalize_dashboard_pair(params.get("pair") or defaults.pair)
     interval = str(params.get("interval") or defaults.interval)
     strategy = str(params.get("strategy") or defaults.strategy)
     lookback = _int_param(params.get("lookback"), defaults.lookback)
@@ -527,6 +727,8 @@ def run_backtest_for_dashboard(
         atr_trailing_multiple=atr_trailing_multiple,
         atr_take_profit_mode=atr_take_profit_mode,
         execution_interval=execution_interval or None,
+        paper_intrabar_enabled=bool(execution_interval),
+        strategy_interval=interval,
         intrabar_reentry_enabled=intrabar_reentry_enabled,
         max_reentries_per_candle=max_reentries_per_candle,
         reentry_cooldown_candles=reentry_cooldown_candles,
