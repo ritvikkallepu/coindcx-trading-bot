@@ -50,14 +50,55 @@ def _redact(secret: str | None) -> str:
 class RiskSettings:
     max_risk_per_trade_pct: Decimal = Decimal("5")
     max_daily_loss_pct: Decimal = Decimal("10")
-    max_open_positions: int = 1
+    max_open_positions: int = 3
+    max_open_positions_per_pair: int = 1
+    allow_multi_pair_positions: bool = True
+    allow_same_pair_pyramiding: bool = False
     max_leverage: int = 30
     max_total_open_notional_pct: Decimal = Decimal("0")
     max_total_risk_pct: Decimal = Decimal("20")
+    max_margin_usage_pct: Decimal = Decimal("100.0")
+    max_margin_per_trade_pct: Decimal = Decimal("0")
     liquidation_buffer_pct: Decimal = Decimal("2")
+    entry_safety_enabled: bool = True
+    min_stop_distance_pct: Decimal = Decimal("0.50")
+    min_entry_atr_pct: Decimal = Decimal("0.05")
+    min_stop_atr_multiple: Decimal = Decimal("0.75")
+    min_entry_volume_ratio: Decimal = Decimal("0.50")
+    max_entry_spread_pct: Decimal = Decimal("0.30")
+    min_entry_side_depth_margin: Decimal = Decimal("0")
+    pair_loss_throttle_enabled: bool = True
+    pair_loss_lookback: int = 4
+    pair_loss_limit: int = 2
+    pair_loss_risk_multiplier: Decimal = Decimal("0.50")
+    pair_loss_severe_limit: int = 3
+    pair_loss_severe_risk_multiplier: Decimal = Decimal("0.25")
     trailing_stop_enabled: bool = False
     trailing_stop_activation_pct: Decimal = Decimal("1")
     trailing_stop_distance_pct: Decimal = Decimal("2")
+    # Fees and Slippage
+    maker_fee_rate: Decimal = Decimal("0.0002")
+    taker_fee_rate: Decimal = Decimal("0.0005")
+    fee_gst_rate: Decimal = Decimal("0.18")
+    slippage_pct: Decimal = Decimal("0.05")
+    stop_slippage_pct: Decimal = Decimal("0.1")
+    # ATR Policy
+    atr_stop_enabled: bool = True
+    atr_take_profit_enabled: bool = True
+    atr_trailing_enabled: bool = True
+    atr_take_profit_mode: str = "fixed"
+    atr_stop_multiple: Decimal = Decimal("1.5")
+    atr_take_profit_multiple: Decimal = Decimal("2.4")
+    atr_trailing_multiple: Decimal = Decimal("2.0")
+    # Management
+    breakeven_enabled: bool = False
+    breakeven_activation_r: Decimal = Decimal("1.0")
+    breakeven_offset_r: Decimal = Decimal("0")
+    profit_lock_enabled: bool = False
+    profit_lock_activation_r: Decimal = Decimal("1.5")
+    profit_lock_r: Decimal = Decimal("0.5")
+    atr_trail_after_r_enabled: bool = False
+    atr_trail_activation_r: Decimal = Decimal("2.0")
 
 
 @dataclass(frozen=True)
@@ -70,8 +111,11 @@ class Settings:
     coindcx_public_base_url: str = "https://public.coindcx.com"
     coindcx_ws_url: str = "wss://stream.coindcx.com"
     futures_margin_currency: str = "INR"
+    price_quote_currency: str = "USDT"
+    quote_to_margin_rate: Decimal = Decimal("98")
     paper_starting_equity: Decimal = Decimal("10000")
-    paper_starting_equity_currency: str = "USDT"
+    paper_starting_equity_currency: str = "INR"
+    paper_leverage: Decimal = Decimal("1")
     paper_intrabar_enabled: bool = False
     strategy_interval: str = "15m"
     execution_interval: str = "1m"
@@ -117,13 +161,41 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
     risk = RiskSettings(
         max_risk_per_trade_pct=_decimal(_get(merged, "MAX_RISK_PER_TRADE_PCT", "5")),
         max_daily_loss_pct=_decimal(_get(merged, "MAX_DAILY_LOSS_PCT", "10")),
-        max_open_positions=int(_get(merged, "MAX_OPEN_POSITIONS", "1")),
+        max_open_positions=int(_get(merged, "MAX_OPEN_POSITIONS", "3")),
+        max_open_positions_per_pair=int(_get(merged, "MAX_OPEN_POSITIONS_PER_PAIR", "1")),
+        allow_multi_pair_positions=_bool(_get(merged, "ALLOW_MULTI_PAIR_POSITIONS", "true")),
+        allow_same_pair_pyramiding=_bool(_get(merged, "ALLOW_SAME_PAIR_PYRAMIDING", "false")),
         max_leverage=int(_get(merged, "MAX_LEVERAGE", "30")),
         max_total_open_notional_pct=_decimal(
             _get(merged, "MAX_TOTAL_OPEN_NOTIONAL_PCT", "0")
         ),
         max_total_risk_pct=_decimal(_get(merged, "MAX_TOTAL_RISK_PCT", "20")),
+        max_margin_usage_pct=_decimal(_get(merged, "MAX_MARGIN_USAGE_PCT", "100.0")),
+        max_margin_per_trade_pct=_decimal(
+            _get(merged, "MAX_MARGIN_PER_TRADE_PCT", "0")
+        ),
         liquidation_buffer_pct=_decimal(_get(merged, "LIQUIDATION_BUFFER_PCT", "2")),
+        entry_safety_enabled=_bool(_get(merged, "ENTRY_SAFETY_ENABLED", "true")),
+        min_stop_distance_pct=_decimal(_get(merged, "MIN_STOP_DISTANCE_PCT", "0.50")),
+        min_entry_atr_pct=_decimal(_get(merged, "MIN_ENTRY_ATR_PCT", "0.05")),
+        min_stop_atr_multiple=_decimal(_get(merged, "MIN_STOP_ATR_MULTIPLE", "0.75")),
+        min_entry_volume_ratio=_decimal(_get(merged, "MIN_ENTRY_VOLUME_RATIO", "0.50")),
+        max_entry_spread_pct=_decimal(_get(merged, "MAX_ENTRY_SPREAD_PCT", "0.30")),
+        min_entry_side_depth_margin=_decimal(
+            _get(merged, "MIN_ENTRY_SIDE_DEPTH_MARGIN", "0")
+        ),
+        pair_loss_throttle_enabled=_bool(
+            _get(merged, "PAIR_LOSS_THROTTLE_ENABLED", "true")
+        ),
+        pair_loss_lookback=int(_get(merged, "PAIR_LOSS_LOOKBACK", "4")),
+        pair_loss_limit=int(_get(merged, "PAIR_LOSS_LIMIT", "2")),
+        pair_loss_risk_multiplier=_decimal(
+            _get(merged, "PAIR_LOSS_RISK_MULTIPLIER", "0.50")
+        ),
+        pair_loss_severe_limit=int(_get(merged, "PAIR_LOSS_SEVERE_LIMIT", "3")),
+        pair_loss_severe_risk_multiplier=_decimal(
+            _get(merged, "PAIR_LOSS_SEVERE_RISK_MULTIPLIER", "0.25")
+        ),
         trailing_stop_enabled=_bool(_get(merged, "TRAILING_STOP_ENABLED", "false")),
         trailing_stop_activation_pct=_decimal(
             _get(merged, "TRAILING_STOP_ACTIVATION_PCT", "1")
@@ -131,6 +203,26 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         trailing_stop_distance_pct=_decimal(
             _get(merged, "TRAILING_STOP_DISTANCE_PCT", "2")
         ),
+        maker_fee_rate=_decimal(_get(merged, "MAKER_FEE_RATE", "0.0002")),
+        taker_fee_rate=_decimal(_get(merged, "TAKER_FEE_RATE", "0.0005")),
+        fee_gst_rate=_decimal(_get(merged, "FEE_GST_RATE", "0.18")),
+        slippage_pct=_decimal(_get(merged, "SLIPPAGE_PCT", "0.05")),
+        stop_slippage_pct=_decimal(_get(merged, "STOP_SLIPPAGE_PCT", "0.1")),
+        atr_stop_enabled=_bool(_get(merged, "ATR_STOP_ENABLED", "true")),
+        atr_take_profit_enabled=_bool(_get(merged, "ATR_TAKE_PROFIT_ENABLED", "true")),
+        atr_trailing_enabled=_bool(_get(merged, "ATR_TRAILING_ENABLED", "true")),
+        atr_take_profit_mode=_get(merged, "ATR_TAKE_PROFIT_MODE", "fixed"),
+        atr_stop_multiple=_decimal(_get(merged, "ATR_STOP_MULTIPLE", "1.5")),
+        atr_take_profit_multiple=_decimal(_get(merged, "ATR_TAKE_PROFIT_MULTIPLE", "2.4")),
+        atr_trailing_multiple=_decimal(_get(merged, "ATR_TRAILING_MULTIPLE", "2.0")),
+        breakeven_enabled=_bool(_get(merged, "BREAKEVEN_ENABLED", "false")),
+        breakeven_activation_r=_decimal(_get(merged, "BREAKEVEN_ACTIVATION_R", "1.0")),
+        breakeven_offset_r=_decimal(_get(merged, "BREAKEVEN_OFFSET_R", "0")),
+        profit_lock_enabled=_bool(_get(merged, "PROFIT_LOCK_ENABLED", "false")),
+        profit_lock_activation_r=_decimal(_get(merged, "PROFIT_LOCK_ACTIVATION_R", "1.5")),
+        profit_lock_r=_decimal(_get(merged, "PROFIT_LOCK_R", "0.5")),
+        atr_trail_after_r_enabled=_bool(_get(merged, "ATR_TRAIL_AFTER_R_ENABLED", "false")),
+        atr_trail_activation_r=_decimal(_get(merged, "ATR_TRAIL_ACTIVATION_R", "2.0")),
     )
 
     return Settings(
@@ -146,8 +238,11 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         ).rstrip("/"),
         coindcx_ws_url=_get(merged, "COINDCX_WS_URL", "wss://stream.coindcx.com"),
         futures_margin_currency=_get(merged, "FUTURES_MARGIN_CURRENCY", "INR").upper(),
+        price_quote_currency=_get(merged, "PRICE_QUOTE_CURRENCY", "USDT").upper(),
+        quote_to_margin_rate=_decimal(_get(merged, "QUOTE_TO_MARGIN_RATE", "98")),
         paper_starting_equity=_decimal(_get(merged, "PAPER_STARTING_EQUITY", "10000")),
-        paper_starting_equity_currency=_get(merged, "PAPER_STARTING_EQUITY_CURRENCY", "USDT"),
+        paper_starting_equity_currency=_get(merged, "PAPER_STARTING_EQUITY_CURRENCY", "INR"),
+        paper_leverage=_decimal(_get(merged, "PAPER_LEVERAGE", "1")),
         paper_intrabar_enabled=_bool(_get(merged, "PAPER_INTRABAR_ENABLED", "false")),
         strategy_interval=_get(merged, "STRATEGY_INTERVAL", "15m"),
         execution_interval=_get(merged, "EXECUTION_INTERVAL", "1m"),

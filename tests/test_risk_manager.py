@@ -61,6 +61,24 @@ class RiskManagerTests(unittest.TestCase):
         self.assertEqual(decision.max_loss, Decimal("10"))
         self.assertEqual(decision.leverage, Decimal("1"))
 
+    def test_signal_risk_multiplier_reduces_actual_position_size(self) -> None:
+        decision = _manager().evaluate_signal(
+            _entry_signal(
+                metadata={
+                    "risk_multiplier": Decimal("0.5"),
+                    "risk_multiplier_applies": True,
+                }
+            ),
+            account_equity=Decimal("1000"),
+            requested_leverage=Decimal("1"),
+        )
+
+        self.assertTrue(decision.approved)
+        self.assertEqual(decision.position_size, Decimal("1.0"))
+        self.assertEqual(decision.max_loss, Decimal("5.0"))
+        self.assertEqual(decision.metadata["risk_multiplier"], Decimal("0.5"))
+        self.assertEqual(decision.metadata["risk_percent_used"], Decimal("0.50"))
+
     def test_rejects_entry_without_stop_loss(self) -> None:
         decision = _manager().evaluate_signal(
             _entry_signal(stop_loss=None),
@@ -105,7 +123,7 @@ class RiskManagerTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.approved)
-        self.assertIn("Max open positions reached", decision.reason)
+        self.assertIn("max_open_positions_blocked", decision.reason)
 
     def test_caps_same_position_scale_in_to_basket_risk_budget(self) -> None:
         position = OpenPosition(
@@ -113,6 +131,7 @@ class RiskManagerTests(unittest.TestCase):
             direction=SignalDirection.LONG,
             quantity=Decimal("1"),
             entry_price=Decimal("100"),
+            stop_loss=Decimal("95"),
         )
         decision = _manager().evaluate_signal(
             _entry_signal(metadata={"allow_scale_in": True}),
@@ -122,7 +141,11 @@ class RiskManagerTests(unittest.TestCase):
         )
 
         self.assertTrue(decision.approved)
+        # Budget 10. Existing risk 5. Remaining budget 5.
+        # Signal entry 100, SL 95 -> distance 5. 
+        # Size = 5 / 5 = 1.
         self.assertEqual(decision.position_size, Decimal("1.00"))
+
         self.assertTrue(decision.metadata["basket_risk_checked"])
         self.assertTrue(decision.metadata["position_size_adjusted_for_basket_risk"])
 
@@ -141,7 +164,7 @@ class RiskManagerTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.approved)
-        self.assertIn("Max open positions reached", decision.reason)
+        self.assertIn("same_pair_position_blocked", decision.reason)
 
     def test_rejects_leverage_above_configured_limit(self) -> None:
         decision = _manager().evaluate_signal(
@@ -292,7 +315,7 @@ class RiskManagerTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.approved)
-        self.assertIn("open notional", decision.reason)
+        self.assertIn("Total open notional exceeds limit", decision.reason)
 
     def test_rejects_projected_risk_above_total_risk_limit(self) -> None:
         manager = RiskManager(

@@ -119,6 +119,8 @@ def build_status_payload(
             "live_trading_enabled": settings.live_trading_enabled,
             "default_pair": settings.default_pair,
             "futures_margin_currency": settings.futures_margin_currency,
+            "price_quote_currency": settings.price_quote_currency,
+            "quote_to_margin_rate": settings.quote_to_margin_rate,
         },
         "safety": {
             "live_orders_locked": not settings.live_trading_allowed,

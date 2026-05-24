@@ -87,6 +87,10 @@ class SweepConfig:
     lookback: int = 1000
     starting_equity: Decimal = Decimal("1000")
     leverage: Decimal = Decimal("3")
+    margin_currency: str = "INR"
+    price_quote_currency: str = "USDT"
+    quote_to_margin_rate: Decimal = Decimal("98")
+    unit_contract_value: Decimal = Decimal("1")
     risk_per_trade_pct: Decimal | None = None
     compound_risk_equity: bool = False
     stop_loss_pct: Decimal | None = None
@@ -763,6 +767,10 @@ def _run_one(
         starting_equity=config.starting_equity,
         leverage=config.leverage,
         strategy_name=variant.name,
+        margin_currency=config.margin_currency,
+        price_quote_currency=config.price_quote_currency,
+        quote_to_margin_rate=config.quote_to_margin_rate,
+        unit_contract_value=config.unit_contract_value,
         risk_per_trade_pct=config.risk_per_trade_pct,
         compound_risk_equity=config.compound_risk_equity,
         stop_loss_pct=config.stop_loss_pct,

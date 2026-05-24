@@ -533,6 +533,35 @@ DASHBOARD_HTML = r"""<!doctype html>
       gap: 10px;
       font-size: 13px;
     }
+    .posAudit {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }
+    .posAuditItem {
+      min-width: 0;
+      background: #151820;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 6px;
+      padding: 8px;
+    }
+    .posAuditItem span {
+      display: block;
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.2;
+      margin-bottom: 4px;
+    }
+    .posAuditItem strong {
+      display: block;
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
     .posFooter {
       margin-top: 12px;
       padding-top: 10px;
@@ -1141,7 +1170,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <div class="metricSub" id="pmReturnAbs">-</div>
           </div>
           <div class="metricCard">
-            <div class="metricLabel">Realized PnL</div>
+            <div class="metricLabel">Closed Net PnL</div>
             <div class="metricValue" id="pmPnl">-</div>
             <div class="metricSub" id="pmPnlSub">-</div>
           </div>
@@ -1254,7 +1283,9 @@ DASHBOARD_HTML = r"""<!doctype html>
                   <th>Dir</th>
                   <th>Entry</th>
                   <th>Exit</th>
-                  <th>Qty</th>
+                  <th>Qty / Unit</th>
+                  <th>Notional</th>
+                  <th>Risk Used</th>
                   <th>Gross PnL</th>
                   <th>Fees</th>
                   <th>Net PnL</th>
@@ -1264,7 +1295,7 @@ DASHBOARD_HTML = r"""<!doctype html>
                 </tr>
               </thead>
               <tbody id="pmTradeRows">
-                <tr><td colspan="13">No closed trades yet</td></tr>
+                <tr><td colspan="15">No closed trades yet</td></tr>
               </tbody>
             </table>
           </div>
@@ -1376,6 +1407,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     const num = value => {
       const parsed = Number(value);
       return Number.isFinite(parsed) ? parsed : 0;
+    };
+    const boolVal = value => {
+      if (value === true) return true;
+      if (value === false || value === null || value === undefined) return false;
+      return ['1', 'true', 'yes', 'y', 'on'].includes(String(value).trim().toLowerCase());
     };
 
     const money = value => num(value).toLocaleString(undefined, {
@@ -2106,6 +2142,57 @@ DASHBOARD_HTML = r"""<!doctype html>
       try { return JSON.parse(value); } catch(e) { return fallback; }
     }
 
+    function paperTradeSummaryFromRows(rows) {
+      const list = rows || [];
+      let wins = 0;
+      let losses = 0;
+      let gross = 0;
+      let net = 0;
+      let fees = 0;
+      let winPnl = 0;
+      let lossPnl = 0;
+      let best = null;
+      let worst = null;
+      let notional = 0;
+
+      list.forEach(t => {
+        const rowNet = num(t.net_pnl || t.pnl);
+        const rowGross = num(t.gross_pnl || t.pnl);
+        const rowFees = num(t.total_fees || t.fees || t.fee || 0);
+        const rowNotional = Math.abs(num(t.position_notional || t.notional_margin || t.notional || 0));
+        gross += rowGross;
+        net += rowNet;
+        fees += rowFees;
+        notional += rowNotional;
+        best = best === null ? rowNet : Math.max(best, rowNet);
+        worst = worst === null ? rowNet : Math.min(worst, rowNet);
+        if (rowNet > 0) {
+          wins += 1;
+          winPnl += rowNet;
+        } else if (rowNet < 0) {
+          losses += 1;
+          lossPnl += Math.abs(rowNet);
+        }
+      });
+
+      return {
+        closed_trades: list.length,
+        wins,
+        losses,
+        win_rate_pct: list.length ? wins / list.length * 100 : 0,
+        gross_pnl: gross,
+        net_pnl: net,
+        fees,
+        avg_win: wins ? winPnl / wins : 0,
+        avg_loss: losses ? lossPnl / losses : 0,
+        best_trade: best === null ? 0 : best,
+        worst_trade: worst === null ? 0 : worst,
+        profit_factor: lossPnl > 0 ? winPnl / lossPnl : (winPnl > 0 ? null : 0),
+        closed_notional: notional,
+        fees_cost_pct: notional > 0 ? fees / notional * 100 : 0,
+      };
+    }
+
     function renderPaperEquityChart(history) {
       const chart = document.getElementById('paperEquityChart');
       if (!history || !history.length) { chart.innerHTML = ''; return; }
@@ -2237,7 +2324,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       countChip.textContent = `${rows.length} trades`;
 
       if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="13">No closed trades yet — open positions will appear here when they close</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="15">No closed trades yet - open positions will appear here when they close</td></tr>';
         winChip.textContent = '-';
         winChip.className = 'chip';
         return;
@@ -2247,12 +2334,19 @@ DASHBOARD_HTML = r"""<!doctype html>
       tbody.innerHTML = rows.map((t, i) => {
         const pnl = num(t.net_pnl || t.pnl);
         const gross = num(t.gross_pnl || t.pnl);
-        const fees = num(t.fees || t.fee || 0);
         const isWin = pnl > 0;
         if (isWin) wins++;
 
         const side = escapeHtml(t.direction || t.side || '');
-        const qty = compact(t.position_size || t.quantity || 0);
+        const qtyUnit = t.quantity_unit || 'contracts';
+        const qty = `${compact(t.position_size || t.quantity || 0)} ${escapeHtml(qtyUnit)}`;
+        const notional = num(t.position_notional || t.notional_margin || 0);
+        const currency = escapeHtml(t.notional_currency || 'INR');
+        const legacy = String(t.legacy_currency_math || '').toLowerCase() === 'true';
+        const totalFees = num(t.total_fees || t.fees || t.fee || 0);
+        const riskUsed = t.risk_percent_used !== undefined && t.risk_percent_used !== ''
+          ? `${num(t.risk_percent_used).toFixed(2)}%`
+          : '-';
         const reason = escapeHtml(t.exit_reason || t.reason || '');
         const time = escapeHtml(t.timestamp || t.exit_time || '-');
         const hold = t.hold_duration_candles !== undefined ? `${t.hold_duration_candles}c` : '-';
@@ -2266,8 +2360,10 @@ DASHBOARD_HTML = r"""<!doctype html>
           <td>${compact(t.entry_price)}</td>
           <td>${compact(t.exit_price)}</td>
           <td>${qty}</td>
+          <td>${money(notional)} <small style="color:${legacy ? 'var(--warn)' : 'var(--muted)'}">${currency}${legacy ? ' legacy' : ''}</small></td>
+          <td>${riskUsed}</td>
           <td>${money(gross)}</td>
-          <td>${money(fees)}</td>
+          <td>${money(totalFees)}</td>
           <td><span class="chip ${isWin?'good':'bad'}">${money(pnl)}</span></td>
           <td style="color:${isWin?'var(--green)':'var(--red)'}">${netPct}</td>
           <td>${hold}</td>
@@ -2297,6 +2393,18 @@ DASHBOARD_HTML = r"""<!doctype html>
         const pnlCls = pnl >= 0 ? 'good' : 'bad';
         const dirCls = p.direction === 'long' ? 'good' : 'bad';
         const notional = num(p.notional);
+        const riskUsed = p.risk_percent_used !== undefined && p.risk_percent_used !== ''
+          ? `${num(p.risk_percent_used).toFixed(2)}%`
+          : '-';
+        const priceOrDash = value => (value !== undefined && value !== null && String(value) !== '')
+          ? compact(value)
+          : '-';
+        const auditItems = [
+          ['Active Trail', priceOrDash(p.active_trailing_stop || p.stop_loss)],
+          ['TP Suppressed', boolVal(p.take_profit_suppressed_by_trailing) ? 'Yes' : 'No'],
+          ['ATR Best', priceOrDash(p.atr_best_price)],
+          ['Stop Type', p.stop_type ? String(p.stop_type) : '-']
+        ];
 
         const footerItems = [
           p.strategy,
@@ -2314,79 +2422,68 @@ DASHBOARD_HTML = r"""<!doctype html>
               <div class="chip ${pnlCls}" style="font-weight:800">${money(pnl)}</div>
             </div>
             <div class="posGrid">
-              <div><span>Qty</span><strong>${compact(p.quantity)}</strong></div>
+              <div><span>Qty (${escapeHtml(p.quantity_unit || 'contracts')})</span><strong>${compact(p.quantity)}</strong></div>
               <div><span>Entry</span><strong>${compact(p.entry_price)}</strong></div>
-              <div><span>Notional</span><strong>${money(notional)}</strong></div>
+              <div><span>Notional (${escapeHtml(p.notional_currency || 'INR')})</span><strong>${money(notional)}</strong></div>
+              <div><span>Risk Used</span><strong>${riskUsed}</strong></div>
+            </div>
+            <div class="posAudit">
+              ${auditItems.map(([label, value]) => `
+                <div class="posAuditItem">
+                  <span>${escapeHtml(label)}</span>
+                  <strong>${escapeHtml(value)}</strong>
+                </div>
+              `).join('')}
             </div>
             ${footerItems.length > 0 ? `
               <div class="posFooter">
-                ${footerItems.map(item => `<span>${item}</span>`).join('')}
+                ${footerItems.map(item => `<span>${escapeHtml(item)}</span>`).join('')}
               </div>
             ` : ''}
           </div>
         `;
       }).join('');
     }
-    function renderPaperSessionStats(trades) {
+    function renderPaperSessionStats(trades, summary) {
       const rows = trades || [];
       const bar = document.getElementById('pmStatsBar');
-      
-      if (!rows.length) {
+      const stats = summary || paperTradeSummaryFromRows(rows);
+
+      if (!num(stats.closed_trades)) {
         bar.style.display = 'none';
         return;
       }
       bar.style.display = 'grid';
 
-      let totalWinPnL = 0;
-      let totalLossPnL = 0;
-      let winCount = 0;
-      let lossCount = 0;
-      let best = -Infinity;
-      let worst = Infinity;
-
-      rows.forEach(t => {
-        const pnl = num(t.net_pnl || t.pnl);
-        if (pnl > 0) {
-          totalWinPnL += pnl;
-          winCount++;
-        } else {
-          totalLossPnL += Math.abs(pnl);
-          lossCount++;
-        }
-        if (pnl > best) best = pnl;
-        if (pnl < worst) worst = pnl;
-      });
-
-      const avgWin = winCount > 0 ? totalWinPnL / winCount : 0;
-      const avgLoss = lossCount > 0 ? totalLossPnL / lossCount : 0;
-      
-      let pf = '-';
-      if (totalLossPnL === 0) {
-        pf = totalWinPnL > 0 ? '∞' : '-';
-      } else {
-        pf = (totalWinPnL / totalLossPnL).toFixed(2);
-      }
+      const avgWin = num(stats.avg_win);
+      const avgLoss = num(stats.avg_loss);
+      const best = num(stats.best_trade);
+      const worst = num(stats.worst_trade);
+      const pfRaw = stats.profit_factor;
+      const pf = pfRaw === null || pfRaw === undefined || pfRaw === ''
+        ? (num(stats.net_pnl) > 0 ? 'inf' : '-')
+        : num(pfRaw).toFixed(2);
 
       document.getElementById('pmAvgWin').textContent = money(avgWin);
       document.getElementById('pmAvgWin').style.color = 'var(--green)';
-      
+
       document.getElementById('pmAvgLoss').textContent = money(avgLoss);
       document.getElementById('pmAvgLoss').style.color = 'var(--red)';
-      
-      document.getElementById('pmBestTrade').textContent = best === -Infinity ? '-' : money(best);
+
+      document.getElementById('pmBestTrade').textContent = money(best);
       document.getElementById('pmBestTrade').style.color = best > 0 ? 'var(--green)' : 'var(--text)';
-      
-      document.getElementById('pmWorstTrade').textContent = worst === Infinity ? '-' : money(worst);
+
+      document.getElementById('pmWorstTrade').textContent = money(worst);
       document.getElementById('pmWorstTrade').style.color = worst < 0 ? 'var(--red)' : 'var(--text)';
-      
+
       document.getElementById('pmProfitFactor').textContent = pf;
-      if (pf !== '-' && pf !== '∞') {
+      if (pf !== '-' && pf !== 'inf') {
         document.getElementById('pmProfitFactor').style.color = num(pf) >= 1.5 ? 'var(--green)' : num(pf) < 1 ? 'var(--red)' : 'var(--text)';
-      } else if (pf === '∞') {
+      } else if (pf === 'inf') {
         document.getElementById('pmProfitFactor').style.color = 'var(--green)';
       }
 
-      document.getElementById('pmTotalClosed').textContent = rows.length;
+      document.getElementById('pmTotalClosed').textContent = compact(stats.closed_trades);
     }
 
     async function refreshPaperStatus() {
@@ -2398,6 +2495,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
         const running = data.running;
         const trades = tradesData.trades || [];
+        const tradeSummary = tradesData.summary || paperTradeSummaryFromRows(trades);
         const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
         const col = (id, good) => { const el = document.getElementById(id); if (el) el.style.color = good ? 'var(--green)' : 'var(--red)'; };
 
@@ -2415,19 +2513,18 @@ DASHBOARD_HTML = r"""<!doctype html>
         const candleCount = num(data.candle_count);
         
         const hasUsableEquity = equity > 0;
-        let displayEquity = running && hasUsableEquity ? equity : startEq;
-        let returnPct = 0;
+        let displayEquity = hasUsableEquity ? equity : startEq;
         let returnAbs = displayEquity - startEq;
-
-        if (running) {
-            if (candleCount > 0 && hasUsableEquity) {
-                returnPct = ((equity - startEq) / startEq * 100);
-            } else if (hasUsableEquity && Math.abs(equity - startEq) > 0.01) {
-                returnPct = ((equity - startEq) / startEq * 100);
-            }
+        let returnPct = startEq > 0 ? (returnAbs / startEq * 100) : 0;
+        if (data.return_abs !== undefined && data.return_abs !== '') {
+          returnAbs = num(data.return_abs);
+        }
+        if (data.return_pct !== undefined && data.return_pct !== '') {
+          returnPct = num(data.return_pct);
         }
         
-        const pnl = num(data.realized_pnl);
+        const pnl = num(tradeSummary.net_pnl);
+        const grossClosedPnl = num(tradeSummary.gross_pnl);
         const fees = num(data.fees_paid);
 
         // Update Row 1
@@ -2438,24 +2535,28 @@ DASHBOARD_HTML = r"""<!doctype html>
         col('pmReturn', returnPct >= 0);
         
         const absSign = returnAbs >= 0 ? '+' : '';
-        set('pmReturnAbs', running ? absSign + money(Math.abs(returnAbs)) + (returnAbs < 0 ? ' loss' : ' gain') : '');
+        set('pmReturnAbs', absSign + money(Math.abs(returnAbs)) + (returnAbs < 0 ? ' loss' : ' gain'));
         col('pmReturnAbs', returnAbs >= 0);
         
         set('pmPnl', money(pnl));
         col('pmPnl', pnl >= 0);
-        set('pmPnlSub', 'Realized Session');
+        set('pmPnlSub', `Closed gross ${money(grossClosedPnl)}`);
         
         set('pmFees', money(fees));
-        set('pmFeesSub', `${((fees / Math.max(1, displayEquity)) * 100).toFixed(3)}% cost`);
+        const feeCostPct = tradeSummary.fees_cost_pct !== undefined
+          ? num(tradeSummary.fees_cost_pct)
+          : (fees / Math.max(1, num(tradeSummary.closed_notional) || displayEquity)) * 100;
+        set('pmFeesSub', `${feeCostPct.toFixed(3)}% closed notional`);
 
         // Update Row 2
         // Win Rate
-        let wins = 0;
-        if (trades.length > 0) {
-          wins = trades.filter(t => num(t.net_pnl) > 0).length;
-          const wr = (wins / trades.length) * 100;
+        const closedTrades = num(tradeSummary.closed_trades);
+        const wins = num(tradeSummary.wins);
+        const losses = num(tradeSummary.losses);
+        if (closedTrades > 0) {
+          const wr = num(tradeSummary.win_rate_pct);
           set('pmWinRate', wr.toFixed(1) + '%');
-          set('pmWinRateSub', `${wins}W / ${trades.length - wins}L`);
+          set('pmWinRateSub', `${wins}W / ${losses}L`);
         } else {
           set('pmWinRate', '0.0%');
           set('pmWinRateSub', 'No closed trades');
@@ -2486,6 +2587,12 @@ DASHBOARD_HTML = r"""<!doctype html>
               if (dd > maxDD) maxDD = dd;
             }
           }
+          if (data.max_drawdown_pct !== undefined && data.max_drawdown_pct !== '') {
+            maxDD = num(data.max_drawdown_pct);
+          }
+          if (data.peak_equity !== undefined && data.peak_equity !== '') {
+            peak = num(data.peak_equity) || peak;
+          }
           set('pmMaxDD', maxDD.toFixed(2) + '%');
           const ddEl = document.getElementById('pmMaxDD');
           if (ddEl) ddEl.style.color = maxDD < 3 ? 'var(--green)' : maxDD < 8 ? 'var(--amber, #f59e0b)' : 'var(--red)';
@@ -2508,7 +2615,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           const openPos = parseInt(data.open_positions || '0');
           const entriesOpen = openPos > 0 ? openPos + ' entr' + (openPos > 1 ? 'ies' : 'y') + ' open' : '';
           fillInfo.textContent = fills > 0
-            ? fills + ' total fill' + (fills > 1 ? 's' : '') + (entriesOpen ? ' · ' + entriesOpen : '')
+            ? fills + ' total fill' + (fills > 1 ? 's' : '') + (entriesOpen ? ' | ' + entriesOpen : '')
             : '';
         }
 
@@ -2523,7 +2630,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           }
 
           document.getElementById('paperLoopMeta').innerHTML =
-            `<strong>Running:</strong> ${data.pair} · INR-M · ${data.interval} · ${data.strategy} · <span class="subtle">updated ${lastUpdatedStr}</span>`;
+            `<strong>Running:</strong> ${data.pair} | INR-M | ${data.interval} | ${data.strategy} | <span class="subtle">updated ${lastUpdatedStr}</span>`;
           document.getElementById('paperTopChips').innerHTML =
             `<span class="chip warn">Paper</span>
              <span class="chip good">INR-M Futures</span>
@@ -2541,7 +2648,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           // Sync UI selection to running pair if it's different and NOT manually changed?
           // For now just keep them separate as requested.
         } else {
-          document.getElementById('paperLoopMeta').textContent = 'Standby · Ready to start INR-M session';
+          document.getElementById('paperLoopMeta').textContent = 'Standby | Ready to start INR-M session';
           const runningLabelWrap = document.getElementById('runningPairLabelWrap');
           if (runningLabelWrap) runningLabelWrap.style.display = 'none';
         }
@@ -2560,7 +2667,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           `${data.pair} ${data.interval}`;
 
         renderPaperTrades(trades);
-        renderPaperSessionStats(trades);
+        renderPaperSessionStats(trades, tradeSummary);
 
         // Update Watchlist UI
         const watchlist = data.watchlist || [];

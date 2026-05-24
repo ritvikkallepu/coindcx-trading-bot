@@ -60,6 +60,12 @@ class HybridMetaStrategy(Strategy):
     fallback_stop_pct: Decimal = Decimal("0.012")
     fallback_take_profit_pct: Decimal = Decimal("0.024")
     allow_short_without_open_interest: bool = True
+    signal_flip_exit_enabled: bool = True
+    signal_flip_grace_candles: int = 3
+    signal_flip_confirm_candles: int = 2
+    signal_flip_min_hold_candles: int = 2
+    signal_flip_exit_only_if_unprofitable: bool = False
+    signal_flip_exit_requires_price_confirmation: bool = True
 
     def evaluate(self, context: StrategyContext) -> StrategySignal:
         latest = context.latest_candle
@@ -95,7 +101,7 @@ class HybridMetaStrategy(Strategy):
         )
         bb_score = self._bb_reversion_score(latest.close, bands[-1])
         visual = self._visual_score(
-            context=context,
+            candles=list(context.candles),
             atr=atr_values[-1],
             average_volume=volume_sma[-1],
         )
@@ -172,21 +178,48 @@ class HybridMetaStrategy(Strategy):
             metadata["signal_funnel_raw_candidate"] = True
             metadata["signal_funnel_raw_direction"] = raw_direction.value
 
-        open_direction = self._open_position_direction(context.features, context.pair)
+        open_pos = self._open_position_metadata(context.features, context.pair)
+        open_direction = None
+        if open_pos:
+            dir_val = open_pos.get("direction")
+            if dir_val == SignalDirection.LONG.value:
+                open_direction = SignalDirection.LONG
+            elif dir_val == SignalDirection.SHORT.value:
+                open_direction = SignalDirection.SHORT
+
         if open_direction == SignalDirection.LONG:
             if final_score <= -self.exit_threshold:
-                return StrategySignal(
-                    strategy_name=self.name,
-                    pair=context.pair,
-                    interval=context.interval,
-                    action=SignalAction.EXIT_LONG,
-                    confidence=clamp_confidence(abs(final_score)),
-                    reason="Hybrid score flipped bearish; long invalidated.",
-                    timestamp_ms=latest.close_time_ms,
+                exit_allowed, exit_reason, exit_metadata = self._check_signal_flip_exit(
+                    context=context,
                     direction=SignalDirection.LONG,
-                    entry_price=latest.close,
-                    metadata=metadata,
+                    final_score=final_score,
+                    open_pos=open_pos,
+                    fast=fast,
+                    slow=slow,
+                    rsi_values=rsi_values,
+                    bands=bands,
+                    atr_values=atr_values,
+                    volume_sma=volume_sma,
                 )
+                if exit_allowed:
+                    return StrategySignal(
+                        strategy_name=self.name,
+                        pair=context.pair,
+                        interval=context.interval,
+                        action=SignalAction.EXIT_LONG,
+                        confidence=clamp_confidence(abs(final_score)),
+                        reason=exit_reason,
+                        timestamp_ms=latest.close_time_ms,
+                        direction=SignalDirection.LONG,
+                        entry_price=latest.close,
+                        metadata={**metadata, **exit_metadata},
+                    )
+                else:
+                    return self._hold(
+                        context,
+                        exit_reason,
+                        {**metadata, **exit_metadata, "funnel_reason": SignalFunnelReason.EXISTING_POSITION_BLOCKED},
+                    )
             return self._hold(
                 context,
                 "Already long; hybrid score has not invalidated the position.",
@@ -195,18 +228,37 @@ class HybridMetaStrategy(Strategy):
 
         if open_direction == SignalDirection.SHORT:
             if final_score >= self.exit_threshold:
-                return StrategySignal(
-                    strategy_name=self.name,
-                    pair=context.pair,
-                    interval=context.interval,
-                    action=SignalAction.EXIT_SHORT,
-                    confidence=clamp_confidence(abs(final_score)),
-                    reason="Hybrid score flipped bullish; short invalidated.",
-                    timestamp_ms=latest.close_time_ms,
+                exit_allowed, exit_reason, exit_metadata = self._check_signal_flip_exit(
+                    context=context,
                     direction=SignalDirection.SHORT,
-                    entry_price=latest.close,
-                    metadata=metadata,
+                    final_score=final_score,
+                    open_pos=open_pos,
+                    fast=fast,
+                    slow=slow,
+                    rsi_values=rsi_values,
+                    bands=bands,
+                    atr_values=atr_values,
+                    volume_sma=volume_sma,
                 )
+                if exit_allowed:
+                    return StrategySignal(
+                        strategy_name=self.name,
+                        pair=context.pair,
+                        interval=context.interval,
+                        action=SignalAction.EXIT_SHORT,
+                        confidence=clamp_confidence(abs(final_score)),
+                        reason=exit_reason,
+                        timestamp_ms=latest.close_time_ms,
+                        direction=SignalDirection.SHORT,
+                        entry_price=latest.close,
+                        metadata={**metadata, **exit_metadata},
+                    )
+                else:
+                    return self._hold(
+                        context,
+                        exit_reason,
+                        {**metadata, **exit_metadata, "funnel_reason": SignalFunnelReason.EXISTING_POSITION_BLOCKED},
+                    )
             return self._hold(
                 context,
                 "Already short; hybrid score has not invalidated the position.",
@@ -352,7 +404,7 @@ class HybridMetaStrategy(Strategy):
         
         # Instrument-agnostic spread score:
         # If ATR is available, use it to normalize the spread.
-        # A 1.0 spread score is achieved when spread reaches 0.4x ATR.
+        # A 1.0 spread score is achieved when spread reaches 0.4 x ATR.
         if atr is not None and atr > 0:
             spread_score = _clamp(spread / (atr * Decimal("0.4")), Decimal("-1"), Decimal("1"))
         else:
@@ -377,11 +429,12 @@ class HybridMetaStrategy(Strategy):
     def _visual_score(
         self,
         *,
-        context: StrategyContext,
+        candles: list[OHLCVCandle],
         atr: Decimal | None,
         average_volume: Decimal | None,
     ) -> dict[str, Any]:
-        candles = list(context.candles)
+        if not candles:
+            return {"score": Decimal("0"), "blocked": True, "reason": "no candles"}
         latest = candles[-1]
         if latest.close <= 0:
             return {"score": Decimal("0"), "blocked": True, "reason": "latest close is not positive"}
@@ -421,7 +474,7 @@ class HybridMetaStrategy(Strategy):
             momentum_score = Decimal("0")
         else:
             momentum_pct = ((latest.close - start) / start) * Decimal("100")
-            momentum_score = _clamp(momentum_pct / Decimal("3"), Decimal("-1"), Decimal("1"))
+            momentum_score = _clamp(momentum_pct / Decimal("3.0"), Decimal("-1"), Decimal("1"))
 
         higher_highs = sum(1 for index in range(1, len(lookback)) if lookback[index].high > lookback[index - 1].high)
         lower_lows = sum(1 for index in range(1, len(lookback)) if lookback[index].low < lookback[index - 1].low)
@@ -584,6 +637,17 @@ class HybridMetaStrategy(Strategy):
             "risk_multiplier": combined_risk_multiplier,
             "risk_multiplier_applies": bool(metadata.get("risk_multiplier_applies")),
         }
+        if policy.atr_stop_enabled or policy.atr_trailing_enabled:
+            metadata.setdefault("breakeven_enabled", True)
+            metadata.setdefault("breakeven_offset_r", Decimal("0"))
+            metadata.setdefault("profit_lock_enabled", True)
+            metadata.setdefault("adaptive_stop_management_enabled", True)
+            metadata.setdefault(
+                "adaptive_stop_profile",
+                metadata.get("atr_profile") or metadata.get("trade_mode") or "balanced",
+            )
+        if atr is not None and atr > 0:
+            metadata.setdefault("atr_entry_atr", atr)
         stop_distance = (
             atr * self.stop_atr_multiple
             if atr is not None and atr > 0
@@ -644,8 +708,16 @@ class HybridMetaStrategy(Strategy):
             parent_metadata["breakout_rejection"] = "breakout_disabled"
             return None
 
+        min_execution_candles = int(
+            _decimal_from_metadata(
+                config.get("reversal_breakout_min_execution_candles"),
+                Decimal("2"),
+            )
+        )
+        min_execution_candles = max(min_execution_candles, 2)
+
         execution_candles = _execution_candles(context.features.get("execution_candles"))
-        if len(execution_candles) < 3:
+        if len(execution_candles) < min_execution_candles:
             parent_metadata["breakout_rejection"] = "not_enough_execution_candles"
             return None
 
@@ -711,11 +783,30 @@ class HybridMetaStrategy(Strategy):
             parent_metadata["breakout_rejection"] = f"close_position_too_low_{close_position_ratio:.2f}"
             return None
 
+        ignition_volume_ratio = _decimal_from_metadata(
+            config.get("reversal_breakout_ignition_volume_ratio"),
+            Decimal("3.0"),
+        )
+        ignition_body_ratio = _decimal_from_metadata(
+            config.get("reversal_breakout_ignition_body_ratio"),
+            Decimal("0.70"),
+        )
+        ignition_close_position_ratio = _decimal_from_metadata(
+            config.get("reversal_breakout_ignition_close_position_ratio"),
+            Decimal("0.75"),
+        )
+        ignition_candidate = (
+            volume_ratio >= ignition_volume_ratio
+            and body_ratio >= ignition_body_ratio
+            and close_position_ratio >= ignition_close_position_ratio
+        )
+
         if fast_ema is not None and fast_ema > 0 and latest_exec.close <= fast_ema:
             parent_metadata["breakout_rejection"] = "below_fast_ema"
             return None
 
         extension_atr = Decimal("0")
+        breakout_variant = "reversal_breakout"
         if atr is not None and atr > 0 and fast_ema is not None and fast_ema > 0:
             extension_atr = (latest_exec.close - fast_ema) / atr
             max_extension = _decimal_from_metadata(
@@ -723,14 +814,20 @@ class HybridMetaStrategy(Strategy):
                 Decimal("2.2"),
             )
             if extension_atr > max_extension:
-                parent_metadata["breakout_rejection"] = f"too_extended_from_ema_{extension_atr:.2f}"
-                return None
+                ignition_max_extension = _decimal_from_metadata(
+                    config.get("reversal_breakout_ignition_max_extension_atr"),
+                    Decimal("5.0"),
+                )
+                if not ignition_candidate or extension_atr > ignition_max_extension:
+                    parent_metadata["breakout_rejection"] = f"too_extended_from_ema_{extension_atr:.2f}"
+                    return None
+                breakout_variant = "momentum_ignition"
 
         hard_bearish_context = (
             final_score <= Decimal("-0.85")
             or (ema_score <= Decimal("-0.85") and visual_score <= Decimal("-0.60"))
         )
-        if hard_bearish_context:
+        if hard_bearish_context and not ignition_candidate:
             parent_metadata["breakout_rejection"] = "hard_bearish_context"
             return None
 
@@ -738,6 +835,11 @@ class HybridMetaStrategy(Strategy):
             config.get("reversal_breakout_risk_multiplier"),
             Decimal("0.50"),
         )
+        if breakout_variant == "momentum_ignition":
+            risk_multiplier = _decimal_from_metadata(
+                config.get("reversal_breakout_ignition_risk_multiplier"),
+                Decimal("0.25"),
+            )
         risk_multiplier = min(max(risk_multiplier, Decimal("0.05")), Decimal("1"))
         time_stop_candles = int(
             _decimal_from_metadata(
@@ -750,10 +852,16 @@ class HybridMetaStrategy(Strategy):
             **parent_metadata,
             "entry_type": "intrabar_reversal_breakout",
             "intrabar_reversal_breakout": True,
+            "breakout_variant": breakout_variant,
+            "momentum_ignition": breakout_variant == "momentum_ignition",
             "signal_funnel_raw_candidate": True,
             "signal_funnel_raw_direction": SignalDirection.LONG.value,
             "setup_tier": "B",
-            "setup_tier_reason": "B setup: intrabar reversal breakout override.",
+            "setup_tier_reason": (
+                "B setup: reduced-risk momentum ignition override."
+                if breakout_variant == "momentum_ignition"
+                else "B setup: intrabar reversal breakout override."
+            ),
             "setup_tier_risk_multiplier": risk_multiplier,
             "risk_multiplier": risk_multiplier,
             "risk_multiplier_applies": risk_multiplier < Decimal("1"),
@@ -770,23 +878,19 @@ class HybridMetaStrategy(Strategy):
             "execution_body_ratio": body_ratio,
             "execution_close_position_ratio": close_position_ratio,
             "execution_extension_atr": extension_atr,
+            "ignition_volume_ratio_threshold": ignition_volume_ratio,
+            "ignition_body_ratio_threshold": ignition_body_ratio,
+            "ignition_close_position_threshold": ignition_close_position_ratio,
             "breakeven_enabled": True,
-            "breakeven_activation_r": _decimal_from_metadata(
-                config.get("reversal_breakout_breakeven_activation_r"),
-                Decimal("0.70"),
-            ),
             "breakeven_offset_r": Decimal("0"),
             "profit_lock_enabled": True,
-            "profit_lock_activation_r": _decimal_from_metadata(
-                config.get("reversal_breakout_profit_lock_activation_r"),
-                Decimal("1.20"),
-            ),
-            "profit_lock_r": _decimal_from_metadata(
-                config.get("reversal_breakout_profit_lock_r"),
-                Decimal("0.35"),
-            ),
+            "adaptive_stop_management_enabled": True,
+            "adaptive_stop_profile": breakout_variant,
             "time_stop_candles": time_stop_candles,
             "time_stop_ms": time_stop_candles * interval_to_ms(latest_exec.interval),
+            "time_stop_exit_only_if_stagnant": True,
+            "time_stop_min_r": Decimal("0"),
+            "time_stop_breakout_level": parent_high,
         }
         parent_metadata["breakout_rejection"] = "entered"
         return self._entry_signal(
@@ -794,10 +898,162 @@ class HybridMetaStrategy(Strategy):
             direction=SignalDirection.LONG,
             final_score=max(abs(final_score), Decimal("0.50")),
             atr=atr,
-            reason="Intrabar reversal breakout: lower-timeframe impulse broke above parent high.",
+            reason=(
+                "Intrabar momentum ignition: live lower-timeframe burst broke above parent high."
+                if breakout_variant == "momentum_ignition"
+                else "Intrabar reversal breakout: lower-timeframe impulse broke above parent high."
+            ),
             metadata=metadata,
             entry_candle=latest_exec,
         )
+
+    def _get_score_at_index(
+        self,
+        context: StrategyContext,
+        index: int,
+        fast: list[Decimal | None],
+        slow: list[Decimal | None],
+        rsi_values: list[Decimal | None],
+        bands: list[BollingerBandPoint | None],
+        atr_values: list[Decimal | None],
+        volume_sma: list[Decimal | None],
+    ) -> Decimal:
+        candle = context.candles[index]
+        ema_score = self._ema_rsi_score(
+            latest_close=candle.close,
+            fast_current=fast[index],
+            slow_current=slow[index],
+            rsi_current=rsi_values[index],
+            atr=atr_values[index],
+        )
+        bb_score = self._bb_reversion_score(candle.close, bands[index])
+        
+        visual_candles = list(context.candles)
+        if index < -1:
+            visual_candles = visual_candles[:index + 1]
+            
+        visual = self._visual_score(
+            candles=visual_candles,
+            atr=atr_values[index],
+            average_volume=volume_sma[index],
+        )
+        
+        oi_score, oi_metadata = self._open_interest_score(context.features)
+        
+        spread = abs(fast[index] - slow[index]) if (fast[index] is not None and slow[index] is not None) else Decimal("0")
+        atr = atr_values[index]
+        is_strong_trend = (atr is not None and atr > 0 and spread >= atr * Decimal("0.5"))
+        is_weak_regime = (atr is not None and atr > 0 and spread <= atr * Decimal("0.15"))
+
+        score, _ = self._combined_score(
+            ema_score=ema_score,
+            bb_score=bb_score,
+            visual_score=visual["score"],
+            oi_score=oi_score,
+            oi_active=oi_metadata["score_used"],
+            is_strong_trend=is_strong_trend,
+            is_weak_regime=is_weak_regime,
+        )
+        return score
+
+    def _check_signal_flip_exit(
+        self,
+        *,
+        context: StrategyContext,
+        direction: SignalDirection,
+        final_score: Decimal,
+        open_pos: dict[str, Any],
+        fast: list[Decimal | None],
+        slow: list[Decimal | None],
+        rsi_values: list[Decimal | None],
+        bands: list[BollingerBandPoint | None],
+        atr_values: list[Decimal | None],
+        volume_sma: list[Decimal | None],
+    ) -> tuple[bool, str, dict[str, Any]]:
+        if not self.signal_flip_exit_enabled:
+            return True, "Hybrid score flipped; signal flip protection disabled.", {}
+
+        opened_at_ms = _decimal_from_metadata(open_pos.get("opened_at_ms"), Decimal("0"))
+        latest = context.candles[-1]
+        
+        interval_ms = interval_to_ms(context.interval)
+        hold_duration_ms = latest.close_time_ms - opened_at_ms
+        hold_candles = int(hold_duration_ms // interval_ms)
+        
+        metadata = {
+            "signal_flip_detected": True,
+            "hold_candles_at_signal_flip": hold_candles,
+        }
+
+        # 1. Min hold candles
+        if hold_candles < self.signal_flip_min_hold_candles:
+            return False, "signal_flip_ignored_min_hold", {**metadata, "final_exit_reason": "signal_flip_ignored_min_hold"}
+
+        # 2. Grace period
+        grace_active = hold_candles <= self.signal_flip_grace_candles
+        metadata["signal_flip_grace_active"] = grace_active
+        if grace_active:
+            return False, "signal_flip_ignored_grace_period", {**metadata, "final_exit_reason": "signal_flip_ignored_grace_period"}
+
+        # 3. Confirmation candles
+        confirm_count = 1
+        if self.signal_flip_confirm_candles > 1:
+            for i in range(2, self.signal_flip_confirm_candles + 1):
+                idx = -i
+                if abs(idx) > len(context.candles):
+                    break
+                prev_score = self._get_score_at_index(context, idx, fast, slow, rsi_values, bands, atr_values, volume_sma)
+                if direction == SignalDirection.LONG and prev_score <= -self.exit_threshold:
+                    confirm_count += 1
+                elif direction == SignalDirection.SHORT and prev_score >= self.exit_threshold:
+                    confirm_count += 1
+                else:
+                    break
+        
+        metadata["signal_flip_confirm_count"] = confirm_count
+        if confirm_count < self.signal_flip_confirm_candles:
+            return False, "signal_flip_waiting_confirmation", {**metadata, "final_exit_reason": "signal_flip_waiting_confirmation"}
+
+        # 4. Unprofitable only
+        if self.signal_flip_exit_only_if_unprofitable:
+            entry_price = _decimal_from_metadata(open_pos.get("entry_price"), Decimal("0"))
+            if direction == SignalDirection.LONG and latest.close > entry_price:
+                return False, "signal_flip_ignored_profitable", {**metadata, "final_exit_reason": "signal_flip_ignored_profitable"}
+            if direction == SignalDirection.SHORT and latest.close < entry_price:
+                return False, "signal_flip_ignored_profitable", {**metadata, "final_exit_reason": "signal_flip_ignored_profitable"}
+
+        # 5. Price confirmation
+        price_conf_passed = True
+        if self.signal_flip_exit_requires_price_confirmation:
+            price_conf_passed = False
+            entry_price = _decimal_from_metadata(open_pos.get("entry_price"), Decimal("0"))
+            fast_ema = fast[-1]
+            prev_candle = context.candles[-2] if len(context.candles) >= 2 else None
+            
+            if direction == SignalDirection.LONG:
+                if latest.close < entry_price:
+                    price_conf_passed = True
+                elif fast_ema is not None and latest.close < fast_ema:
+                    price_conf_passed = True
+                elif prev_candle is not None and latest.close < prev_candle.low:
+                    price_conf_passed = True
+            else: # SHORT
+                if latest.close > entry_price:
+                    price_conf_passed = True
+                elif fast_ema is not None and latest.close > fast_ema:
+                    price_conf_passed = True
+                elif prev_candle is not None and latest.close > prev_candle.high:
+                    price_conf_passed = True
+        
+        metadata["price_confirmation_passed"] = price_conf_passed
+        if not price_conf_passed:
+            return False, "signal_flip_waiting_price_confirmation", {**metadata, "final_exit_reason": "signal_flip_waiting_price_confirmation"}
+
+        reason = "signal_flip_exit_confirmed"
+        if self.signal_flip_exit_requires_price_confirmation:
+            reason = "signal_flip_exit_confirmed_price_break"
+            
+        return True, reason, {**metadata, "final_exit_reason": reason}
 
     def _hold(
         self,

@@ -80,16 +80,41 @@ class PaperPosition:
     strategy_name: str
     stop_loss: Decimal | None = None
     take_profit: Decimal | None = None
+    quote_to_margin_rate: Decimal = Decimal("1")
+    unit_contract_value: Decimal = Decimal("1")
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def notional(self) -> Decimal:
-        return abs(self.quantity * self.entry_price)
+        return abs(
+            self.quantity
+            * self.entry_price
+            * self.unit_contract_value
+            * self.quote_to_margin_rate
+        )
+
+    def margin_notional(self, price: Decimal) -> Decimal:
+        return abs(
+            self.quantity
+            * price
+            * self.unit_contract_value
+            * self.quote_to_margin_rate
+        )
 
     def unrealized_pnl(self, mark_price: Decimal) -> Decimal:
         if self.direction == SignalDirection.LONG:
-            return self.quantity * (mark_price - self.entry_price)
-        return self.quantity * (self.entry_price - mark_price)
+            return (
+                self.quantity
+                * (mark_price - self.entry_price)
+                * self.unit_contract_value
+                * self.quote_to_margin_rate
+            )
+        return (
+            self.quantity
+            * (self.entry_price - mark_price)
+            * self.unit_contract_value
+            * self.quote_to_margin_rate
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return convert_for_json(asdict(self))

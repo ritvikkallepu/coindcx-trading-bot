@@ -21,6 +21,7 @@ class CandleBuilderTests(unittest.TestCase):
         self.assertEqual(interval_to_ms("1h"), 3_600_000)
         self.assertEqual(interval_to_ms("2h"), 2 * 3_600_000)
         self.assertEqual(interval_to_ms("24h"), 24 * 3_600_000)
+        self.assertEqual(interval_to_ms("1M"), 30 * 24 * 3_600_000)
         with self.assertRaises(ValueError):
             interval_to_ms("2m")
 

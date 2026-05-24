@@ -139,6 +139,16 @@ class MarketDataPipelineTests(unittest.TestCase):
         self.assertEqual(count, 4)
         self.assertEqual(pipeline.store.summary()["event_counts"]["orderbook_update"], 1)
 
+    def test_unknown_event_is_skipped_without_crashing_pipeline(self) -> None:
+        logger = logging.getLogger("test.pipeline.unknown")
+        logger.disabled = True
+        pipeline = MarketDataPipeline(default_pair="B-BTC_USDT", logger=logger)
+
+        events = pipeline.handle_raw("unknown-event", {"data": {}})
+
+        self.assertEqual(events, [])
+        self.assertEqual(pipeline.store.summary()["event_counts"], {})
+
     def test_store_bounds_latest_dicts_and_keeps_candle_history(self) -> None:
         store = InMemoryMarketStore(
             max_price_pairs=1,

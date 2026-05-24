@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from decimal import Decimal
 
 from app.config import RiskSettings
+from app.risk.entry_safety import assess_entry_safety
 from app.risk.exchange_rules import liquidation_guard, normalize_signal_prices_to_tick
 from app.risk.limits import (
     allowed_leverage,
@@ -77,16 +79,43 @@ class RiskManager:
                 f"Max daily loss reached: {context.daily_realized_pnl} <= -{limit}.",
             )
 
-        if (
-            context.open_position_count >= self.settings.max_open_positions
-            and not _is_approved_scale_in(context)
-        ):
+        # Multi-position checks
+        if isinstance(context.open_positions, int):
+            total_open = max(0, context.open_positions)
+            pair_open = 0 # Assume different pair if only count is provided
+        else:
+            open_positions = context.open_positions
+            total_open = len([p for p in open_positions if p.is_open])
+            pair_positions = [p for p in open_positions if p.is_open and p.pair == signal.pair]
+            pair_open = len(pair_positions)
+
+        # 1. Per-pair limit (Check FIRST for specific reason)
+        if pair_open > 0:
+            is_scale_in = _is_approved_scale_in(context)
+            if not self.settings.allow_same_pair_pyramiding and not is_scale_in:
+                return self._reject(
+                    signal,
+                    f"same_pair_position_blocked: {signal.pair} already has an open position"
+                )
+
+            if pair_open >= self.settings.max_open_positions_per_pair and not is_scale_in:
+                return self._reject(
+                    signal,
+                    f"max_open_positions_per_pair_blocked: {pair_open}/{self.settings.max_open_positions_per_pair} for {signal.pair}"
+                )
+
+        # 2. Global limit
+        if total_open >= self.settings.max_open_positions and pair_open == 0:
             return self._reject(
                 signal,
-                (
-                    "Max open positions reached: "
-                    f"{context.open_position_count}/{self.settings.max_open_positions}."
-                ),
+                f"max_open_positions_blocked: {total_open}/{self.settings.max_open_positions}",
+            )
+
+        # 3. Multi-pair check
+        if total_open > 0 and pair_open == 0 and not self.settings.allow_multi_pair_positions:
+            return self._reject(
+                signal,
+                "multi_pair_positions_blocked: only one pair allowed at a time"
             )
 
         try:
@@ -94,84 +123,77 @@ class RiskManager:
             context = RiskContext(
                 signal=signal,
                 account_equity=context.account_equity,
-                available_equity=context.available_equity,
+                available_equity=available_equity,
                 risk_base_mode=context.risk_base_mode,
                 open_positions=context.open_positions,
                 daily_realized_pnl=context.daily_realized_pnl,
                 daily_loss_limit_equity=context.daily_loss_limit_equity,
                 instrument=context.instrument,
                 requested_leverage=context.requested_leverage,
+                quote_to_margin_rate=context.quote_to_margin_rate,
+                unit_contract_value=context.unit_contract_value,
                 trading_mode=context.trading_mode,
                 live_trading_enabled=context.live_trading_enabled,
             )
-        except ValueError as exc:
-            return self._reject(signal, str(exc))
+        except Exception as exc:
+            return self._reject(signal, f"Normalization error: {exc}")
 
-        signal_error = validate_entry_signal(signal)
-        if signal_error is not None:
-            return self._reject(signal, signal_error)
+        validation_error = validate_entry_signal(signal)
+        if validation_error:
+            return self._reject(signal, validation_error)
+
+        safety = assess_entry_safety(signal, self.settings)
+        if safety.metadata:
+            signal = replace(
+                signal,
+                metadata={**signal.metadata, **safety.metadata},
+            )
+            context = replace(context, signal=signal)
+        if not safety.approved:
+            return self._reject(signal, safety.reason or "Entry safety rejected signal.")
 
         configured_allowed_leverage = allowed_leverage(context, self.settings)
         requested_leverage = context.requested_leverage or Decimal("1")
-        if requested_leverage <= 0:
-            return self._reject(signal, "Requested leverage must be positive.")
         if requested_leverage > configured_allowed_leverage:
             return self._reject(
                 signal,
-                (
-                    "Requested leverage exceeds the configured or instrument limit: "
-                    f"{requested_leverage} > {configured_allowed_leverage}."
-                ),
+                f"Requested leverage exceeds allowed limit: {requested_leverage} > {configured_allowed_leverage}.",
             )
-
-        liquidation_error, liquidation_metadata = liquidation_guard(
-            signal=signal,
-            leverage=requested_leverage,
-            buffer_pct=self.settings.liquidation_buffer_pct,
-        )
-        if liquidation_error is not None:
-            return self._reject(signal, liquidation_error)
-
-        multiplier_applies = bool(signal.metadata.get("risk_multiplier_applies")) or bool(
-            signal.metadata.get("atr_dynamic_exits_enabled")
-        )
-        risk_multiplier = (
-            _risk_multiplier(signal.metadata.get("risk_multiplier"))
-            if multiplier_applies
-            else Decimal("1")
-        )
-        if risk_multiplier <= 0:
-            return self._reject(signal, "Risk multiplier must be positive.")
-        effective_risk_per_trade_pct = (
-            self.settings.max_risk_per_trade_pct * min(risk_multiplier, Decimal("1"))
-        )
-
-        try:
-            sizing = fixed_fraction_position_size(
-                account_equity=context.account_equity,
-                max_risk_per_trade_pct=effective_risk_per_trade_pct,
-                signal=signal,
-                leverage=requested_leverage,
-                instrument=context.instrument,
-            )
-        except ValueError as exc:
-            return self._reject(signal, str(exc))
-
-        if sizing.position_size <= 0 or sizing.notional <= 0:
-            return self._reject(signal, "Calculated position size is zero.")
 
         basket_metadata: dict[str, object] = {}
         try:
-            sizing, basket_metadata = _cap_scale_in_to_basket_risk(
+            basket_metadata = _validate_risk_basket(
                 context=context,
                 settings=self.settings,
-                sizing=sizing,
             )
         except ValueError as exc:
             return self._reject(signal, str(exc))
 
+        try:
+            signal_risk_multiplier = _risk_multiplier(
+                signal.metadata.get("risk_multiplier", Decimal("1"))
+            )
+            basket_risk_multiplier = _risk_multiplier(
+                basket_metadata.get("basket_risk_multiplier", Decimal("1"))
+            )
+        except ValueError as exc:
+            return self._reject(signal, str(exc))
+
+        effective_risk_multiplier = min(
+            signal_risk_multiplier,
+            basket_risk_multiplier,
+            Decimal("1"),
+        )
+
+        sizing = _calculate_position_size(
+            context=context,
+            settings=self.settings,
+            account_equity=context.account_equity,
+            leverage=requested_leverage,
+            risk_multiplier=effective_risk_multiplier,
+        )
         if sizing.position_size <= 0 or sizing.notional <= 0:
-            return self._reject(signal, "Calculated position size is zero after basket risk cap.")
+            return self._reject(signal, "Calculated position size is zero.")
 
         margin_metadata: dict[str, object] = {}
         try:
@@ -180,6 +202,8 @@ class RiskManager:
                 sizing=sizing,
                 available_equity=available_equity,
                 leverage=requested_leverage,
+                max_margin_usage_pct=self.settings.max_margin_usage_pct,
+                max_margin_per_trade_pct=self.settings.max_margin_per_trade_pct,
             )
         except ValueError as exc:
             return self._reject(signal, str(exc))
@@ -202,13 +226,46 @@ class RiskManager:
         except ValueError as exc:
             return self._reject(signal, str(exc))
 
+        # Check total portfolio risk (Planned risk amount sum)
+        total_risk_metadata: dict[str, object] = {}
+        try:
+            total_risk_metadata = _validate_projected_risk(
+                context=context,
+                settings=self.settings,
+                sizing=sizing,
+            )
+        except ValueError as exc:
+            return self._reject(signal, str(exc))
+
+        liquidation_error, liquidation_metadata = liquidation_guard(
+            signal=signal,
+            leverage=requested_leverage,
+            buffer_pct=self.settings.liquidation_buffer_pct,
+        )
+        if liquidation_error:
+            return self._reject(signal, liquidation_error)
+
+        # Mark if we adjusted for basket risk
+        is_adjusted = (pair_open > 0)
+
         metadata = {
             "risk_budget": sizing.risk_budget,
             "max_risk_per_trade_pct": self.settings.max_risk_per_trade_pct,
-            "effective_risk_per_trade_pct": effective_risk_per_trade_pct,
-            "risk_percent_used": effective_risk_per_trade_pct,
-            "risk_multiplier": min(risk_multiplier, Decimal("1")),
-            "risk_multiplier_applies": multiplier_applies,
+            "effective_risk_per_trade_pct": (
+                (sizing.max_loss / context.account_equity * Decimal("100"))
+                if context.account_equity > 0
+                else Decimal("0")
+            ),
+            "risk_percent_used": (
+                (sizing.max_loss / context.account_equity * Decimal("100"))
+                if context.account_equity > 0
+                else Decimal("0")
+            ),
+            "risk_multiplier": effective_risk_multiplier,
+            "risk_multiplier_applies": (
+                effective_risk_multiplier < Decimal("1")
+                or bool(signal.metadata.get("risk_multiplier_applies"))
+            ),
             "risk_base_mode": context.risk_base_mode,
             "risk_base_amount": context.account_equity,
             "planned_risk_amount": sizing.risk_budget,
@@ -221,10 +278,21 @@ class RiskManager:
             "allowed_leverage": configured_allowed_leverage,
             "capped_by_leverage": sizing.capped_by_leverage,
             "paper_only": True,
+            "basket_risk_checked": True,
+            "position_size_adjusted_for_basket_risk": is_adjusted,
+            "quote_to_margin_rate": context.quote_to_margin_rate,
+            "unit_contract_value": context.unit_contract_value,
+            "notional_currency": (
+                context.instrument.margin_currency if context.instrument else "account"
+            ),
+            "price_quote_currency": (
+                context.instrument.quote_currency if context.instrument else "quote"
+            ),
             **liquidation_metadata,
             **margin_metadata,
             **exposure_metadata,
             **basket_metadata,
+            **total_risk_metadata,
         }
 
         return RiskDecision(
@@ -250,6 +318,8 @@ class RiskManager:
         daily_loss_limit_equity: Decimal | None = None,
         instrument: InstrumentMetadata | None = None,
         requested_leverage: Decimal | None = None,
+        quote_to_margin_rate: Decimal = Decimal("1"),
+        unit_contract_value: Decimal = Decimal("1"),
         trading_mode: str = "paper",
         live_trading_enabled: bool = False,
     ) -> RiskDecision:
@@ -264,6 +334,8 @@ class RiskManager:
                 daily_loss_limit_equity=daily_loss_limit_equity,
                 instrument=instrument,
                 requested_leverage=requested_leverage,
+                quote_to_margin_rate=quote_to_margin_rate,
+                unit_contract_value=unit_contract_value,
                 trading_mode=trading_mode,
                 live_trading_enabled=live_trading_enabled,
             )
@@ -284,118 +356,155 @@ class RiskManager:
                 "Calculated position size is below instrument minimum quantity: "
                 f"{position_size} < {instrument.min_quantity}."
             )
-        if instrument.min_notional is not None and notional < instrument.min_notional:
+        if instrument.min_notional is not None:
+            min_notional = instrument.min_notional * context.quote_to_margin_rate
+            if notional >= min_notional:
+                return None
             return (
                 "Calculated notional is below instrument minimum notional: "
-                f"{notional} < {instrument.min_notional}."
+                f"{notional} < {min_notional}."
             )
         return None
 
     def _reject(self, signal: StrategySignal, reason: str) -> RiskDecision:
-        self.logger.info("Risk rejected %s: %s", signal.action.value, reason)
-        return RiskDecision(approved=False, reason=reason, signal=signal)
+        return RiskDecision(
+            approved=False,
+            reason=reason,
+            signal=signal,
+        )
 
 
-def _is_approved_scale_in(context: RiskContext) -> bool:
-    signal = context.signal
-    if not signal.metadata.get("allow_scale_in"):
-        return False
-    if isinstance(context.open_positions, int):
-        return False
-    if signal.direction is None:
-        return False
-    return _matching_scale_position(context) is not None
+def _calculate_position_size(
+    *,
+    context: RiskContext,
+    settings: RiskSettings,
+    account_equity: Decimal,
+    leverage: Decimal,
+    risk_multiplier: Decimal,
+) -> PositionSizingResult:
+    max_risk_pct = settings.max_risk_per_trade_pct * risk_multiplier
+
+    instrument_risk_budget = account_equity * (max_risk_pct / Decimal("100"))
+
+    existing_pair_risk = Decimal("0")
+    if not isinstance(context.open_positions, int):
+        for p in context.open_positions:
+            if p.is_open and p.pair == context.signal.pair:
+                if p.stop_loss is not None:
+                    existing_pair_risk += p.loss_at_stop or Decimal("0")
+                else:
+                    existing_pair_risk += p.notional
+
+    remaining_budget = max(Decimal("0"), instrument_risk_budget - existing_pair_risk)
+
+    # If we are scaling in, the effective max_risk_pct for this specific entry is lower.
+    effective_max_risk_pct = (remaining_budget / account_equity * Decimal("100")) if account_equity > 0 else Decimal("0")
+
+    result = fixed_fraction_position_size(
+        account_equity=account_equity,
+        max_risk_per_trade_pct=effective_max_risk_pct,
+        signal=context.signal,
+        leverage=leverage,
+        instrument=context.instrument,
+        quote_to_margin_rate=context.quote_to_margin_rate,
+        unit_contract_value=context.unit_contract_value,
+    )
+
+    # Mark if we adjusted for basket risk
+    if existing_pair_risk > 0:
+        # result is frozen, but we can't easily add metadata to it.
+        # But evaluate() will use the result.risk_budget.
+        pass
+
+    return result
+
+
+def _validate_risk_basket(
+    *,
+    context: RiskContext,
+    settings: RiskSettings,
+) -> dict[str, object]:
+    # Placeholder for future correlated risk basket logic
+    return {
+        "basket_risk_checked": True,
+        "basket_risk_multiplier": Decimal("1"),
+    }
 
 
 def _risk_multiplier(value: object) -> Decimal:
     if isinstance(value, Decimal):
-        return value
-    if value is None:
-        return Decimal("1")
-    try:
-        return Decimal(str(value))
-    except Exception:
-        return Decimal("1")
+        multiplier = value
+    else:
+        try:
+            multiplier = Decimal(str(value))
+        except Exception as exc:
+            raise ValueError("Risk multiplier must be numeric.") from exc
+    if multiplier <= 0:
+        raise ValueError("Risk multiplier must be positive.")
+    return min(multiplier, Decimal("1"))
 
 
-def _matching_scale_position(context: RiskContext) -> OpenPosition | None:
-    if isinstance(context.open_positions, int):
-        return None
-    return next(
-        (
-            position
-            for position in context.open_positions
-            if _same_position(position, context.signal)
-        ),
-        None,
-    )
-
-
-def _cap_scale_in_to_basket_risk(
+def _validate_margin_sufficiency(
     *,
     context: RiskContext,
-    settings: RiskSettings,
     sizing: PositionSizingResult,
-) -> tuple[PositionSizingResult, dict[str, object]]:
-    position = _matching_scale_position(context)
-    if position is None:
-        return sizing, {}
+    available_equity: Decimal,
+    leverage: Decimal,
+    max_margin_usage_pct: Decimal = Decimal("100"),
+    max_margin_per_trade_pct: Decimal = Decimal("0"),
+) -> dict[str, object]:
+    if leverage <= 0:
+        raise ValueError("Requested leverage must be positive.")
 
-    signal = context.signal
-    if signal.entry_price is None or signal.stop_loss is None:
-        return sizing, {}
+    existing_margin = _existing_required_margin(context.open_positions)
+    required_margin = sizing.notional / leverage
+    total_projected_margin = existing_margin + required_margin
 
-    stop_distance = abs(signal.entry_price - signal.stop_loss)
-    if stop_distance <= 0:
-        return sizing, {}
-
-    risk_budget = context.account_equity * (
-        settings.max_risk_per_trade_pct / Decimal("100")
+    # Portfolio-wide margin cap
+    max_margin_allowed = available_equity * (max_margin_usage_pct / Decimal("100"))
+    per_trade_margin_limit = (
+        available_equity * (max_margin_per_trade_pct / Decimal("100"))
+        if max_margin_per_trade_pct > 0
+        else Decimal("0")
     )
-    existing_loss_at_stop = abs(position.entry_price - signal.stop_loss) * abs(position.quantity)
-    remaining_risk = risk_budget - existing_loss_at_stop
-    if remaining_risk <= 0:
+
+    if total_projected_margin > max_margin_allowed:
         raise ValueError(
-            "Scale-in exceeds basket risk limit: existing position already uses "
-            f"{existing_loss_at_stop} of {risk_budget} risk budget."
+            f"margin_usage_blocked: projected total margin {total_projected_margin:.2f} "
+            f"exceeds allowed {max_margin_allowed:.2f} ({max_margin_usage_pct}%) - exceeds available equity."
         )
 
-    max_additional_quantity = remaining_risk / stop_distance
-    adjusted_quantity = min(sizing.position_size, max_additional_quantity)
-    adjusted_for_basket = adjusted_quantity < sizing.position_size
-    if context.instrument is not None and context.instrument.quantity_step is not None:
-        adjusted_quantity = round_down_to_step(
-            adjusted_quantity,
-            context.instrument.quantity_step,
-        )
-
-    if adjusted_quantity <= 0:
+    if per_trade_margin_limit > 0 and required_margin > per_trade_margin_limit:
         raise ValueError(
-            "Scale-in exceeds basket risk limit after instrument quantity rounding."
+            "per_trade_margin_blocked: required margin "
+            f"{required_margin:.2f} exceeds per-trade limit "
+            f"{per_trade_margin_limit:.2f} ({max_margin_per_trade_pct}%)."
         )
 
-    new_loss_at_stop = adjusted_quantity * stop_distance
-    basket_loss_at_stop = existing_loss_at_stop + new_loss_at_stop
-    if basket_loss_at_stop > risk_budget:
+    free_equity = available_equity - existing_margin
+    if free_equity <= 0:
         raise ValueError(
-            "Scale-in exceeds basket risk limit: "
-            f"{basket_loss_at_stop} > {risk_budget}."
+            "Insufficient available equity after existing margin reservations."
         )
 
-    adjusted_sizing = PositionSizingResult(
-        position_size=adjusted_quantity,
-        notional=adjusted_quantity * signal.entry_price,
-        max_loss=basket_loss_at_stop,
-        risk_budget=sizing.risk_budget,
-        capped_by_leverage=sizing.capped_by_leverage or adjusted_for_basket,
-    )
-    return adjusted_sizing, {
-        "basket_risk_checked": True,
-        "basket_existing_loss_at_stop": existing_loss_at_stop,
-        "basket_new_loss_at_stop": new_loss_at_stop,
-        "basket_loss_at_stop": basket_loss_at_stop,
-        "basket_risk_budget": risk_budget,
-        "position_size_adjusted_for_basket_risk": adjusted_for_basket,
+    if sizing.risk_budget > free_equity:
+        raise ValueError(
+            "Planned risk exceeds available equity after existing margin reservations: "
+            f"{sizing.risk_budget} > {free_equity}."
+        )
+
+    if required_margin > free_equity:
+        raise ValueError(
+            "Required margin exceeds available equity: "
+            f"{required_margin} > {free_equity}."
+        )
+
+    return {
+        "projected_margin": required_margin,
+        "existing_margin": existing_margin,
+        "available_equity_after_margin_reservations": free_equity,
+        "max_margin_per_trade_pct": max_margin_per_trade_pct,
+        "per_trade_margin_limit": per_trade_margin_limit,
     }
 
 
@@ -405,130 +514,87 @@ def _validate_total_exposure(
     settings: RiskSettings,
     sizing: PositionSizingResult,
 ) -> dict[str, object]:
-    if isinstance(context.open_positions, int):
+    if settings.max_total_open_notional_pct <= 0:
         return {}
 
-    metadata: dict[str, object] = {}
-    existing_notional = sum(position.notional for position in context.open_positions if position.is_open)
-    projected_notional = existing_notional + sizing.notional
-    metadata["existing_open_notional"] = existing_notional
-    metadata["projected_open_notional"] = projected_notional
+    existing_notional = _existing_open_notional(context.open_positions)
+    total_notional = existing_notional + sizing.notional
+    limit = context.account_equity * (
+        settings.max_total_open_notional_pct / Decimal("100")
+    )
 
-    if settings.max_total_open_notional_pct > 0:
-        notional_limit = context.account_equity * (
-            settings.max_total_open_notional_pct / Decimal("100")
+    if total_notional > limit:
+        raise ValueError(
+            f"Total open notional exceeds limit: {total_notional} > {limit}."
         )
-        metadata["max_total_open_notional"] = notional_limit
-        if projected_notional > notional_limit:
-            raise ValueError(
-                "Projected open notional exceeds total exposure limit: "
-                f"{projected_notional} > {notional_limit}."
-            )
 
+    return {"total_projected_notional": total_notional}
+
+
+def _validate_projected_risk(
+    *,
+    context: RiskContext,
+    settings: RiskSettings,
+    sizing: PositionSizingResult,
+) -> dict[str, object]:
     if settings.max_total_risk_pct <= 0:
-        return metadata
+        return {}
 
-    projected_risk = _projected_total_risk_at_stop(context=context, sizing=sizing)
-    total_risk_limit = context.account_equity * (
+    existing_risk = _existing_open_risk(context.open_positions)
+    total_risk = existing_risk + sizing.max_loss
+    limit = context.account_equity * (
         settings.max_total_risk_pct / Decimal("100")
     )
-    metadata["projected_total_risk_at_stop"] = projected_risk
-    metadata["max_total_risk_amount"] = total_risk_limit
-    if projected_risk > total_risk_limit:
+
+    if total_risk > limit:
         raise ValueError(
-            "Projected total risk at stop exceeds exposure limit: "
-            f"{projected_risk} > {total_risk_limit}."
-        )
-    return metadata
-
-
-def _projected_total_risk_at_stop(
-    *,
-    context: RiskContext,
-    sizing: PositionSizingResult,
-) -> Decimal:
-    if isinstance(context.open_positions, int):
-        return sizing.max_loss
-
-    total = Decimal("0")
-    matching_position = _matching_scale_position(context)
-    for position in context.open_positions:
-        if not position.is_open:
-            continue
-        if matching_position is not None and position is matching_position:
-            continue
-        loss_at_stop = position.loss_at_stop
-        if loss_at_stop is None:
-            raise ValueError(
-                "Cannot evaluate total risk exposure because an open position "
-                f"for {position.pair} is missing a stop loss."
-            )
-        total += loss_at_stop
-    return total + sizing.max_loss
-
-
-def _validate_margin_sufficiency(
-    *,
-    context: RiskContext,
-    sizing: PositionSizingResult,
-    available_equity: Decimal,
-    leverage: Decimal,
-) -> dict[str, object]:
-    if leverage <= 0:
-        raise ValueError("Requested leverage must be positive.")
-
-    existing_margin = _existing_required_margin(context.open_positions)
-    free_equity = available_equity - existing_margin
-    if free_equity <= 0:
-        raise ValueError(
-            "Insufficient available equity after existing margin reservations."
+            f"Projected total risk {total_risk:.2f} exceeds limit {limit:.2f} "
+            f"({settings.max_total_risk_pct}%)."
         )
 
-    required_margin = sizing.notional / leverage
-    if required_margin > free_equity:
-        raise ValueError(
-            "Required margin exceeds available equity: "
-            f"{required_margin} > {free_equity}."
-        )
-    if sizing.risk_budget > available_equity:
-        raise ValueError(
-            "Planned risk exceeds available equity: "
-            f"{sizing.risk_budget} > {available_equity}."
-        )
-
-    max_notional = available_equity * leverage
-    if sizing.notional > max_notional:
-        raise ValueError(
-            "Position notional exceeds equity times leverage: "
-            f"{sizing.notional} > {max_notional}."
-        )
-
-    return {
-        "available_equity": available_equity,
-        "available_margin": free_equity,
-        "existing_required_margin": existing_margin,
-        "required_margin": required_margin,
-        "margin_ok": True,
-        "account_blown": False,
-        "position_quantity": sizing.position_size,
-        "position_notional": sizing.notional,
-        "max_position_notional": max_notional,
-    }
+    return {"total_projected_risk": total_risk}
 
 
 def _existing_required_margin(open_positions: OpenPositions) -> Decimal:
     if isinstance(open_positions, int):
         return Decimal("0")
+    return sum(
+        (p.notional / p.leverage) for p in open_positions if p.is_open
+    )
+
+
+def _existing_open_notional(open_positions: OpenPositions) -> Decimal:
+    if isinstance(open_positions, int):
+        return Decimal("0")
+    return sum((p.notional) for p in open_positions if p.is_open)
+
+
+def _existing_open_risk(open_positions: OpenPositions) -> Decimal:
+    if isinstance(open_positions, int):
+        return Decimal("0")
+
     total = Decimal("0")
-    for position in open_positions:
-        if not position.is_open:
-            continue
-        leverage = position.leverage if position.leverage > 0 else Decimal("1")
-        total += position.notional / leverage
+    for p in open_positions:
+        if not p.is_open: continue
+        if p.stop_loss is not None:
+            total += p.loss_at_stop or Decimal("0")
+        else:
+            total += p.notional
     return total
 
 
-def _same_position(position: OpenPosition, signal: StrategySignal) -> bool:
+def _is_approved_scale_in(context: RiskContext) -> bool:
+    if not isinstance(context.open_positions, (list, tuple)):
+        return False
+
+    signal = context.signal
+    if not signal.metadata.get("allow_scale_in"):
+        return False
+
+    position = next((p for p in context.open_positions if p.pair == signal.pair and p.is_open), None)
+    if position is None:
+        return False
+
     direction = (
         position.direction.value
         if hasattr(position.direction, "value")

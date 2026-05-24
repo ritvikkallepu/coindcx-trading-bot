@@ -97,7 +97,7 @@ class CoinDCXFuturesClient:
             self.settings.live_trading_allowed if allow_trading is None else allow_trading
         )
 
-    def get_active_instruments(self, margin_currency: str = "USDT") -> list[str]:
+    def get_active_instruments(self, margin_currency: str = "INR") -> list[str]:
         return self._request_json(
             "GET",
             self.settings.coindcx_api_base_url,
@@ -105,7 +105,7 @@ class CoinDCXFuturesClient:
             query={"margin_currency_short_name[]": [margin_currency.upper()]},
         )
 
-    def get_instrument(self, pair: str, margin_currency: str = "USDT") -> dict[str, Any]:
+    def get_instrument(self, pair: str, margin_currency: str = "INR") -> dict[str, Any]:
         return self._request_json(
             "GET",
             self.settings.coindcx_api_base_url,

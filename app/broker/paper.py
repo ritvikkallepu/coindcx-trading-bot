@@ -16,6 +16,7 @@ from app.broker.models import (
     PaperPosition,
 )
 from app.data.candle_builder import OHLCVCandle
+from app.data.market_events import OrderBookLevel
 from app.fees import effective_fee_rate
 from app.persistence.paper_state import PaperStateStore
 from app.risk.limits import is_entry_signal, is_exit_signal
@@ -30,6 +31,13 @@ class _ExitTrigger:
     price: Decimal
     reason: str
     metadata: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _OrderBookState:
+    bids: list[OrderBookLevel]
+    asks: list[OrderBookLevel]
+    timestamp_ms: int | None = None
 
 
 class PaperBroker:
@@ -47,6 +55,10 @@ class PaperBroker:
         trailing_stop_enabled: bool = False,
         trailing_stop_activation_pct: Decimal = Decimal("1"),
         trailing_stop_distance_pct: Decimal = Decimal("2"),
+        quote_to_margin_rate: Decimal = Decimal("1"),
+        unit_contract_value: Decimal = Decimal("1"),
+        account_currency: str = "INR",
+        price_quote_currency: str = "USDT",
         logger: logging.Logger | None = None,
         state_store: PaperStateStore | None = None,
     ) -> None:
@@ -72,6 +84,10 @@ class PaperBroker:
             raise ValueError("trailing_stop_distance_pct cannot be negative.")
         if trailing_stop_enabled and trailing_stop_distance_pct <= 0:
             raise ValueError("trailing_stop_distance_pct must be positive when enabled.")
+        if quote_to_margin_rate <= 0:
+            raise ValueError("quote_to_margin_rate must be positive.")
+        if unit_contract_value <= 0:
+            raise ValueError("unit_contract_value must be positive.")
 
         self.starting_equity = starting_equity
         self.maker_fee_rate = maker_fee_rate
@@ -84,6 +100,10 @@ class PaperBroker:
         self.trailing_stop_enabled = trailing_stop_enabled
         self.trailing_stop_activation_pct = trailing_stop_activation_pct
         self.trailing_stop_distance_pct = trailing_stop_distance_pct
+        self.quote_to_margin_rate = quote_to_margin_rate
+        self.unit_contract_value = unit_contract_value
+        self.account_currency = account_currency.upper()
+        self.price_quote_currency = price_quote_currency.upper()
         self.logger = logger or logging.getLogger(__name__)
         self.state_store = state_store
         
@@ -93,12 +113,29 @@ class PaperBroker:
         self.positions: dict[str, PaperPosition] = {}
         self.orders: list[PaperOrder] = []
         self.fills: list[PaperFill] = []
+        self._mark_prices: dict[str, Decimal] = {}
+        self._orderbooks: dict[str, _OrderBookState] = {}
         self._order_sequence = 0
         self._fill_sequence = 0
+        self.restored_state_ignored = False
+        self.restored_state_ignored_reason = ""
 
         if self.state_store:
             saved = self.state_store.load()
-            if saved:
+            if isinstance(saved, dict) and saved:
+                if not _saved_state_currency_compatible(
+                    saved,
+                    quote_to_margin_rate=self.quote_to_margin_rate,
+                    unit_contract_value=self.unit_contract_value,
+                ):
+                    self.logger.warning(
+                        "Ignoring persisted paper state because it was created with "
+                        "legacy or different currency conversion settings. Reset the "
+                        "paper session to remove old CSV history."
+                    )
+                    self.restored_state_ignored = True
+                    self.restored_state_ignored_reason = "currency_mismatch"
+                    return
                 # Restore state with proper object reconstruction
                 self.positions = {
                     pair: self.state_store._restore_position(pos_dict)
@@ -111,6 +148,14 @@ class PaperBroker:
                 self.funding_paid = saved.get("funding_paid", Decimal("0"))
                 self.realized_pnl = saved.get(
                     "realized_pnl", saved.get("daily_pnl", Decimal("0"))
+                )
+                self._fill_sequence = max(
+                    (_sequence_number(fill.fill_id, "paper-fill-") for fill in self.fills),
+                    default=0,
+                )
+                self._order_sequence = max(
+                    (_sequence_number(fill.order_id, "paper-order-") for fill in self.fills),
+                    default=0,
                 )
 
                 self.logger.info(
@@ -224,7 +269,7 @@ class PaperBroker:
             mark_price = mark_prices.get(pair, position.entry_price)
             if mark_price <= 0:
                 continue
-            notional = abs(position.quantity * mark_price)
+            notional = position.margin_notional(mark_price)
             if position.direction == SignalDirection.LONG:
                 funding_paid += notional * funding_fee_rate
             else:
@@ -260,7 +305,7 @@ class PaperBroker:
         position = self.positions.get(candle.pair)
         if position is None:
             return
-        if not _bool_metadata(position.metadata, "atr_dynamic_exits_enabled", False):
+        if not _dynamic_atr_exits_enabled(position):
             return
         if position.opened_at_ms > candle.close_time_ms:
             return
@@ -281,6 +326,36 @@ class PaperBroker:
         breakeven_enabled = _bool_metadata(position.metadata, "breakeven_enabled", breakeven_enabled)
         profit_lock_enabled = _bool_metadata(position.metadata, "profit_lock_enabled", profit_lock_enabled)
         atr_trail_after_r_enabled = _bool_metadata(position.metadata, "atr_trail_after_r_enabled", atr_trail_after_r_enabled)
+        adaptive_stop_management_enabled = _bool_metadata(
+            position.metadata,
+            "adaptive_stop_management_enabled",
+            False,
+        )
+        breakeven_activation_r = _decimal_metadata(
+            position.metadata,
+            "breakeven_activation_r",
+            breakeven_activation_r,
+        )
+        breakeven_offset_r = _decimal_metadata(
+            position.metadata,
+            "breakeven_offset_r",
+            breakeven_offset_r,
+        )
+        profit_lock_activation_r = _decimal_metadata(
+            position.metadata,
+            "profit_lock_activation_r",
+            profit_lock_activation_r,
+        )
+        profit_lock_r = _decimal_metadata(
+            position.metadata,
+            "profit_lock_r",
+            profit_lock_r,
+        )
+        atr_trail_activation_r = _decimal_metadata(
+            position.metadata,
+            "atr_trail_activation_r",
+            atr_trail_activation_r,
+        )
 
         if not stop_enabled and not take_profit_enabled and not breakeven_enabled and not profit_lock_enabled:
             return
@@ -340,6 +415,18 @@ class PaperBroker:
         r_unit = abs(position.entry_price - initial_stop) if (initial_stop is not None and initial_stop > 0) else None
         current_profit = (candle.close - position.entry_price) if position.direction == SignalDirection.LONG else (position.entry_price - candle.close)
         current_r = (current_profit / r_unit) if (r_unit is not None and r_unit > 0) else Decimal("0")
+        adaptive_settings: dict[str, Decimal | str] = {}
+        if adaptive_stop_management_enabled and r_unit is not None and r_unit > 0:
+            adaptive_settings = _adaptive_stop_management_settings(
+                position=position,
+                current_atr=atr,
+                entry_atr=entry_atr,
+                r_unit=r_unit,
+                trailing_distance=trailing_distance,
+            )
+            breakeven_activation_r = adaptive_settings["breakeven_activation_r"]  # type: ignore[assignment]
+            profit_lock_activation_r = adaptive_settings["profit_lock_activation_r"]  # type: ignore[assignment]
+            profit_lock_r = adaptive_settings["profit_lock_r"]  # type: ignore[assignment]
         
         management_stop = None
         stop_type = "atr"
@@ -373,7 +460,7 @@ class PaperBroker:
             if actual_trailing_enabled:
                 best_price = max(
                     _decimal_metadata(position.metadata, "atr_best_price", position.entry_price),
-                    candle.close,
+                    candle.high,
                     position.entry_price,
                 )
             else:
@@ -411,7 +498,7 @@ class PaperBroker:
             if actual_trailing_enabled:
                 best_price = min(
                     _decimal_metadata(position.metadata, "atr_best_price", position.entry_price),
-                    candle.close,
+                    candle.low,
                     position.entry_price,
                 )
             else:
@@ -448,6 +535,7 @@ class PaperBroker:
         metadata = {
             **position.metadata,
             "atr_dynamic_exit_active": True,
+            "atr_dynamic_exits_enabled": True,
             "atr_latest": atr,
             "atr_stop_enabled": stop_enabled,
             "atr_take_profit_enabled": take_profit_enabled,
@@ -460,13 +548,27 @@ class PaperBroker:
             "atr_best_price": best_price,
             "atr_stop_loss": stop_candidate,
             "atr_take_profit": take_profit,
+            "take_profit_suppressed_by_trailing": _trailing_priority_enabled(
+                replace(
+                    position,
+                    metadata={
+                        **position.metadata,
+                        "atr_dynamic_exits_enabled": True,
+                        "atr_trailing_enabled": trailing_enabled,
+                        "profit_lock_enabled": profit_lock_enabled,
+                    },
+                )
+            ),
             "atr_exit_updated_at_ms": candle.close_time_ms,
+            "adaptive_stop_management_enabled": adaptive_stop_management_enabled,
             "atr_exit_update_count": int(
                 position.metadata.get("atr_exit_update_count", 0)
             )
             + 1,
             "stop_type": stop_type if stop_candidate == management_stop else "atr",
         }
+        if adaptive_settings:
+            metadata.update(adaptive_settings)
         self.positions[position.pair] = replace(
             position,
             stop_loss=stop_candidate,
@@ -479,17 +581,20 @@ class PaperBroker:
         self,
         mark_prices: Mapping[str, Decimal] | None = None,
     ) -> PaperAccountSnapshot:
+        if mark_prices:
+            self.update_mark_prices(mark_prices)
+
         unrealized = Decimal("0")
         for pair, position in self.positions.items():
-            mark_price = mark_prices.get(pair) if mark_prices else None
+            mark_price = self._mark_prices.get(pair)
             if mark_price is not None:
                 unrealized += position.unrealized_pnl(mark_price)
 
         open_notional = Decimal("0")
         for pair, position in self.positions.items():
-            mark_price = mark_prices.get(pair) if mark_prices else None
+            mark_price = self._mark_prices.get(pair)
             price = mark_price if mark_price is not None else position.entry_price
-            open_notional += abs(position.quantity * price)
+            open_notional += position.margin_notional(price)
 
         equity = (
             self.starting_equity
@@ -511,6 +616,72 @@ class PaperBroker:
 
     def open_positions(self) -> list[PaperPosition]:
         return list(self.positions.values())
+
+    def update_mark_prices(self, mark_prices: Mapping[str, Decimal]) -> None:
+        for pair, price in mark_prices.items():
+            if price is None:
+                continue
+            self._mark_prices[pair] = Decimal(str(price))
+
+    def mark_price_for(self, pair: str, fallback: Decimal | None = None) -> Decimal | None:
+        return self._mark_prices.get(pair, fallback)
+
+    def margin_notional(self, quantity: Decimal, price: Decimal) -> Decimal:
+        return abs(
+            quantity
+            * price
+            * self.unit_contract_value
+            * self.quote_to_margin_rate
+        )
+
+    def update_orderbook(
+        self,
+        pair: str,
+        *,
+        bids: list[OrderBookLevel],
+        asks: list[OrderBookLevel],
+        timestamp_ms: int | None = None,
+    ) -> None:
+        clean_bids = sorted(
+            [level for level in bids if level.price > 0 and level.quantity > 0],
+            key=lambda level: level.price,
+            reverse=True,
+        )
+        clean_asks = sorted(
+            [level for level in asks if level.price > 0 and level.quantity > 0],
+            key=lambda level: level.price,
+        )
+        if not clean_bids and not clean_asks:
+            return
+        self._orderbooks[pair] = _OrderBookState(
+            bids=clean_bids,
+            asks=clean_asks,
+            timestamp_ms=timestamp_ms,
+        )
+
+    def orderbook_summary(self, pair: str, *, depth: int = 5) -> dict[str, Decimal | int | None]:
+        book = self._orderbooks.get(pair)
+        if book is None:
+            return {}
+        depth = max(depth, 1)
+        best_bid = book.bids[0].price if book.bids else None
+        best_ask = book.asks[0].price if book.asks else None
+        bid_depth_quote = sum(
+            (level.price * level.quantity for level in book.bids[:depth]),
+            Decimal("0"),
+        )
+        ask_depth_quote = sum(
+            (level.price * level.quantity for level in book.asks[:depth]),
+            Decimal("0"),
+        )
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread_pct": _spread_pct(best_bid, best_ask),
+            "bid_depth_quote": bid_depth_quote,
+            "ask_depth_quote": ask_depth_quote,
+            "timestamp_ms": book.timestamp_ms,
+        }
 
     def _open_from_decision(
         self,
@@ -573,9 +744,16 @@ class PaperBroker:
                 market_price=market_price,
             )
 
-        fill_price = self._apply_slippage(base_price, side, self.slippage_pct)
         leverage = decision.leverage or Decimal("1")
         quantity = decision.position_size
+        fill_price, slippage_details = self._paper_fill_price(
+            pair=signal.pair,
+            side=side,
+            quantity=quantity,
+            base_price=base_price,
+            fallback_slippage_pct=self.slippage_pct,
+            slippage_type="entry",
+        )
         margin_error, margin_metadata = self._entry_margin_check(
             decision=decision,
             quantity=quantity,
@@ -602,13 +780,32 @@ class PaperBroker:
             reason="Paper entry filled.",
         )
         fee_type = self._fee_type_for_signal(signal, default_fee_type=self.entry_fee_type)
-        fee_details = self._fee_details(order.notional, fee_type)
+        fee_notional = self.margin_notional(order.quantity, order.price)
+        fee_details = self._fee_details(fee_notional, fee_type)
         fee = fee_details["total_fee"]
         fill = self._fill(
             order=order,
             fee=fee,
             timestamp_ms=timestamp_ms,
-            metadata=fee_details,
+            metadata={
+                **fee_details,
+                **slippage_details,
+                "notional_quote": order.notional,
+                "notional_margin": fee_notional,
+                "account_currency": self.account_currency,
+                "price_quote_currency": self.price_quote_currency,
+                "quote_to_margin_rate": self.quote_to_margin_rate,
+                "unit_contract_value": self.unit_contract_value,
+                "risk_percent_used": decision.metadata.get("risk_percent_used"),
+                "risk_multiplier": decision.metadata.get("risk_multiplier"),
+                "risk_base_mode": decision.metadata.get("risk_base_mode"),
+                "risk_base_amount": decision.metadata.get("risk_base_amount"),
+                "planned_risk_amount": decision.metadata.get("planned_risk_amount"),
+                "required_margin": margin_metadata.get("required_margin"),
+                "position_notional": margin_metadata.get("position_notional"),
+                "position_notional_margin": margin_metadata.get("position_notional_margin"),
+                "position_notional_quote": margin_metadata.get("position_notional_quote"),
+            },
         )
         self.fees_paid += fee
 
@@ -623,6 +820,8 @@ class PaperBroker:
             strategy_name=signal.strategy_name,
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
+            quote_to_margin_rate=self.quote_to_margin_rate,
+            unit_contract_value=self.unit_contract_value,
             metadata={
                 **decision.metadata,
                 **signal.metadata,
@@ -633,9 +832,20 @@ class PaperBroker:
                 "trailing_stop_activation_pct": self.trailing_stop_activation_pct,
                 "trailing_stop_distance_pct": self.trailing_stop_distance_pct,
                 "entry_fee_type": fee_type,
+                "entry_fee": fee,
                 "entry_fee_rate": fee_details["fee_rate"],
                 "entry_fee_gst_rate": self.fee_gst_rate,
                 "entry_effective_fee_rate": fee_details["effective_fee_rate"],
+                "entry_fees_total": fee,
+                "notional_quote": order.notional,
+                "notional_margin": fee_notional,
+                "account_currency": self.account_currency,
+                "price_quote_currency": self.price_quote_currency,
+                "quote_to_margin_rate": self.quote_to_margin_rate,
+                "unit_contract_value": self.unit_contract_value,
+                "quantity_unit": _quantity_unit(signal.pair),
+                "entry_slippage_model": slippage_details["slippage_model"],
+                "entry_slippage_pct": slippage_details["slippage_pct"],
             },
         )
         self.positions[signal.pair] = position
@@ -693,9 +903,16 @@ class PaperBroker:
                 market_price=market_price,
             )
 
-        fill_price = self._apply_slippage(base_price, side, self.slippage_pct)
         leverage = decision.leverage or position.leverage
         quantity = decision.position_size
+        fill_price, slippage_details = self._paper_fill_price(
+            pair=signal.pair,
+            side=side,
+            quantity=quantity,
+            base_price=base_price,
+            fallback_slippage_pct=self.slippage_pct,
+            slippage_type="entry",
+        )
         margin_error, margin_metadata = self._entry_margin_check(
             decision=decision,
             quantity=quantity,
@@ -722,13 +939,32 @@ class PaperBroker:
             reason="Paper grid scale-in filled.",
         )
         fee_type = self._fee_type_for_signal(signal, default_fee_type=self.entry_fee_type)
-        fee_details = self._fee_details(order.notional, fee_type)
+        fee_notional = self.margin_notional(order.quantity, order.price)
+        fee_details = self._fee_details(fee_notional, fee_type)
         fee = fee_details["total_fee"]
         fill = self._fill(
             order=order,
             fee=fee,
             timestamp_ms=timestamp_ms,
-            metadata=fee_details,
+            metadata={
+                **fee_details,
+                **slippage_details,
+                "notional_quote": order.notional,
+                "notional_margin": fee_notional,
+                "account_currency": self.account_currency,
+                "price_quote_currency": self.price_quote_currency,
+                "quote_to_margin_rate": position.quote_to_margin_rate,
+                "unit_contract_value": position.unit_contract_value,
+                "risk_percent_used": position.metadata.get("risk_percent_used"),
+                "risk_multiplier": position.metadata.get("risk_multiplier"),
+                "risk_base_mode": position.metadata.get("risk_base_mode"),
+                "risk_base_amount": position.metadata.get("risk_base_amount"),
+                "planned_risk_amount": position.metadata.get("planned_risk_amount"),
+                "required_margin": position.metadata.get("required_margin"),
+                "position_notional": position.metadata.get("position_notional"),
+                "position_notional_margin": position.metadata.get("position_notional_margin"),
+                "position_notional_quote": position.metadata.get("position_notional_quote"),
+            },
         )
         self.fees_paid += fee
 
@@ -736,6 +972,11 @@ class PaperBroker:
         average_entry = (
             (position.quantity * position.entry_price) + (quantity * fill_price)
         ) / new_quantity
+        existing_entry_fees = _decimal_metadata(
+            position.metadata,
+            "entry_fees_total",
+            _decimal_metadata(position.metadata, "entry_fee", Decimal("0")),
+        )
         metadata = {
             **position.metadata,
             **decision.metadata,
@@ -747,9 +988,14 @@ class PaperBroker:
             "last_scale_in_price": fill_price,
             "last_scale_in_at_ms": timestamp_ms,
             "last_scale_in_fee_type": fee_type,
+            "entry_fees_total": existing_entry_fees + fee,
             "last_scale_in_fee_rate": fee_details["fee_rate"],
             "last_scale_in_fee_gst_rate": self.fee_gst_rate,
             "last_scale_in_effective_fee_rate": fee_details["effective_fee_rate"],
+            "last_scale_in_notional_quote": order.notional,
+            "last_scale_in_notional_margin": fee_notional,
+            "last_scale_in_slippage_model": slippage_details["slippage_model"],
+            "last_scale_in_slippage_pct": slippage_details["slippage_pct"],
         }
         updated_position = replace(
             position,
@@ -819,7 +1065,14 @@ class PaperBroker:
             )
 
         slippage_pct = self._exit_slippage_pct(signal)
-        fill_price = self._apply_slippage(base_price, side, slippage_pct)
+        fill_price, slippage_details = self._paper_fill_price(
+            pair=position.pair,
+            side=side,
+            quantity=position.quantity,
+            base_price=base_price,
+            fallback_slippage_pct=slippage_pct,
+            slippage_type=_slippage_type(signal),
+        )
         action = (
             SignalAction.EXIT_LONG
             if position.direction == SignalDirection.LONG
@@ -837,7 +1090,8 @@ class PaperBroker:
         )
         gross_pnl = position.unrealized_pnl(fill_price)
         fee_type = self._fee_type_for_signal(signal, default_fee_type=self.exit_fee_type)
-        fee_details = self._fee_details(order.notional, fee_type)
+        fee_notional = position.margin_notional(order.price)
+        fee_details = self._fee_details(fee_notional, fee_type)
         fee = fee_details["total_fee"]
         fill = self._fill(
             order=order,
@@ -846,10 +1100,14 @@ class PaperBroker:
             realized_pnl=gross_pnl,
             metadata={
                 **fee_details,
-                "pre_slippage_price": base_price,
-                "slippage_pct": slippage_pct,
-                "slippage_type": _slippage_type(signal),
+                **slippage_details,
                 **_exit_fill_metadata(signal),
+                "notional_quote": order.notional,
+                "notional_margin": fee_notional,
+                "account_currency": self.account_currency,
+                "price_quote_currency": self.price_quote_currency,
+                "quote_to_margin_rate": position.quote_to_margin_rate,
+                "unit_contract_value": position.unit_contract_value,
             },
         )
         self.realized_pnl += gross_pnl
@@ -883,7 +1141,8 @@ class PaperBroker:
     ) -> tuple[str | None, dict[str, object]]:
         snapshot = self.snapshot({decision.signal.pair: mark_price})
         account_blown = snapshot.equity <= 0
-        notional = abs(quantity * price)
+        notional = self.margin_notional(quantity, price)
+        notional_quote = abs(quantity * price)
         required_margin = notional / leverage if leverage > 0 else notional
         planned_risk = decision.max_loss or Decimal("0")
         max_notional = snapshot.equity * leverage if snapshot.equity > 0 else Decimal("0")
@@ -902,9 +1161,15 @@ class PaperBroker:
             "planned_risk_amount": planned_risk,
             "position_quantity": quantity,
             "position_notional": notional,
+            "position_notional_quote": notional_quote,
+            "position_notional_margin": notional,
             "max_position_notional": max_notional,
             "margin_ok": margin_ok,
             "account_blown": account_blown,
+            "account_currency": self.account_currency,
+            "price_quote_currency": self.price_quote_currency,
+            "quote_to_margin_rate": self.quote_to_margin_rate,
+            "unit_contract_value": self.unit_contract_value,
             "risk_base_amount": decision.metadata.get("risk_base_amount"),
             "risk_base_mode": decision.metadata.get("risk_base_mode"),
             "risk_multiplier": decision.metadata.get("risk_multiplier"),
@@ -1016,6 +1281,88 @@ class PaperBroker:
             return price + adjustment
         return price - adjustment
 
+    def _paper_fill_price(
+        self,
+        *,
+        pair: str,
+        side: PaperOrderSide,
+        quantity: Decimal,
+        base_price: Decimal,
+        fallback_slippage_pct: Decimal,
+        slippage_type: str,
+    ) -> tuple[Decimal, dict[str, object]]:
+        book = self._orderbooks.get(pair)
+        fixed_price = self._apply_slippage(base_price, side, fallback_slippage_pct)
+        if book is None or quantity <= 0:
+            return fixed_price, {
+                "slippage_model": "fixed_pct",
+                "pre_slippage_price": base_price,
+                "slippage_pct": fallback_slippage_pct,
+                "configured_slippage_pct": fallback_slippage_pct,
+                "slippage_type": slippage_type,
+            }
+
+        levels = book.asks if side == PaperOrderSide.BUY else book.bids
+        if not levels:
+            return fixed_price, {
+                "slippage_model": "fixed_pct_no_book_side",
+                "pre_slippage_price": base_price,
+                "slippage_pct": fallback_slippage_pct,
+                "configured_slippage_pct": fallback_slippage_pct,
+                "slippage_type": slippage_type,
+                "orderbook_timestamp_ms": book.timestamp_ms,
+            }
+
+        remaining = quantity
+        visible_filled = Decimal("0")
+        notional = Decimal("0")
+        for level in levels:
+            if remaining <= 0:
+                break
+            take = min(remaining, level.quantity)
+            notional += take * level.price
+            visible_filled += take
+            remaining -= take
+
+        if visible_filled <= 0:
+            return fixed_price, {
+                "slippage_model": "fixed_pct_empty_book",
+                "pre_slippage_price": base_price,
+                "slippage_pct": fallback_slippage_pct,
+                "configured_slippage_pct": fallback_slippage_pct,
+                "slippage_type": slippage_type,
+                "orderbook_timestamp_ms": book.timestamp_ms,
+            }
+
+        if remaining > 0:
+            # We only subscribe to finite visible depth. Price the unfilled tail with
+            # the fixed fallback so the simulation remains conservative and complete.
+            notional += remaining * fixed_price
+
+        fill_price = notional / quantity
+        slippage_pct = _slippage_pct_from_fill(
+            base_price=base_price,
+            fill_price=fill_price,
+            side=side,
+        )
+        best_bid = book.bids[0].price if book.bids else None
+        best_ask = book.asks[0].price if book.asks else None
+        return fill_price, {
+            "slippage_model": "live_orderbook" if remaining <= 0 else "live_orderbook_plus_fixed_tail",
+            "pre_slippage_price": base_price,
+            "slippage_pct": slippage_pct,
+            "configured_slippage_pct": fallback_slippage_pct,
+            "slippage_type": slippage_type,
+            "orderbook_timestamp_ms": book.timestamp_ms,
+            "orderbook_side": "asks" if side == PaperOrderSide.BUY else "bids",
+            "orderbook_requested_quantity": quantity,
+            "orderbook_visible_filled_quantity": visible_filled,
+            "orderbook_depth_exhausted": remaining > 0,
+            "orderbook_best_bid": best_bid,
+            "orderbook_best_ask": best_ask,
+            "orderbook_spread_pct": _spread_pct(best_bid, best_ask),
+        }
+
     def _exit_slippage_pct(self, signal: StrategySignal) -> Decimal:
         if _is_stop_exit(signal) and self.stop_slippage_pct is not None:
             return self.stop_slippage_pct
@@ -1057,29 +1404,32 @@ class PaperBroker:
         position: PaperPosition,
         candle: OHLCVCandle,
     ) -> _ExitTrigger | None:
+        same_entry_candle = _position_opened_on_execution_candle(position, candle)
         if position.direction == SignalDirection.LONG:
             stop = position.stop_loss
-            target = position.take_profit
-            if stop is not None and candle.open <= stop:
+            target = None if _trailing_priority_enabled(position) else position.take_profit
+            if not same_entry_candle and stop is not None and candle.open <= stop:
                 return _exit_trigger(
                     action=SignalAction.EXIT_LONG,
                     price=candle.open,
                     reason=_gap_stop_reason(position),
                     trigger_type="stop_loss",
                     trigger_level=stop,
+                    position=position,
                     gap_exit=True,
                 )
-            if target is not None and candle.open >= target:
+            if not same_entry_candle and target is not None and candle.open >= target:
                 return _exit_trigger(
                     action=SignalAction.EXIT_LONG,
                     price=candle.open,
                     reason=_gap_take_profit_reason(position),
                     trigger_type="take_profit",
                     trigger_level=target,
+                    position=position,
                     gap_exit=True,
                 )
-            stop_hit = stop is not None and candle.low <= stop
-            target_hit = target is not None and candle.high >= target
+            stop_hit = _long_stop_hit(position, candle, stop)
+            target_hit = _long_target_hit(position, candle, target)
             if stop_hit and target_hit:
                 assert stop is not None
                 return _exit_trigger(
@@ -1088,6 +1438,7 @@ class PaperBroker:
                     reason="Ambiguous candle hit stop loss and take profit; conservative stop loss used.",
                     trigger_type="stop_loss",
                     trigger_level=stop,
+                    position=position,
                     ambiguous_candle=True,
                 )
             if stop_hit:
@@ -1098,6 +1449,7 @@ class PaperBroker:
                     reason=_stop_reason(position),
                     trigger_type="stop_loss",
                     trigger_level=stop,
+                    position=position,
                 )
             if target_hit:
                 assert target is not None
@@ -1107,31 +1459,37 @@ class PaperBroker:
                     reason=_take_profit_reason(position),
                     trigger_type="take_profit",
                     trigger_level=target,
+                    position=position,
                 )
+            time_stop = _time_stop_trigger(position, candle)
+            if time_stop is not None:
+                return time_stop
             return None
 
         stop = position.stop_loss
-        target = position.take_profit
-        if stop is not None and candle.open >= stop:
+        target = None if _trailing_priority_enabled(position) else position.take_profit
+        if not same_entry_candle and stop is not None and candle.open >= stop:
             return _exit_trigger(
                 action=SignalAction.EXIT_SHORT,
                 price=candle.open,
                 reason=_gap_stop_reason(position),
                 trigger_type="stop_loss",
                 trigger_level=stop,
+                position=position,
                 gap_exit=True,
             )
-        if target is not None and candle.open <= target:
+        if not same_entry_candle and target is not None and candle.open <= target:
             return _exit_trigger(
                 action=SignalAction.EXIT_SHORT,
                 price=candle.open,
                 reason=_gap_take_profit_reason(position),
                 trigger_type="take_profit",
                 trigger_level=target,
+                position=position,
                 gap_exit=True,
             )
-        stop_hit = stop is not None and candle.high >= stop
-        target_hit = target is not None and candle.low <= target
+        stop_hit = _short_stop_hit(position, candle, stop)
+        target_hit = _short_target_hit(position, candle, target)
         if stop_hit and target_hit:
             assert stop is not None
             return _exit_trigger(
@@ -1140,6 +1498,7 @@ class PaperBroker:
                 reason="Ambiguous candle hit stop loss and take profit; conservative stop loss used.",
                 trigger_type="stop_loss",
                 trigger_level=stop,
+                position=position,
                 ambiguous_candle=True,
             )
         if stop_hit:
@@ -1150,6 +1509,7 @@ class PaperBroker:
                 reason=_stop_reason(position),
                 trigger_type="stop_loss",
                 trigger_level=stop,
+                position=position,
             )
         if target_hit:
             assert target is not None
@@ -1159,7 +1519,11 @@ class PaperBroker:
                 reason=_take_profit_reason(position),
                 trigger_type="take_profit",
                 trigger_level=target,
+                position=position,
             )
+        time_stop = _time_stop_trigger(position, candle)
+        if time_stop is not None:
+            return time_stop
         return None
 
     def _update_trailing_stop(
@@ -1171,12 +1535,20 @@ class PaperBroker:
             return
         # If this position has ATR trailing enabled (via metadata or fallback), it takes 
         # precedence over the fixed percentage trailing stop.
-        if _bool_metadata(position.metadata, "atr_trailing_enabled", False):
+        if (
+            _bool_metadata(position.metadata, "atr_trailing_enabled", False)
+            and _bool_metadata(position.metadata, "atr_dynamic_exits_enabled", False)
+        ):
             return
         if position.stop_loss is None or candle.close <= 0:
             return
 
-        candidate = self._trailing_stop_candidate(position, candle.close)
+        reference_price = (
+            candle.high
+            if position.direction == SignalDirection.LONG
+            else candle.low
+        )
+        candidate = self._trailing_stop_candidate(position, reference_price)
         if candidate is None:
             return
 
@@ -1189,8 +1561,9 @@ class PaperBroker:
         metadata = {
             **position.metadata,
             "trailing_stop_active": True,
+            "take_profit_suppressed_by_trailing": _trailing_priority_enabled(position),
             "last_trailing_stop": candidate,
-            "last_trailing_reference_price": candle.close,
+            "last_trailing_reference_price": reference_price,
             "trailing_stop_updated_at_ms": candle.close_time_ms,
             "trailing_stop_update_count": int(
                 position.metadata.get("trailing_stop_update_count", 0)
@@ -1230,6 +1603,91 @@ class PaperBroker:
         return candidate
 
 
+def _position_opened_on_execution_candle(
+    position: PaperPosition,
+    candle: OHLCVCandle,
+) -> bool:
+    entry_open_ms = _int_metadata(
+        position.metadata,
+        "entry_execution_candle_open_time_ms",
+        -1,
+    )
+    if entry_open_ms < 0:
+        return False
+    if entry_open_ms != candle.open_time_ms:
+        return False
+    entry_interval = str(position.metadata.get("entry_execution_interval") or "")
+    return not entry_interval or entry_interval == candle.interval
+
+
+def _long_stop_hit(
+    position: PaperPosition,
+    candle: OHLCVCandle,
+    stop: Decimal | None,
+) -> bool:
+    if stop is None:
+        return False
+    if not _position_opened_on_execution_candle(position, candle):
+        return candle.low <= stop
+    entry_low = _decimal_metadata(
+        position.metadata,
+        "entry_execution_candle_low",
+        candle.low,
+    )
+    return candle.close <= stop or (candle.low < entry_low and candle.low <= stop)
+
+
+def _long_target_hit(
+    position: PaperPosition,
+    candle: OHLCVCandle,
+    target: Decimal | None,
+) -> bool:
+    if target is None:
+        return False
+    if not _position_opened_on_execution_candle(position, candle):
+        return candle.high >= target
+    entry_high = _decimal_metadata(
+        position.metadata,
+        "entry_execution_candle_high",
+        candle.high,
+    )
+    return candle.close >= target or (candle.high > entry_high and candle.high >= target)
+
+
+def _short_stop_hit(
+    position: PaperPosition,
+    candle: OHLCVCandle,
+    stop: Decimal | None,
+) -> bool:
+    if stop is None:
+        return False
+    if not _position_opened_on_execution_candle(position, candle):
+        return candle.high >= stop
+    entry_high = _decimal_metadata(
+        position.metadata,
+        "entry_execution_candle_high",
+        candle.high,
+    )
+    return candle.close >= stop or (candle.high > entry_high and candle.high >= stop)
+
+
+def _short_target_hit(
+    position: PaperPosition,
+    candle: OHLCVCandle,
+    target: Decimal | None,
+) -> bool:
+    if target is None:
+        return False
+    if not _position_opened_on_execution_candle(position, candle):
+        return candle.low <= target
+    entry_low = _decimal_metadata(
+        position.metadata,
+        "entry_execution_candle_low",
+        candle.low,
+    )
+    return candle.close <= target or (candle.low < entry_low and candle.low <= target)
+
+
 def _entry_side(action: SignalAction) -> PaperOrderSide | None:
     if action == SignalAction.ENTER_LONG:
         return PaperOrderSide.BUY
@@ -1252,12 +1710,183 @@ def _exit_matches_position(action: SignalAction, direction: SignalDirection) -> 
     return False
 
 
+def _adaptive_stop_management_settings(
+    *,
+    position: PaperPosition,
+    current_atr: Decimal,
+    entry_atr: Decimal,
+    r_unit: Decimal,
+    trailing_distance: Decimal,
+) -> dict[str, object]:
+    profile = str(
+        position.metadata.get("adaptive_stop_profile")
+        or position.metadata.get("atr_profile")
+        or position.metadata.get("trade_mode")
+        or "balanced"
+    ).strip().lower()
+
+    if "momentum" in profile or "ignition" in profile:
+        breakeven_noise_factor = Decimal("0.75")
+        profit_buffer_factor = Decimal("0.45")
+    elif "breakout" in profile or "runner" in profile:
+        breakeven_noise_factor = Decimal("0.90")
+        profit_buffer_factor = Decimal("0.60")
+    elif "defensive" in profile or "mean" in profile:
+        breakeven_noise_factor = Decimal("0.80")
+        profit_buffer_factor = Decimal("0.50")
+    elif "trend" in profile:
+        breakeven_noise_factor = Decimal("1.10")
+        profit_buffer_factor = Decimal("0.85")
+    else:
+        breakeven_noise_factor = Decimal("1.00")
+        profit_buffer_factor = Decimal("0.70")
+
+    live_atr_r = current_atr / r_unit
+    entry_atr_r = entry_atr / r_unit if entry_atr > 0 else live_atr_r
+    trailing_distance_r = trailing_distance / r_unit
+    volatility_ratio = current_atr / entry_atr if entry_atr > 0 else Decimal("1")
+
+    breakeven_activation_r = _clamp_decimal(
+        live_atr_r * breakeven_noise_factor,
+        Decimal("0.30"),
+        Decimal("2.20"),
+    )
+    profit_lock_activation_r = max(
+        breakeven_activation_r + (live_atr_r * profit_buffer_factor),
+        trailing_distance_r + (live_atr_r * Decimal("0.25")),
+    )
+    profit_lock_activation_r = _clamp_decimal(
+        profit_lock_activation_r,
+        breakeven_activation_r,
+        Decimal("4.00"),
+    )
+    profit_lock_r = max(
+        Decimal("0"),
+        profit_lock_activation_r - trailing_distance_r,
+    )
+    profit_lock_r = min(
+        profit_lock_r,
+        profit_lock_activation_r * Decimal("0.70"),
+    )
+
+    return {
+        "adaptive_stop_profile": profile,
+        "adaptive_breakeven_activation_r": breakeven_activation_r,
+        "adaptive_profit_lock_activation_r": profit_lock_activation_r,
+        "adaptive_profit_lock_r": profit_lock_r,
+        "adaptive_live_atr_r": live_atr_r,
+        "adaptive_entry_atr_r": entry_atr_r,
+        "adaptive_trailing_distance_r": trailing_distance_r,
+        "adaptive_volatility_ratio": volatility_ratio,
+        "breakeven_activation_r": breakeven_activation_r,
+        "profit_lock_activation_r": profit_lock_activation_r,
+        "profit_lock_r": profit_lock_r,
+    }
+
+
+def _clamp_decimal(value: Decimal, low: Decimal, high: Decimal) -> Decimal:
+    return min(max(value, low), high)
+
+
 def _can_scale_in(signal: StrategySignal, position: PaperPosition) -> bool:
     return (
         bool(signal.metadata.get("allow_scale_in"))
         and signal.direction == position.direction
         and signal.strategy_name == position.strategy_name
     )
+
+
+def _time_stop_trigger(
+    position: PaperPosition,
+    candle: OHLCVCandle,
+) -> _ExitTrigger | None:
+    time_stop_ms = _int_metadata(position.metadata, "time_stop_ms", 0)
+    if time_stop_ms <= 0:
+        return None
+    if candle.close_time_ms < position.opened_at_ms + time_stop_ms:
+        return None
+    exit_only_if_stagnant = _bool_metadata(
+        position.metadata,
+        "time_stop_exit_only_if_stagnant",
+        True,
+    )
+    if exit_only_if_stagnant:
+        min_r = _decimal_metadata(
+            position.metadata,
+            "time_stop_min_r",
+            Decimal("0"),
+        )
+        current_r = _position_current_r(position, candle.close)
+        if current_r is not None:
+            if current_r > min_r:
+                return None
+        elif _position_profit(position, candle.close) > 0:
+            return None
+    return _exit_trigger(
+        action=(
+            SignalAction.EXIT_LONG
+            if position.direction == SignalDirection.LONG
+            else SignalAction.EXIT_SHORT
+        ),
+        price=candle.close,
+        reason="Stagnation stop triggered: breakout did not progress after the time window.",
+        trigger_type="stagnation_time_stop",
+        trigger_level=candle.close,
+        position=position,
+    )
+
+
+def _trailing_priority_enabled(position: PaperPosition) -> bool:
+    """Return True when a position should be managed by a trailing/profit stop.
+
+    In this mode take-profit is treated as a diagnostic/initial target, not a
+    full-close trigger. The trade exits when the stop ratchets up/down and the
+    market reverses into it.
+    """
+
+    if str(position.metadata.get("take_profit_priority") or "").lower() == "take_profit":
+        return False
+    if _bool_metadata(position.metadata, "profit_lock_enabled", False):
+        return True
+    if (
+        _dynamic_atr_exits_enabled(position)
+        and _bool_metadata(position.metadata, "atr_trailing_enabled", False)
+    ):
+        return True
+    if _bool_metadata(position.metadata, "trailing_stop_enabled", False):
+        return True
+    return False
+
+
+def _dynamic_atr_exits_enabled(position: PaperPosition) -> bool:
+    if "atr_dynamic_exits_enabled" in position.metadata:
+        return _bool_metadata(position.metadata, "atr_dynamic_exits_enabled", False)
+    return any(
+        _bool_metadata(position.metadata, key, False)
+        for key in (
+            "atr_stop_enabled",
+            "atr_take_profit_enabled",
+            "atr_trailing_enabled",
+            "breakeven_enabled",
+            "profit_lock_enabled",
+        )
+    )
+
+
+def _position_profit(position: PaperPosition, price: Decimal) -> Decimal:
+    if position.direction == SignalDirection.LONG:
+        return price - position.entry_price
+    return position.entry_price - price
+
+
+def _position_current_r(position: PaperPosition, price: Decimal) -> Decimal | None:
+    initial_stop = _decimal_metadata(position.metadata, "initial_stop_loss", None)
+    if initial_stop is None or initial_stop <= 0:
+        return None
+    risk_unit = abs(position.entry_price - initial_stop)
+    if risk_unit <= 0:
+        return None
+    return _position_profit(position, price) / risk_unit
 
 
 def _exit_trigger(
@@ -1267,6 +1896,7 @@ def _exit_trigger(
     reason: str,
     trigger_type: str,
     trigger_level: Decimal,
+    position: PaperPosition, # Task: Pass position for context
     gap_exit: bool = False,
     ambiguous_candle: bool = False,
 ) -> _ExitTrigger:
@@ -1280,6 +1910,11 @@ def _exit_trigger(
             "trigger_price_source": "candle_open" if gap_exit else "trigger_level",
             "gap_exit": gap_exit,
             "ambiguous_candle": ambiguous_candle,
+            "initial_stop_loss": position.stop_loss,
+            "take_profit": position.take_profit,
+            "atr_stop_loss": position.metadata.get("atr_stop_loss"),
+            "atr_take_profit": position.metadata.get("atr_take_profit"),
+            "take_profit_suppressed_by_trailing": _trailing_priority_enabled(position),
         },
     )
 
@@ -1300,8 +1935,15 @@ def _exit_fill_metadata(signal: StrategySignal) -> dict[str, object]:
         "trigger_price_source",
         "gap_exit",
         "ambiguous_candle",
+        "initial_stop_loss",
+        "take_profit",
+        "atr_stop_loss",
+        "atr_take_profit",
+        "take_profit_suppressed_by_trailing",
     }
-    return {key: signal.metadata[key] for key in keys if key in signal.metadata}
+    metadata = {key: signal.metadata[key] for key in keys if key in signal.metadata}
+    metadata["reason"] = signal.reason
+    return metadata
 
 
 def _normalize_fee_type(value: str) -> str:
@@ -1309,6 +1951,116 @@ def _normalize_fee_type(value: str) -> str:
     if normalized not in {"maker", "taker"}:
         raise ValueError("fee type must be maker or taker.")
     return normalized
+
+
+def _sequence_number(value: object, prefix: str) -> int:
+    text = str(value or "")
+    if not text.startswith(prefix):
+        return 0
+    try:
+        return int(text[len(prefix) :])
+    except ValueError:
+        return 0
+
+
+def _saved_state_currency_compatible(
+    saved: Mapping[str, Any],
+    *,
+    quote_to_margin_rate: Decimal,
+    unit_contract_value: Decimal,
+) -> bool:
+    """Reject old paper state that was recorded before INR conversion metadata.
+
+    Restoring those fills into an INR-M session makes dashboard equity, PnL, fees
+    and margin look valid while they are actually quote-currency numbers.
+    """
+
+    def decimal_or_none(value: object) -> Decimal | None:
+        if value is None or value == "":
+            return None
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return None
+
+    positions = saved.get("positions") or {}
+    if isinstance(positions, Mapping):
+        for raw_position in positions.values():
+            if not isinstance(raw_position, Mapping):
+                continue
+            rate = decimal_or_none(raw_position.get("quote_to_margin_rate"))
+            unit = decimal_or_none(raw_position.get("unit_contract_value"))
+            metadata = raw_position.get("metadata")
+            if isinstance(metadata, Mapping):
+                rate = rate or decimal_or_none(metadata.get("quote_to_margin_rate"))
+                unit = unit or decimal_or_none(metadata.get("unit_contract_value"))
+            if rate is None:
+                rate = Decimal("1")
+            if unit is None:
+                unit = Decimal("1")
+            if rate != quote_to_margin_rate or unit != unit_contract_value:
+                return False
+
+    fills = saved.get("fills") or []
+    if isinstance(fills, list):
+        for raw_fill in fills:
+            if not isinstance(raw_fill, Mapping):
+                continue
+            metadata = raw_fill.get("metadata")
+            if not isinstance(metadata, Mapping):
+                metadata = {}
+            rate = decimal_or_none(metadata.get("quote_to_margin_rate"))
+            unit = decimal_or_none(metadata.get("unit_contract_value"))
+            if rate is None:
+                rate = Decimal("1")
+            if unit is None:
+                unit = Decimal("1")
+            if rate != quote_to_margin_rate or unit != unit_contract_value:
+                return False
+
+    return True
+
+
+def _quantity_unit(pair: str) -> str:
+    symbol = pair
+    if symbol.startswith("B-"):
+        symbol = symbol[2:]
+    return symbol.split("_", 1)[0] or "contracts"
+
+
+def _slippage_pct_from_fill(
+    *,
+    base_price: Decimal,
+    fill_price: Decimal,
+    side: PaperOrderSide,
+) -> Decimal:
+    if base_price <= 0:
+        return Decimal("0")
+    if side == PaperOrderSide.BUY:
+        return (fill_price - base_price) / base_price * Decimal("100")
+    return (base_price - fill_price) / base_price * Decimal("100")
+
+
+def _spread_pct(
+    best_bid: Decimal | None,
+    best_ask: Decimal | None,
+) -> Decimal | None:
+    if best_bid is None or best_ask is None:
+        return None
+    midpoint = (best_bid + best_ask) / Decimal("2")
+    if midpoint <= 0:
+        return None
+    return (best_ask - best_bid) / midpoint * Decimal("100")
+
+
+def _int_metadata(metadata: Mapping[str, object], key: str, default: int) -> int:
+    value = metadata.get(key)
+    if value is None:
+        return default
+    try:
+        return int(Decimal(str(value)))
+    except Exception:
+        return default
 
 
 def _bool_metadata(
@@ -1346,35 +2098,35 @@ def _stop_reason(position: PaperPosition) -> str:
     if position.metadata.get("atr_dynamic_exit_active") and position.metadata.get("atr_stop_enabled"):
         stop_type = position.metadata.get("stop_type", "atr")
         if stop_type == "breakeven":
-            return "Breakeven stop triggered."
+            return "breakeven_stop"
         if stop_type == "profit_lock":
-            return "Profit lock triggered."
-        return "Dynamic ATR stop triggered."
+            return "profit_lock_stop"
+        return "dynamic_atr_stop"
     if position.metadata.get("trailing_stop_active"):
-        return "Trailing stop triggered."
-    return "Stop loss triggered."
+        return "trailing_stop"
+    return "hard_stop_loss"
 
 
 def _take_profit_reason(position: PaperPosition) -> str:
     if position.metadata.get("atr_dynamic_exit_active") and position.metadata.get("atr_take_profit_enabled"):
-        return "Dynamic ATR take profit triggered."
-    return "Take profit triggered."
+        return "dynamic_atr_take_profit"
+    return "take_profit"
 
 
 def _gap_stop_reason(position: PaperPosition) -> str:
     if position.metadata.get("atr_dynamic_exit_active") and position.metadata.get("atr_stop_enabled"):
         stop_type = position.metadata.get("stop_type", "atr")
         if stop_type == "breakeven":
-            return "Breakeven stop gapped through; filled at candle open."
+            return "breakeven_stop_gapped"
         if stop_type == "profit_lock":
-            return "Profit lock gapped through; filled at candle open."
-        return "Dynamic ATR stop gapped through; filled at candle open."
+            return "profit_lock_stop_gapped"
+        return "dynamic_atr_stop_gapped"
     if position.metadata.get("trailing_stop_active") and not position.metadata.get("fixed_trailing_stop_suppressed"):
-        return "Trailing stop gapped through; filled at candle open."
-    return "Stop loss gapped through; filled at candle open."
+        return "trailing_stop_gapped"
+    return "hard_stop_loss_gapped"
 
 
 def _gap_take_profit_reason(position: PaperPosition) -> str:
     if position.metadata.get("atr_dynamic_exit_active") and position.metadata.get("atr_take_profit_enabled"):
-        return "Dynamic ATR take profit gapped through; filled at candle open."
-    return "Take profit gapped through; filled at candle open."
+        return "dynamic_atr_take_profit_gapped"
+    return "take_profit_gapped"

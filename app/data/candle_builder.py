@@ -22,6 +22,7 @@ FIXED_INTERVAL_MS = {
     "24h": 24 * 60 * 60_000,
     "3d": 3 * 24 * 60 * 60_000,
     "1w": 7 * 24 * 60 * 60_000,
+    "1M": 30 * 24 * 60 * 60_000,
 }
 
 
@@ -53,6 +54,7 @@ class OHLCVCandle:
     volume: Decimal
     quote_volume: Decimal = Decimal("0")
     trade_count: int = 0
+    is_closed: bool = True
 
     @classmethod
     def from_candle_event(cls, event: CandleEvent) -> OHLCVCandle:
@@ -68,6 +70,7 @@ class OHLCVCandle:
             volume=event.volume,
             quote_volume=event.quote_volume or Decimal("0"),
             trade_count=0,
+            is_closed=event.is_closed,
         )
 
     @classmethod

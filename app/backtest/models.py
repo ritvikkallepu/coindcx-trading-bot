@@ -22,6 +22,10 @@ class BacktestConfig:
     starting_equity: Decimal
     leverage: Decimal
     strategy_name: str = "all"
+    margin_currency: str = "INR"
+    price_quote_currency: str = "USDT"
+    quote_to_margin_rate: Decimal = Decimal("1")
+    unit_contract_value: Decimal = Decimal("1")
     requested_candles: int | None = None
     risk_per_trade_pct: Decimal | None = None
     compound_risk_equity: bool = False
@@ -70,6 +74,22 @@ class BacktestConfig:
     intrabar_reentry_enabled: bool = False
     max_reentries_per_candle: int = 0
     reentry_cooldown_candles: int = 1
+    intrabar_reversal_breakout_enabled: bool = True
+    reversal_breakout_min_execution_candles: int = 2
+    reversal_breakout_volume_ratio: Decimal = Decimal("2.0")
+    reversal_breakout_body_ratio: Decimal = Decimal("0.65")
+    reversal_breakout_close_position_ratio: Decimal = Decimal("0.70")
+    reversal_breakout_risk_multiplier: Decimal = Decimal("0.50")
+    reversal_breakout_max_extension_atr: Decimal = Decimal("2.2")
+    reversal_breakout_ignition_volume_ratio: Decimal = Decimal("3.0")
+    reversal_breakout_ignition_body_ratio: Decimal = Decimal("0.70")
+    reversal_breakout_ignition_close_position_ratio: Decimal = Decimal("0.75")
+    reversal_breakout_ignition_max_extension_atr: Decimal = Decimal("5.0")
+    reversal_breakout_ignition_risk_multiplier: Decimal = Decimal("0.25")
+    reversal_breakout_breakeven_activation_r: Decimal = Decimal("0.70")
+    reversal_breakout_profit_lock_activation_r: Decimal = Decimal("1.20")
+    reversal_breakout_profit_lock_r: Decimal = Decimal("0.35")
+    reversal_breakout_time_stop_candles: int = 8
     stop_loss_cooldown_candles: int = 1
     max_consecutive_losses: int = 2
     loss_cooldown_candles: int = 4
@@ -114,6 +134,10 @@ class BacktestConfig:
     def __post_init__(self) -> None:
         if self.requested_candles is not None and self.requested_candles <= 0:
             raise ValueError("requested_candles must be positive when provided.")
+        if self.quote_to_margin_rate <= 0:
+            raise ValueError("quote_to_margin_rate must be positive.")
+        if self.unit_contract_value <= 0:
+            raise ValueError("unit_contract_value must be positive.")
         if self.trade_quality_mode not in {"strict", "loose", "tiered"}:
             raise ValueError("trade_quality_mode must be strict, loose, or tiered.")
         if self.a_setup_score_threshold <= 0:

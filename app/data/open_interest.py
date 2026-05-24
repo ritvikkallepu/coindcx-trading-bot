@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
 from bisect import bisect_right
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -12,6 +15,7 @@ from app.data.candle_builder import OHLCVCandle
 
 
 BINANCE_USDM_BASE_URL = "https://fapi.binance.com"
+BINANCE_OI_MAX_HISTORY_MS = 30 * 24 * 60 * 60_000
 BINANCE_OI_PERIOD_BY_INTERVAL = {
     "1m": "5m",
     "5m": "5m",
@@ -22,8 +26,11 @@ BINANCE_OI_PERIOD_BY_INTERVAL = {
     "2h": "2h",
     "2hr": "2h",
     "4h": "4h",
+    "8h": "12h",
     "24h": "1d",
     "1d": "1d",
+    "3d": "1d",
+    "1w": "1d",
 }
 BINANCE_OI_PERIOD_MS = {
     "5m": 5 * 60_000,
@@ -68,9 +75,11 @@ class BinanceOpenInterestClient:
         *,
         base_url: str = BINANCE_USDM_BASE_URL,
         timeout_seconds: float = 2.5,
+        opener: Callable[..., Any] = urlopen,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self._opener = opener
 
     def get_open_interest_history(
         self,
@@ -99,8 +108,13 @@ class BinanceOpenInterestClient:
             headers={"Accept": "application/json", "User-Agent": "coindcx-bot/0.1"},
             method="GET",
         )
-        with urlopen(request, timeout=self.timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
+        try:
+            with self._opener(request, timeout=self.timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            if _is_unavailable_binance_oi_response(exc):
+                return []
+            raise
         data = json.loads(raw)
         if not isinstance(data, list):
             return []
@@ -225,12 +239,20 @@ def load_binance_open_interest_proxy(
     if symbol is None or period is None or not candle_list:
         return OpenInterestFeatureSeries([])
 
+    window = binance_oi_request_window(
+        start_time_ms=candle_list[0].open_time_ms,
+        end_time_ms=candle_list[-1].close_time_ms + 1,
+    )
+    if window is None:
+        return OpenInterestFeatureSeries([])
+    start_time_ms, end_time_ms = window
+
     oi_client = client or BinanceOpenInterestClient()
     points = oi_client.get_open_interest_history_between(
         symbol=symbol,
         period=period,
-        start_time_ms=candle_list[0].open_time_ms,
-        end_time_ms=candle_list[-1].close_time_ms + 1,
+        start_time_ms=start_time_ms,
+        end_time_ms=end_time_ms,
     )
     return build_open_interest_features(
         pair=pair,
@@ -238,6 +260,22 @@ def load_binance_open_interest_proxy(
         candles=candle_list,
         points=points,
     )
+
+
+def binance_oi_request_window(
+    *,
+    start_time_ms: int,
+    end_time_ms: int,
+    now_ms: int | None = None,
+) -> tuple[int, int] | None:
+    """Clamp Binance OI requests to the exchange's recent-history window."""
+    if start_time_ms >= end_time_ms:
+        return None
+    current_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    earliest_available_ms = current_ms - BINANCE_OI_MAX_HISTORY_MS
+    if end_time_ms <= earliest_available_ms:
+        return None
+    return max(start_time_ms, earliest_available_ms), end_time_ms
 
 
 def open_interest_confirmation_score(
@@ -273,3 +311,35 @@ def _point_from_binance_row(row: Mapping[str, Any]) -> OpenInterestPoint:
 
 def _clamp(value: Decimal, low: Decimal, high: Decimal) -> Decimal:
     return min(max(value, low), high)
+
+
+def _is_unavailable_binance_oi_response(exc: HTTPError) -> bool:
+    if exc.code != 400:
+        return False
+
+    body = _read_http_error_body(exc)
+    if not body:
+        return False
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        payload = {}
+
+    code = payload.get("code") if isinstance(payload, Mapping) else None
+    message = str(payload.get("msg", "") if isinstance(payload, Mapping) else body).lower()
+
+    if code == -1121 or "invalid symbol" in message:
+        return True
+    if "latest 1 month" in message or "latest 30 days" in message:
+        return True
+    if "starttime" in message and ("too old" in message or "invalid" in message):
+        return True
+    return False
+
+
+def _read_http_error_body(exc: HTTPError) -> str:
+    try:
+        return exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""

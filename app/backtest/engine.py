@@ -238,6 +238,10 @@ class BacktestEngine:
             trailing_stop_enabled=self.config.trailing_stop_enabled,
             trailing_stop_activation_pct=self.config.trailing_stop_activation_pct,
             trailing_stop_distance_pct=self.config.trailing_stop_distance_pct,
+            quote_to_margin_rate=self.config.quote_to_margin_rate,
+            unit_contract_value=self.config.unit_contract_value,
+            account_currency=self.config.margin_currency,
+            price_quote_currency=self.config.price_quote_currency,
         )
         execution = PaperExecutionEngine(broker)
         series = CandleSeries(maxlen=max(len(all_candles), 1))
@@ -375,6 +379,8 @@ class BacktestEngine:
                     daily_loss_limit_equity=daily_start_equity[day],
                     instrument=self.instrument,
                     requested_leverage=self.config.leverage,
+                    quote_to_margin_rate=self.config.quote_to_margin_rate,
+                    unit_contract_value=self.config.unit_contract_value,
                     trading_mode="paper",
                     live_trading_enabled=False,
                 )
@@ -541,6 +547,10 @@ class BacktestEngine:
             trailing_stop_enabled=self.config.trailing_stop_enabled,
             trailing_stop_activation_pct=self.config.trailing_stop_activation_pct,
             trailing_stop_distance_pct=self.config.trailing_stop_distance_pct,
+            quote_to_margin_rate=self.config.quote_to_margin_rate,
+            unit_contract_value=self.config.unit_contract_value,
+            account_currency=self.config.margin_currency,
+            price_quote_currency=self.config.price_quote_currency,
         )
         execution = PaperExecutionEngine(broker)
         series = CandleSeries(maxlen=max(len(all_candles), 1))
@@ -568,11 +578,14 @@ class BacktestEngine:
                 ).equity
 
             parent_reentries = 0
+            parent_breakout_entries = 0
             reentry_cooldown_until_ms = 0
             active_bias: StrategySignal | None = None
             child_candles = child_by_parent.get(parent_candle.open_time_ms) or [parent_candle]
+            parent_execution_history: list[OHLCVCandle] = []
 
             for child in child_candles:
+                parent_execution_history.append(child)
                 if pending_decisions:
                     before_reports = len(reports)
                     pending_decisions = _fill_pending_decisions(
@@ -636,6 +649,117 @@ class BacktestEngine:
 
                 if (
                     day not in halted_days
+                    and self.config.intrabar_reversal_breakout_enabled
+                    and self.config.strategy_name == "hybrid_meta_v2"
+                    and parent_breakout_entries < 1
+                    and not broker.open_positions()
+                    and not pending_decisions
+                    and not safety_state.active(child.close_time_ms)
+                ):
+                    indicators = latest_indicator_snapshot(
+                        series,
+                        atr_period=self.config.atr_period,
+                    )
+                    context = StrategyContext(
+                        pair=self.config.pair,
+                        interval=self.config.interval,
+                        candles=series,
+                        indicators=indicators,
+                        features=_strategy_features(
+                            broker,
+                            self.config.pair,
+                            self.config,
+                            open_interest=self.open_interest_features.latest_at_or_before(
+                                child.close_time_ms
+                            ),
+                            execution_candles=parent_execution_history,
+                            execution_interval=execution_interval,
+                        ),
+                    )
+                    for signal in self.strategy_engine.evaluate(context):
+                        if signal.metadata.get("entry_type") != "intrabar_reversal_breakout":
+                            continue
+                        signal = _apply_exit_overrides(
+                            signal,
+                            self.config,
+                            current_atr=indicators.atr,
+                        )
+                        snapshot = broker.snapshot({self.config.pair: child.close})
+                        decision = self.risk_manager.evaluate_signal(
+                            signal,
+                            account_equity=_risk_sizing_equity(
+                                snapshot_equity=snapshot.equity,
+                                config=self.config,
+                            ),
+                            available_equity=snapshot.equity,
+                            risk_base_mode=_risk_base_mode(self.config),
+                            open_positions=_risk_open_positions(broker),
+                            daily_realized_pnl=daily_net_pnl.get(
+                                _day_key(child.close_time_ms),
+                                Decimal("0"),
+                            ),
+                            daily_loss_limit_equity=daily_start_equity[day],
+                            instrument=self.instrument,
+                            requested_leverage=self.config.leverage,
+                            quote_to_margin_rate=self.config.quote_to_margin_rate,
+                            unit_contract_value=self.config.unit_contract_value,
+                            trading_mode="paper",
+                            live_trading_enabled=False,
+                        )
+                        decision = _apply_entry_safety_filter(
+                            decision,
+                            series=series,
+                            latest_candle=child,
+                            indicators=indicators,
+                            config=self.config,
+                        )
+                        if _entry_blocked_by_loss_cooldown(
+                            decision.signal,
+                            safety_state=safety_state,
+                            timestamp_ms=child.close_time_ms,
+                        ):
+                            reason = safety_state.reason(child.close_time_ms)
+                            decision = RiskDecision(
+                                approved=False,
+                                reason=reason,
+                                signal=replace(
+                                    decision.signal,
+                                    metadata={
+                                        **decision.signal.metadata,
+                                        "funnel_reason": SignalFunnelReason.COOLDOWN_BLOCKED.value,
+                                    },
+                                ),
+                            )
+                            safety_state.record_blocked(reason)
+                        if _should_defer_decision(decision):
+                            parent_breakout_entries += 1
+                            pending_decisions.append(
+                                _PendingDecision(
+                                    decision=decision,
+                                    generated_at_ms=child.close_time_ms,
+                                )
+                            )
+                        else:
+                            report = execution.process_decision(
+                                decision,
+                                market_price=child.close,
+                                timestamp_ms=child.close_time_ms,
+                            )
+                            reports.append(report)
+                            _record_report(
+                                report,
+                                trades=trades,
+                                open_trade_legs=open_trade_legs,
+                                daily_net_pnl=daily_net_pnl,
+                                safety_state=safety_state,
+                            )
+                            if report.accepted:
+                                parent_breakout_entries += 1
+                                active_bias = _entry_bias_from_report(report, active_bias)
+                        break
+
+                if (
+                    day not in halted_days
                     and active_bias is not None
                     and self.config.intrabar_reentry_enabled
                     and parent_reentries < self.config.max_reentries_per_candle
@@ -669,6 +793,8 @@ class BacktestEngine:
                         daily_loss_limit_equity=daily_start_equity[day],
                         instrument=self.instrument,
                         requested_leverage=self.config.leverage,
+                        quote_to_margin_rate=self.config.quote_to_margin_rate,
+                        unit_contract_value=self.config.unit_contract_value,
                         trading_mode="paper",
                         live_trading_enabled=False,
                     )
@@ -769,6 +895,8 @@ class BacktestEngine:
                         daily_loss_limit_equity=daily_start_equity[day],
                         instrument=self.instrument,
                         requested_leverage=self.config.leverage,
+                        quote_to_margin_rate=self.config.quote_to_margin_rate,
+                        unit_contract_value=self.config.unit_contract_value,
                         trading_mode="paper",
                         live_trading_enabled=False,
                     )
@@ -978,8 +1106,11 @@ def _entry_safety_rejection_reason(
     if not config.atr_entry_filter_enabled:
         return _component_agreement_rejection(signal, config=config)
 
+    is_reversal_breakout = (
+        signal.metadata.get("entry_type") == "intrabar_reversal_breakout"
+    )
     candle_range = latest_candle.high - latest_candle.low
-    if candle_range > atr * ENTRY_SAFETY_SPIKE_ATR_MULTIPLE:
+    if not is_reversal_breakout and candle_range > atr * ENTRY_SAFETY_SPIKE_ATR_MULTIPLE:
         return (
             "Entry safety blocked signal: latest candle range is too large "
             "versus ATR."
@@ -999,12 +1130,14 @@ def _entry_safety_rejection_reason(
         latest_candle=latest_candle,
         atr=atr,
     )
-    if exhaustion_rejection is not None:
+    if not is_reversal_breakout and exhaustion_rejection is not None:
         return exhaustion_rejection
 
     component_rejection = _component_agreement_rejection(signal, config=config)
-    if component_rejection is not None:
+    if not is_reversal_breakout and component_rejection is not None:
         return component_rejection
+    if is_reversal_breakout:
+        return None
 
     return _higher_context_rejection(
         direction,
@@ -1717,7 +1850,18 @@ def _annotate_trade_diagnostics(
             Decimal("0"),
         )
         risk_per_unit = abs(trade.entry_price - initial_stop) if initial_stop > 0 else Decimal("0")
-        risk_amount = risk_per_unit * abs(trade.quantity)
+        quote_to_margin_rate = _metadata_decimal(
+            trade.metadata,
+            "quote_to_margin_rate",
+            Decimal("1"),
+        )
+        unit_contract_value = _metadata_decimal(
+            trade.metadata,
+            "unit_contract_value",
+            Decimal("1"),
+        )
+        value_multiplier = quote_to_margin_rate * unit_contract_value
+        risk_amount = risk_per_unit * abs(trade.quantity) * value_multiplier
         r_multiple = trade.net_pnl / risk_amount if risk_amount > 0 else None
 
         post_candles = [
@@ -1736,14 +1880,14 @@ def _annotate_trade_diagnostics(
 
         metadata = {
             **trade.metadata,
-            "mfe": max_favorable * abs(trade.quantity),
-            "mae": max_adverse * abs(trade.quantity),
+            "mfe": max_favorable * abs(trade.quantity) * value_multiplier,
+            "mae": max_adverse * abs(trade.quantity) * value_multiplier,
             "mfe_per_unit": max_favorable,
             "mae_per_unit": max_adverse,
             "mfe_pct": _pct(max_favorable, trade.entry_price),
             "mae_pct": _pct(max_adverse, trade.entry_price),
             "r_multiple": r_multiple,
-            "post_exit_favorable_move": post_exit_favorable * abs(trade.quantity),
+            "post_exit_favorable_move": post_exit_favorable * abs(trade.quantity) * value_multiplier,
             "post_exit_favorable_move_per_unit": post_exit_favorable,
             "post_exit_favorable_move_pct": _pct(post_exit_favorable, trade.exit_price),
             "diagnostic_candle_count": len(trade_candles),
@@ -1820,6 +1964,8 @@ def _risk_open_positions(broker: PaperBroker) -> list[OpenPosition]:
             entry_price=position.entry_price,
             leverage=position.leverage,
             stop_loss=position.stop_loss,
+            quote_to_margin_rate=position.quote_to_margin_rate,
+            unit_contract_value=position.unit_contract_value,
         )
         for position in broker.open_positions()
     ]
@@ -1831,6 +1977,8 @@ def _strategy_features(
     config: BacktestConfig,
     *,
     open_interest: dict[str, object] | None = None,
+    execution_candles: list[OHLCVCandle] | None = None,
+    execution_interval: str | None = None,
 ) -> dict[str, object]:
     features: dict[str, object] = {
         "backtest_config": {
@@ -1855,8 +2003,38 @@ def _strategy_features(
             "atr_trailing_enabled": config.atr_trailing_enabled,
             "atr_entry_filter_enabled": config.atr_entry_filter_enabled,
             "atr_policy_mode": config.atr_policy_mode,
+            "intrabar_reversal_breakout_enabled": (
+                bool(config.paper_intrabar_enabled)
+                and bool(config.intrabar_reversal_breakout_enabled)
+                and config.strategy_name == "hybrid_meta_v2"
+            ),
+            "reversal_breakout_min_execution_candles": config.reversal_breakout_min_execution_candles,
+            "reversal_breakout_volume_ratio": config.reversal_breakout_volume_ratio,
+            "reversal_breakout_body_ratio": config.reversal_breakout_body_ratio,
+            "reversal_breakout_close_position_ratio": config.reversal_breakout_close_position_ratio,
+            "reversal_breakout_risk_multiplier": config.reversal_breakout_risk_multiplier,
+            "reversal_breakout_max_extension_atr": config.reversal_breakout_max_extension_atr,
+            "reversal_breakout_ignition_volume_ratio": config.reversal_breakout_ignition_volume_ratio,
+            "reversal_breakout_ignition_body_ratio": config.reversal_breakout_ignition_body_ratio,
+            "reversal_breakout_ignition_close_position_ratio": (
+                config.reversal_breakout_ignition_close_position_ratio
+            ),
+            "reversal_breakout_ignition_max_extension_atr": (
+                config.reversal_breakout_ignition_max_extension_atr
+            ),
+            "reversal_breakout_ignition_risk_multiplier": (
+                config.reversal_breakout_ignition_risk_multiplier
+            ),
+            "reversal_breakout_breakeven_activation_r": config.reversal_breakout_breakeven_activation_r,
+            "reversal_breakout_profit_lock_activation_r": config.reversal_breakout_profit_lock_activation_r,
+            "reversal_breakout_profit_lock_r": config.reversal_breakout_profit_lock_r,
+            "reversal_breakout_time_stop_candles": config.reversal_breakout_time_stop_candles,
         }
     }
+    if execution_candles:
+        features["execution_candles"] = execution_candles[-30:]
+    if execution_interval:
+        features["execution_interval"] = execution_interval
     if open_interest is not None:
         features["open_interest"] = open_interest
     for position in broker.open_positions():

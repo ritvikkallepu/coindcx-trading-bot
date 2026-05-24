@@ -29,6 +29,11 @@ class InstrumentMetadata:
     min_notional: Decimal | None = None
     max_leverage: Decimal | None = None
     tick_size: Decimal | None = None
+    margin_currency: str = "INR"
+    quote_currency: str = "USDT"
+    settle_currency: str | None = None
+    unit_contract_value: Decimal = Decimal("1")
+    quote_to_margin_rate: Decimal | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -62,6 +67,35 @@ class InstrumentMetadata:
             ),
             max_leverage=instrument_max_leverage(values),
             tick_size=first_decimal(values, "tick_size", "price_increment"),
+            margin_currency=str(
+                values.get("margin_currency_short_name")
+                or values.get("margin_currency")
+                or "INR"
+            ).upper(),
+            quote_currency=str(
+                values.get("quote_currency_short_name")
+                or values.get("quote_currency")
+                or "USDT"
+            ).upper(),
+            settle_currency=(
+                str(
+                    values.get("settle_currency_short_name")
+                    or values.get("settle_currency")
+                ).upper()
+                if values.get("settle_currency_short_name")
+                or values.get("settle_currency")
+                else None
+            ),
+            unit_contract_value=first_decimal(
+                values,
+                "unit_contract_value",
+                "contract_value",
+            )
+            or Decimal("1"),
+            quote_to_margin_rate=first_decimal(
+                values,
+                "quote_to_margin_rate",
+            ),
             raw=dict(values),
         )
 
@@ -74,6 +108,8 @@ class OpenPosition:
     entry_price: Decimal
     leverage: Decimal = Decimal("1")
     stop_loss: Decimal | None = None
+    quote_to_margin_rate: Decimal = Decimal("1")
+    unit_contract_value: Decimal = Decimal("1")
 
     @property
     def is_open(self) -> bool:
@@ -81,13 +117,23 @@ class OpenPosition:
 
     @property
     def notional(self) -> Decimal:
-        return abs(self.quantity * self.entry_price)
+        return abs(
+            self.quantity
+            * self.entry_price
+            * self.unit_contract_value
+            * self.quote_to_margin_rate
+        )
 
     @property
     def loss_at_stop(self) -> Decimal | None:
         if self.stop_loss is None:
             return None
-        return abs(self.entry_price - self.stop_loss) * abs(self.quantity)
+        return (
+            abs(self.entry_price - self.stop_loss)
+            * abs(self.quantity)
+            * self.unit_contract_value
+            * self.quote_to_margin_rate
+        )
 
 
 OpenPositions = Sequence[OpenPosition] | int
@@ -104,6 +150,8 @@ class RiskContext:
     daily_loss_limit_equity: Decimal | None = None
     instrument: InstrumentMetadata | None = None
     requested_leverage: Decimal | None = None
+    quote_to_margin_rate: Decimal = Decimal("1")
+    unit_contract_value: Decimal = Decimal("1")
     trading_mode: str = "paper"
     live_trading_enabled: bool = False
 

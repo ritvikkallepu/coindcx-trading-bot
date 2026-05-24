@@ -58,6 +58,17 @@ def _context(
 
 
 class StrategyTests(unittest.TestCase):
+    def test_all_strategy_choice_includes_all_registered_strategies(self) -> None:
+        engine = strategy_engine_for_name("all")
+        names = {strategy.name for strategy in engine.strategies}
+
+        self.assertIn("ema_rsi_trend", names)
+        self.assertIn("bb_volume_reversion", names)
+        self.assertIn("hybrid_meta", names)
+        self.assertIn("hybrid_meta_v2", names)
+        self.assertIn("adaptive_hybrid", names)
+        self.assertIn("bb_dynamic_grid", names)
+
     def test_atr_policy_router_uses_runner_for_breakout_setup(self) -> None:
         policy = ATRPolicyRouter().select(
             direction=SignalDirection.LONG,
@@ -473,6 +484,177 @@ class StrategyTests(unittest.TestCase):
 
         self.assertIsInstance(engine.strategies[0], HybridMetaV2Strategy)
         self.assertEqual(engine.strategies[0].name, "hybrid_meta_v2")
+
+    def test_hybrid_meta_v2_allows_reduced_risk_intrabar_reversal_breakout(self) -> None:
+        parent_series = _series_from_closes(
+            [Decimal("100")] * 30,
+            interval="5m",
+            base_volume=Decimal("100"),
+        )
+        execution_candles = [
+            OHLCVCandle(
+                pair="B-BTC_USDT",
+                interval="1m",
+                open_time_ms=1_800_000 + index * 60_000,
+                close_time_ms=1_800_000 + ((index + 1) * 60_000) - 1,
+                open=open_price,
+                high=high,
+                low=low,
+                close=close,
+                volume=volume,
+            )
+            for index, (open_price, high, low, close, volume) in enumerate(
+                [
+                    (
+                        Decimal("99.8"),
+                        Decimal("100.0"),
+                        Decimal("99.7"),
+                        Decimal("99.9"),
+                        Decimal("100"),
+                    ),
+                    (
+                        Decimal("99.9"),
+                        Decimal("100.1"),
+                        Decimal("99.8"),
+                        Decimal("100.0"),
+                        Decimal("100"),
+                    ),
+                    (
+                        Decimal("100.0"),
+                        Decimal("101.3"),
+                        Decimal("99.9"),
+                        Decimal("101.2"),
+                        Decimal("250"),
+                    ),
+                ]
+            )
+        ]
+
+        signal = HybridMetaV2Strategy().evaluate(
+            _context(
+                parent_series,
+                features={
+                    "execution_candles": execution_candles,
+                    "backtest_config": {
+                        "intrabar_reversal_breakout_enabled": True,
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(signal.action, SignalAction.ENTER_LONG)
+        self.assertEqual(signal.interval, "1m")
+        self.assertEqual(signal.entry_price, Decimal("101.2"))
+        self.assertEqual(signal.metadata["entry_type"], "intrabar_reversal_breakout")
+        self.assertEqual(signal.metadata["risk_multiplier"], Decimal("0.50"))
+        self.assertEqual(signal.metadata["atr_profile"], "breakout_runner")
+        self.assertFalse(signal.metadata["atr_take_profit_enabled"])
+        self.assertTrue(signal.metadata["profit_lock_enabled"])
+
+    def test_hybrid_meta_v2_default_entries_include_adaptive_stop_management(self) -> None:
+        closes = [
+            Decimal("100"),
+            Decimal("100.5"),
+            Decimal("101"),
+            Decimal("101.5"),
+            Decimal("102"),
+            Decimal("103"),
+            Decimal("104"),
+            Decimal("105"),
+            Decimal("106"),
+            Decimal("107"),
+            Decimal("108"),
+            Decimal("109"),
+            Decimal("110"),
+            Decimal("111"),
+            Decimal("112"),
+            Decimal("113"),
+            Decimal("114"),
+            Decimal("115"),
+            Decimal("116"),
+            Decimal("117"),
+            Decimal("118"),
+            Decimal("119"),
+            Decimal("120"),
+            Decimal("121"),
+            Decimal("122"),
+            Decimal("123"),
+            Decimal("124"),
+            Decimal("125"),
+            Decimal("126"),
+            Decimal("128"),
+        ]
+
+        signal = HybridMetaV2Strategy().evaluate(
+            _context(
+                _series_from_closes(
+                    closes,
+                    base_volume=Decimal("100"),
+                    last_volume=Decimal("180"),
+                )
+            )
+        )
+
+        if signal.action == SignalAction.ENTER_LONG:
+            self.assertTrue(signal.metadata["atr_dynamic_exits_enabled"])
+            self.assertTrue(signal.metadata["atr_trailing_enabled"])
+            self.assertTrue(signal.metadata["breakeven_enabled"])
+            self.assertTrue(signal.metadata["profit_lock_enabled"])
+            self.assertTrue(signal.metadata["adaptive_stop_management_enabled"])
+            self.assertNotIn("breakeven_activation_r", signal.metadata)
+            self.assertNotIn("profit_lock_activation_r", signal.metadata)
+
+    def test_hybrid_meta_v2_allows_reduced_risk_momentum_ignition(self) -> None:
+        parent_series = _series_from_closes(
+            [Decimal("100")] * 30,
+            interval="5m",
+            base_volume=Decimal("100"),
+        )
+        execution_candles = [
+            OHLCVCandle(
+                pair="B-BTC_USDT",
+                interval="1m",
+                open_time_ms=1_800_000,
+                close_time_ms=1_859_999,
+                open=Decimal("99.8"),
+                high=Decimal("100.0"),
+                low=Decimal("99.7"),
+                close=Decimal("99.9"),
+                volume=Decimal("100"),
+            ),
+            OHLCVCandle(
+                pair="B-BTC_USDT",
+                interval="1m",
+                open_time_ms=1_860_000,
+                close_time_ms=1_919_999,
+                open=Decimal("101"),
+                high=Decimal("105.2"),
+                low=Decimal("100.8"),
+                close=Decimal("105"),
+                volume=Decimal("600"),
+            ),
+        ]
+
+        signal = HybridMetaV2Strategy().evaluate(
+            _context(
+                parent_series,
+                features={
+                    "execution_candles": execution_candles,
+                    "backtest_config": {
+                        "intrabar_reversal_breakout_enabled": True,
+                        "previous_parent_high": Decimal("100"),
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(signal.action, SignalAction.ENTER_LONG)
+        self.assertEqual(signal.entry_price, Decimal("105"))
+        self.assertEqual(signal.metadata["breakout_variant"], "momentum_ignition")
+        self.assertTrue(signal.metadata["momentum_ignition"])
+        self.assertEqual(signal.metadata["risk_multiplier"], Decimal("0.25"))
+        self.assertEqual(signal.metadata["atr_profile"], "momentum_ignition_runner")
+        self.assertEqual(signal.metadata["atr_take_profit_mode"], "none")
 
     def test_adaptive_hybrid_uses_ema_primary_on_one_hour(self) -> None:
         closes = [

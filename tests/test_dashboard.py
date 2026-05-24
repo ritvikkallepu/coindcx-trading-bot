@@ -20,7 +20,7 @@ from app.dashboard.state import (
     classify_run_quality,
     downsample_equity_curve,
 )
-from app.dashboard.server import _fee_config_params, _fee_rate_param
+from app.dashboard.server import _bool_param, _fee_config_params, _fee_rate_param
 from app.risk.models import RiskDecision
 from app.strategies.base import SignalAction, SignalDirection, StrategySignal
 
@@ -126,6 +126,12 @@ class DashboardStateTests(unittest.TestCase):
         self.assertEqual(config["maker_fee_rate"], Decimal("0.0002"))
         self.assertEqual(config["taker_fee_rate"], Decimal("0.0005"))
         self.assertEqual(config["fee_gst_rate"], Decimal("0.18"))
+
+    def test_dashboard_bool_param_parses_false_strings(self) -> None:
+        self.assertFalse(_bool_param("false", True))
+        self.assertFalse(_bool_param("0", True))
+        self.assertFalse(_bool_param("off", True))
+        self.assertTrue(_bool_param("true", False))
 
     def test_downsample_equity_curve_keeps_first_and_last_points(self) -> None:
         points = [_equity_point(index, Decimal(1000 + index)) for index in range(10)]

@@ -34,10 +34,12 @@ class PaperLoopIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = Path(tempfile.mkdtemp())
         self.db_path = self.test_dir / "test_paper_state.db"
+        self.session_path = self.test_dir / "test_paper_session.json"
         self.csv_path = self.test_dir / "test_paper_trades.csv"
         
         self.settings = Settings(
             paper_starting_equity=Decimal("5000"),
+            quote_to_margin_rate=Decimal("1"),
             risk=RiskSettings(max_risk_per_trade_pct=Decimal("1")),
         )
 
@@ -45,28 +47,30 @@ class PaperLoopIntegrationTests(unittest.TestCase):
         if hasattr(self, 'loop') and hasattr(self.loop, 'state_store'):
             self.loop.state_store.close()
         
-        # Add a small delay for Windows file lock release
         import time
         time.sleep(0.1)
         try:
             shutil.rmtree(self.test_dir)
         except PermissionError:
-            pass # Non-fatal for smoke test
+            pass
 
     def test_loop_processes_candles_and_persists_state(self) -> None:
         # 1. Setup Loop
-        self.loop = PaperTradingLoop(self.settings, strategy_name="adaptive_hybrid")
+        from app.persistence.paper_state import PaperStateStore, PaperSessionStore
+        state_store = PaperStateStore(str(self.db_path))
+        session_store = PaperSessionStore(str(self.session_path))
+
+        self.loop = PaperTradingLoop(
+            self.settings,
+            strategy_name="adaptive_hybrid",
+            state_store=state_store,
+            session_store=session_store
+        )
         loop = self.loop
-        
-        # Mock REST client to return empty but valid structure for gap re-fetch
+
         from unittest.mock import MagicMock
         loop.client.get_candles = MagicMock(return_value=[])
-        
-        # Override components to use test paths
-        loop.state_store = PaperStateStore(str(self.db_path))
-        # Re-init broker with the new state store
-        loop.broker.state_store = loop.state_store
-        
+
         from app.live.summary_logger import PaperTradingSummaryLogger
         loop.summary_logger = PaperTradingSummaryLogger(csv_path=str(self.csv_path), summary_every_n_candles=1)
         
@@ -74,9 +78,13 @@ class PaperLoopIntegrationTests(unittest.TestCase):
         loop.gap_guard = CandleGapGuard("5m")
         
         # Manually warm up with 10 candles
-        loop.series = CandleSeries()
+        pair = "B-BTC_USDT"
+        loop._watchlist = [pair]
+        loop.series = {pair: CandleSeries()}
+        from app.data.gap_guard import CandleGapGuard
+        loop.gap_guards = {pair: CandleGapGuard("5m")}
         for i in range(10):
-            loop.series.add(_candle(i, Decimal("100") + i))
+            loop.series[pair].add(_candle(i, Decimal("100") + i))
             
         # 2. Process more candles
         from app.risk.models import RiskDecision
@@ -106,18 +114,111 @@ class PaperLoopIntegrationTests(unittest.TestCase):
         # 3. Asserts
         snapshot = loop.broker.snapshot()
         
-        # Equity is positive
         self.assertGreater(snapshot.equity, Decimal("0"))
-        # We processed candle 10 to 20 = 11 candles
         self.assertEqual(loop.candle_count, 11)
-        
-        # CSV created
         self.assertTrue(self.csv_path.exists())
-        
-        # DB has a broker_state row
+
         saved_state = loop.state_store.load()
         self.assertIsNotNone(saved_state)
         self.assertAlmostEqual(saved_state["equity"], snapshot.equity)
+
+        # Session state should also be saved
+        self.assertTrue(self.session_path.exists())
+        saved_session = session_store.load_session()
+        self.assertEqual(saved_session["candle_count"], 11)
+
+    def test_paper_loop_sizes_risk_from_initial_equity_not_accumulated_profit(self) -> None:
+        from app.persistence.paper_state import PaperSessionStore
+        from app.data.gap_guard import CandleGapGuard
+        from app.strategies.base import SignalAction, SignalDirection, StrategySignal
+        from unittest.mock import MagicMock
+
+        settings = Settings(
+            paper_starting_equity=Decimal("1000"),
+            paper_leverage=Decimal("5"),
+            quote_to_margin_rate=Decimal("1"),
+            risk=RiskSettings(
+                max_risk_per_trade_pct=Decimal("10"),
+                max_leverage=5,
+                slippage_pct=Decimal("0"),
+                stop_slippage_pct=Decimal("0"),
+                maker_fee_rate=Decimal("0"),
+                taker_fee_rate=Decimal("0"),
+            ),
+        )
+        self.loop = PaperTradingLoop(
+            settings,
+            strategy_name="adaptive_hybrid",
+            state_store=PaperStateStore(str(self.db_path)),
+            session_store=PaperSessionStore(str(self.session_path)),
+        )
+        pair = "B-BTC_USDT"
+        self.loop._watchlist = [pair]
+        self.loop._current_interval = "5m"
+        self.loop.series = {pair: CandleSeries()}
+        self.loop.gap_guards = {pair: CandleGapGuard("5m")}
+        for i in range(10):
+            self.loop.series[pair].add(_candle(i, Decimal("100"), pair=pair))
+
+        self.loop.broker.realized_pnl = Decimal("1000")
+        signal = StrategySignal(
+            strategy_name="S",
+            pair=pair,
+            interval="5m",
+            action=SignalAction.ENTER_LONG,
+            direction=SignalDirection.LONG,
+            confidence=Decimal("1"),
+            reason="entry",
+            timestamp_ms=_candle(10, Decimal("100"), pair=pair).close_time_ms,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("90"),
+            take_profit=Decimal("120"),
+        )
+        self.loop.strategy_engine.evaluate = MagicMock(return_value=[signal])
+
+        self.loop._on_candle(_candle(10, Decimal("100"), pair=pair))
+
+        position = self.loop.broker.positions[pair]
+        self.assertEqual(position.quantity, Decimal("10"))
+        self.assertEqual(position.metadata["risk_base_mode"], "initial_equity")
+        self.assertEqual(position.metadata["risk_base_amount"], Decimal("1000"))
+        self.assertEqual(position.metadata["risk_percent_used"], Decimal("10.0"))
+
+    def test_paper_loop_reconnects_when_websocket_returns_unexpectedly(self) -> None:
+        from app.persistence.paper_state import PaperSessionStore
+        from unittest.mock import MagicMock, patch
+
+        state_store = PaperStateStore(str(self.db_path))
+        session_store = PaperSessionStore(str(self.session_path))
+        self.loop = PaperTradingLoop(
+            self.settings,
+            strategy_name="adaptive_hybrid",
+            state_store=state_store,
+            session_store=session_store,
+        )
+        self.loop.client.get_candles = MagicMock(return_value=[])
+        self.loop._websocket_reconnect_delay_seconds = MagicMock(return_value=0)
+        self.loop._sleep_before_reconnect = MagicMock()
+
+        run_calls: list[int] = []
+
+        class FakeWebSocketClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def run(self, subscriptions) -> None:
+                run_calls.append(len(subscriptions))
+                if len(run_calls) >= 2:
+                    raise KeyboardInterrupt()
+
+            def stop(self) -> None:
+                pass
+
+        with patch("app.live.paper_loop.CoinDCXFuturesWebSocketClient", FakeWebSocketClient):
+            self.loop.run("B-BTC_USDT", "5m")
+
+        self.assertEqual(len(run_calls), 2)
+        self.assertTrue(self.session_path.exists())
 
 
 if __name__ == "__main__":

@@ -113,6 +113,7 @@ def _normalize_candles(data: Any, default_pair: str | None) -> list[CandleEvent]
                 close_time_ms=_timestamp_ms(row.get("close_time"), "candle close_time"),
                 quote_volume=_optional_decimal(row.get("quote_volume")),
                 product=product,
+                is_closed=_bool_or_true(row.get("m")),
             )
         )
     return events
@@ -260,3 +261,11 @@ def _product(value: Any) -> str:
     if value in {"f", "futures"}:
         return "futures"
     return str(value or "futures")
+
+
+def _bool_or_true(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    return bool(int(value))

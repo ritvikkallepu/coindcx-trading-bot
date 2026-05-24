@@ -4,7 +4,23 @@ import json
 from decimal import Decimal
 from datetime import datetime, timezone
 from dataclasses import dataclass
-import pytest
+try:
+    import pytest
+except ModuleNotFoundError:  # Allows unittest discovery in the bundled runtime.
+    class _MarkFallback:
+        @staticmethod
+        def parametrize(_name, values):
+            def decorator(func):
+                def wrapper():
+                    for value in values:
+                        func(value)
+                return wrapper
+            return decorator
+
+    class _PytestFallback:
+        mark = _MarkFallback()
+
+    pytest = _PytestFallback()
 from app.utils.json import to_jsonable, safe_json_dumps
 
 @dataclass

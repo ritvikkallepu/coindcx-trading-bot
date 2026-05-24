@@ -44,6 +44,7 @@ class CandleEvent:
     close_time_ms: int
     quote_volume: Decimal | None = None
     product: str = "futures"
+    is_closed: bool = True
     event_type: Literal["candle"] = "candle"
 
 

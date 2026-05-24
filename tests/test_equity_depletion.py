@@ -74,12 +74,12 @@ class EquityDepletionTests(unittest.TestCase):
             interval="1h",
             starting_equity=Decimal("1000"),
             leverage=Decimal("1"),
-            risk_per_trade_pct=Decimal("90"),
+            risk_per_trade_pct=Decimal("100"),
             compound_risk_equity=False,
             atr_period=1,
             atr_entry_filter_enabled=False
         )
-        risk_settings = RiskSettings(max_risk_per_trade_pct=Decimal("100"), max_daily_loss_pct=Decimal("100"), max_total_risk_pct=Decimal("100"))
+        risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_daily_loss_pct=Decimal("100"), max_total_risk_pct=Decimal("100"))
         engine = BacktestEngine(config=config, strategy_engine=StrategyEngine([TwoEntryStrategy()]), risk_manager=RiskManager(settings=risk_settings))
         
         candles = [
@@ -105,7 +105,7 @@ class EquityDepletionTests(unittest.TestCase):
             atr_period=1,
             atr_entry_filter_enabled=False
         )
-        risk_settings = RiskSettings(max_risk_per_trade_pct=Decimal("100"), max_total_risk_pct=Decimal("100"), max_leverage=100)
+        risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_total_risk_pct=Decimal("100"), max_leverage=100)
         engine = BacktestEngine(config=config, strategy_engine=StrategyEngine([MockBankruptStrategy(Decimal("1"), Decimal("0.99"))]), risk_manager=RiskManager(settings=risk_settings))
         
         candles = [OHLCVCandle("B-SOL_USDT", "1h", 0, 3599999, Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"))]
@@ -131,6 +131,7 @@ class EquityDepletionTests(unittest.TestCase):
                         timestamp_ms=context.candles[-1].close_time_ms,
                         entry_price=Decimal("100"),
                         stop_loss=Decimal("50"),
+                        metadata={"allow_scale_in": True},
                     )
                 if context.candles[-1].open_time_ms == 3600000:
                     return StrategySignal(
@@ -144,6 +145,7 @@ class EquityDepletionTests(unittest.TestCase):
                         timestamp_ms=context.candles[-1].close_time_ms,
                         entry_price=Decimal("100"),
                         stop_loss=Decimal("50"),
+                        metadata={"allow_scale_in": True},
                     )
                 return StrategySignal.hold(
                     strategy_name=self.name,
@@ -164,7 +166,7 @@ class EquityDepletionTests(unittest.TestCase):
             atr_entry_filter_enabled=False,
             stop_loss_cooldown_candles=0
         )
-        risk_settings = RiskSettings(max_risk_per_trade_pct=Decimal("100"), max_daily_loss_pct=Decimal("100"), max_leverage=100, max_total_risk_pct=Decimal("100"))
+        risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_daily_loss_pct=Decimal("100"), max_leverage=100, max_total_risk_pct=Decimal("100"))
         engine = BacktestEngine(config=config, strategy_engine=StrategyEngine([HighRiskStrategy()]), risk_manager=RiskManager(settings=risk_settings))
         
         candles = [
@@ -176,6 +178,7 @@ class EquityDepletionTests(unittest.TestCase):
         result = engine.run(candles)
         self.assertEqual(len(result.trades), 1)
         rejections = [r for r in result.reports if not r.accepted and r.signal.action == SignalAction.ENTER_LONG]
+        print(f"DEBUG REJECTIONS: {[r.reason for r in rejections]}")
         self.assertTrue(any(("planned risk" in r.reason.lower() or "margin" in r.reason.lower()) and "exceeds available equity" in r.reason.lower() for r in rejections))
 
     def test_equity_before_after_trade_is_recorded_correctly(self) -> None:
@@ -189,7 +192,7 @@ class EquityDepletionTests(unittest.TestCase):
             atr_period=1,
             atr_entry_filter_enabled=False
         )
-        risk_settings = RiskSettings(max_risk_per_trade_pct=Decimal("100"), max_total_risk_pct=Decimal("100"))
+        risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_total_risk_pct=Decimal("100"))
         engine = BacktestEngine(config=config, strategy_engine=StrategyEngine([TwoEntryStrategy()]), risk_manager=RiskManager(settings=risk_settings))
         
         candles = [
@@ -214,7 +217,7 @@ class EquityDepletionTests(unittest.TestCase):
             atr_period=1,
             atr_entry_filter_enabled=False
         )
-        risk_settings = RiskSettings(max_risk_per_trade_pct=Decimal("100"), max_total_risk_pct=Decimal("100"))
+        risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_total_risk_pct=Decimal("100"))
         
         class ProfitStrategy(Strategy):
             name = "profit"

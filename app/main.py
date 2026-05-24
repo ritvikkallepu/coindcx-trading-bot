@@ -45,6 +45,7 @@ from app.fees import (
 from app.risk.manager import RiskManager
 from app.risk.models import InstrumentMetadata
 from app.research.history import record_backtest_result
+from app.research.quick_validator import QuickValidationConfig, run_quick_validator
 from app.research.sweep import (
     DEFAULT_INTERVALS,
     DEFAULT_SWEEP_PAIRS,
@@ -133,6 +134,8 @@ def _fee_rate_from_args(
         return default
     if fee_rate < 0 and not allow_negative:
         raise SystemExit("Fee rate cannot be negative.")
+    if abs(fee_rate) >= Decimal("0.01"):
+        return fee_rate / Decimal("100")
     return fee_rate
 
 
@@ -144,6 +147,8 @@ def _fee_rates_from_args(
     taker_fee_pct: Decimal | None,
     fee_rate: Decimal | None,
     fee_pct: Decimal | None,
+    default_maker_fee_rate: Decimal = COINDCX_INR_M_MAKER_FEE_RATE,
+    default_taker_fee_rate: Decimal = COINDCX_INR_M_TAKER_FEE_RATE,
 ) -> tuple[Decimal, Decimal]:
     legacy_fee = _fee_rate_from_args(
         fee_rate=fee_rate,
@@ -156,12 +161,12 @@ def _fee_rates_from_args(
         _fee_rate_from_args(
             fee_rate=maker_fee_rate,
             fee_pct=maker_fee_pct,
-            default=COINDCX_INR_M_MAKER_FEE_RATE,
+            default=default_maker_fee_rate,
         ),
         _fee_rate_from_args(
             fee_rate=taker_fee_rate,
             fee_pct=taker_fee_pct,
-            default=COINDCX_INR_M_TAKER_FEE_RATE,
+            default=default_taker_fee_rate,
         ),
     )
 
@@ -170,13 +175,14 @@ def _fee_gst_rate_from_args(
     *,
     fee_gst_rate: Decimal | None,
     fee_gst_pct: Decimal | None,
+    default: Decimal = COINDCX_FEE_GST_RATE,
 ) -> Decimal:
     if fee_gst_pct is not None:
         if fee_gst_pct < 0:
             raise SystemExit("Fee GST percentage cannot be negative.")
         return fee_gst_pct / Decimal("100")
     if fee_gst_rate is None:
-        return COINDCX_FEE_GST_RATE
+        return default
     if fee_gst_rate < 0:
         raise SystemExit("Fee GST rate cannot be negative.")
     return fee_gst_rate
@@ -648,6 +654,9 @@ def paper_execution_smoke(
         exit_fee_type=exit_fee_type,
         slippage_pct=slippage_pct,
         stop_slippage_pct=stop_slippage_pct,
+        quote_to_margin_rate=settings.quote_to_margin_rate,
+        account_currency=settings.futures_margin_currency,
+        price_quote_currency=settings.price_quote_currency,
     )
     engine = PaperExecutionEngine(broker)
 
@@ -661,6 +670,8 @@ def paper_execution_smoke(
             open_positions=snapshot.open_position_count,
             instrument=instrument,
             requested_leverage=leverage,
+            quote_to_margin_rate=settings.quote_to_margin_rate,
+            unit_contract_value=Decimal("1"),
             trading_mode=settings.trading_mode,
             live_trading_enabled=settings.live_trading_enabled,
         )
@@ -739,6 +750,7 @@ def backtest_command(
     equity_giveback_cooldown_candles: int,
     loss_streak_cooldown_enabled: bool,
     consecutive_loss_limit: int,
+    loss_streak_cooldown_candles: int,
     rolling_loss_window: int,
     rolling_loss_limit: int,
     rolling_loss_cooldown_candles: int,
@@ -830,6 +842,9 @@ def backtest_command(
         starting_equity=account_equity,
         leverage=leverage,
         strategy_name=strategy_name,
+        margin_currency=settings.futures_margin_currency,
+        price_quote_currency=settings.price_quote_currency,
+        quote_to_margin_rate=settings.quote_to_margin_rate,
         risk_per_trade_pct=(
             settings.risk.max_risk_per_trade_pct
             if risk_per_trade_pct is None
@@ -869,6 +884,8 @@ def backtest_command(
         atr_take_profit_multiple=atr_take_profit_multiple,
         atr_take_profit_mode=atr_take_profit_mode,
         execution_interval=execution_interval,
+        paper_intrabar_enabled=execution_interval is not None,
+        strategy_interval=interval,
         intrabar_reentry_enabled=intrabar_reentry_enabled,
         max_reentries_per_candle=max_reentries_per_candle,
         reentry_cooldown_candles=reentry_cooldown_candles,
@@ -880,6 +897,7 @@ def backtest_command(
         equity_giveback_cooldown_candles=equity_giveback_cooldown_candles,
         loss_streak_cooldown_enabled=loss_streak_cooldown_enabled,
         consecutive_loss_limit=consecutive_loss_limit,
+        loss_streak_cooldown_candles=loss_streak_cooldown_candles,
         rolling_loss_window=rolling_loss_window,
         rolling_loss_limit=rolling_loss_limit,
         rolling_loss_cooldown_candles=rolling_loss_cooldown_candles,
@@ -1016,6 +1034,9 @@ def research_sweep_command(
             lookback=lookback,
             starting_equity=account_equity,
             leverage=leverage,
+            margin_currency=settings.futures_margin_currency,
+            price_quote_currency=settings.price_quote_currency,
+            quote_to_margin_rate=settings.quote_to_margin_rate,
             risk_per_trade_pct=(
                 settings.risk.max_risk_per_trade_pct
                 if risk_per_trade_pct is None
@@ -1089,6 +1110,132 @@ def research_sweep_command(
             until=parse_until(until),
             output_dir=Path(output_dir),
             max_runs=max_runs,
+        ),
+        variants=variants,
+    )
+    _print_json(result)
+
+
+def quick_validate_command(
+    *,
+    pairs: str,
+    intervals: str,
+    variant_names: str,
+    quick_lookback: int,
+    validation_lookback: int,
+    final_lookback: int,
+    quick_max_runs: int,
+    top_validation: int,
+    top_final: int,
+    quick_only: bool,
+    account_equity: Decimal,
+    leverage: Decimal,
+    risk_per_trade_pct: Decimal | None,
+    risk_grid: str | None,
+    leverage_grid: str | None,
+    compound_risk_equity: bool,
+    stop_loss_pct: Decimal | None,
+    take_profit_pct: Decimal | None,
+    take_profit_grid: str | None,
+    maker_fee_rate: Decimal,
+    taker_fee_rate: Decimal,
+    fee_gst_rate: Decimal,
+    entry_fee_type: str,
+    exit_fee_type: str,
+    slippage_pct: Decimal,
+    stop_slippage_pct: Decimal | None,
+    funding_fee_rate: Decimal,
+    funding_interval_hours: int,
+    trailing_grid: str,
+    atr_grid: str,
+    atr_period: int,
+    atr_stop_multiple: Decimal,
+    atr_take_profit_multiple: Decimal,
+    atr_take_profit_mode: str,
+    output_dir: str,
+) -> None:
+    settings = load_settings()
+    configure_logging(settings)
+    logging.getLogger("app.risk.manager").setLevel(logging.WARNING)
+    logging.getLogger("app.broker.paper").setLevel(logging.WARNING)
+
+    stop_loss_pct = _positive_optional_pct(stop_loss_pct, "--stop-loss-pct")
+    take_profit_pct = _positive_optional_pct(take_profit_pct, "--take-profit-pct")
+    risk_per_trade_pct_values = parse_decimal_list(
+        risk_grid,
+        (Decimal("1"), Decimal("2"), Decimal("3")),
+    )
+    leverage_values = parse_decimal_list(
+        leverage_grid,
+        (Decimal("1"), Decimal("3"), Decimal("5")),
+    )
+    take_profit_pct_values = tuple(
+        _positive_optional_pct(value, "--take-profit-grid")
+        for value in parse_optional_decimal_list(
+            take_profit_grid,
+            (None, Decimal("3"), Decimal("5")),
+        )
+    )
+    for value in risk_per_trade_pct_values:
+        _positive_optional_pct(value, "--risk-grid")
+    for value in leverage_values:
+        _positive_optional_pct(value, "--leverage-grid")
+
+    variants = strategy_variants_for_names(parse_csv_list(variant_names, ()))
+    trailing_profiles = parse_trailing_profiles(trailing_grid)
+    atr_dynamic_exits_values = parse_bool_grid(atr_grid, (False, True))
+
+    base_config = SweepConfig(
+        pairs=parse_csv_list(pairs, DEFAULT_SWEEP_PAIRS),
+        intervals=parse_csv_list(intervals, ("5m", "15m", "30m", "1h")),
+        lookback=quick_lookback,
+        starting_equity=account_equity,
+        leverage=leverage,
+        margin_currency=settings.futures_margin_currency,
+        price_quote_currency=settings.price_quote_currency,
+        quote_to_margin_rate=settings.quote_to_margin_rate,
+        risk_per_trade_pct=(
+            settings.risk.max_risk_per_trade_pct
+            if risk_per_trade_pct is None
+            else risk_per_trade_pct
+        ),
+        risk_per_trade_pct_values=risk_per_trade_pct_values,
+        leverage_values=leverage_values,
+        compound_risk_equity=compound_risk_equity,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        take_profit_pct_values=take_profit_pct_values,
+        maker_fee_rate=maker_fee_rate,
+        taker_fee_rate=taker_fee_rate,
+        fee_gst_rate=fee_gst_rate,
+        entry_fee_type=entry_fee_type,
+        exit_fee_type=exit_fee_type,
+        slippage_pct=slippage_pct,
+        stop_slippage_pct=stop_slippage_pct,
+        funding_fee_rate=funding_fee_rate,
+        funding_interval_hours=funding_interval_hours,
+        trailing_profiles=trailing_profiles,
+        atr_dynamic_exits_values=atr_dynamic_exits_values,
+        atr_take_profit_enabled=atr_take_profit_mode != "none",
+        atr_period=atr_period,
+        atr_stop_multiple=atr_stop_multiple,
+        atr_take_profit_multiple=atr_take_profit_multiple,
+        atr_take_profit_mode=atr_take_profit_mode,
+        output_dir=Path(output_dir),
+        max_runs=quick_max_runs,
+    )
+    result = run_quick_validator(
+        settings=settings,
+        config=QuickValidationConfig(
+            base_sweep=base_config,
+            output_dir=Path(output_dir),
+            quick_lookback=quick_lookback,
+            validation_lookback=validation_lookback,
+            final_lookback=final_lookback,
+            quick_max_runs=quick_max_runs,
+            top_validation=top_validation,
+            top_final=top_final,
+            quick_only=quick_only,
         ),
         variants=variants,
     )
@@ -1794,6 +1941,106 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap for smoke testing or short sweeps",
     )
 
+    quick_parser = subparsers.add_parser(
+        "quick-validate",
+        help="Fast staged strategy validator: quick screen first, then deeper tests of top candidates",
+    )
+    quick_parser.add_argument(
+        "--pairs",
+        default=",".join(DEFAULT_SWEEP_PAIRS),
+        help="Comma-separated futures pairs to screen",
+    )
+    quick_parser.add_argument(
+        "--intervals",
+        default="5m,15m,30m,1h",
+        help="Comma-separated intervals. Default skips 2h and focuses on 5m, 15m, 30m, 1h.",
+    )
+    quick_parser.add_argument(
+        "--variant-names",
+        default="hybrid_meta_v2",
+        help="Comma-separated variants. Default focuses on Hybrid Meta V2.",
+    )
+    quick_parser.add_argument("--quick-lookback", type=int, default=240)
+    quick_parser.add_argument("--validation-lookback", type=int, default=500)
+    quick_parser.add_argument("--final-lookback", type=int, default=1000)
+    quick_parser.add_argument(
+        "--quick-max-runs",
+        type=int,
+        default=60,
+        help="Maximum broad-screen runs before selecting top candidates.",
+    )
+    quick_parser.add_argument("--top-validation", type=int, default=8)
+    quick_parser.add_argument("--top-final", type=int, default=3)
+    quick_parser.add_argument(
+        "--quick-only",
+        action="store_true",
+        help="Run only the fast broad screen and skip validation/final stages.",
+    )
+    quick_parser.add_argument("--equity", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("3"))
+    quick_parser.add_argument(
+        "--leverage-grid",
+        default="1,3,5",
+        help="Coarse leverage grid. Keep this coarse to avoid slow overfitting.",
+    )
+    quick_parser.add_argument("--risk-per-trade-pct", type=_decimal_arg, default=None)
+    quick_parser.add_argument(
+        "--risk-grid",
+        default="1,2,3",
+        help="Coarse risk-per-trade percentage grid.",
+    )
+    quick_parser.add_argument(
+        "--compound-risk-equity",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use current equity for sizing. Default keeps risk based on initial equity.",
+    )
+    quick_parser.add_argument("--stop-loss-pct", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--take-profit-pct", type=_decimal_arg, default=None)
+    quick_parser.add_argument(
+        "--take-profit-grid",
+        default="default,3,5",
+        help="Coarse take-profit grid. Use default/none for strategy exits.",
+    )
+    quick_parser.add_argument("--fee-rate", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--fee-pct", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--maker-fee-rate", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--maker-fee-pct", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--taker-fee-rate", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--taker-fee-pct", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--fee-gst-rate", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--fee-gst-pct", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--entry-fee-type", choices=("maker", "taker"), default="maker")
+    quick_parser.add_argument("--exit-fee-type", choices=("maker", "taker"), default="taker")
+    quick_parser.add_argument("--slippage-pct", type=_decimal_arg, default=Decimal("0.02"))
+    quick_parser.add_argument("--stop-slippage-pct", type=_decimal_arg, default=Decimal("0.02"))
+    quick_parser.add_argument("--funding-fee-rate", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--funding-fee-pct", type=_decimal_arg, default=None)
+    quick_parser.add_argument("--funding-interval-hours", type=int, default=8)
+    quick_parser.add_argument(
+        "--trailing-grid",
+        default="off,2:3,3:5",
+        help="Coarse trailing profiles: off or activation:distance.",
+    )
+    quick_parser.add_argument(
+        "--atr-grid",
+        default="off,on",
+        help="ATR dynamic exit states to test: off,on.",
+    )
+    quick_parser.add_argument("--atr-period", type=int, default=14)
+    quick_parser.add_argument("--atr-stop-multiple", type=_decimal_arg, default=Decimal("1.5"))
+    quick_parser.add_argument("--atr-take-profit-multiple", type=_decimal_arg, default=Decimal("3"))
+    quick_parser.add_argument(
+        "--atr-take-profit-mode",
+        choices=ATR_TAKE_PROFIT_MODES,
+        default="none",
+    )
+    quick_parser.add_argument(
+        "--output-dir",
+        default="research/backtests/quick_validator",
+        help="Directory where staged validator outputs are written.",
+    )
+
     dashboard_parser = subparsers.add_parser(
         "dashboard",
         help="Run the local paper/backtest monitoring dashboard",
@@ -2049,10 +2296,13 @@ def main() -> None:
             taker_fee_pct=args.taker_fee_pct,
             fee_rate=args.fee_rate,
             fee_pct=args.fee_pct,
+            default_maker_fee_rate=settings.risk.maker_fee_rate,
+            default_taker_fee_rate=settings.risk.taker_fee_rate,
         )
         fee_gst_rate = _fee_gst_rate_from_args(
             fee_gst_rate=args.fee_gst_rate,
             fee_gst_pct=args.fee_gst_pct,
+            default=settings.risk.fee_gst_rate,
         )
         paper_execution_smoke(
             pair=args.pair,
@@ -2079,10 +2329,13 @@ def main() -> None:
             taker_fee_pct=args.taker_fee_pct,
             fee_rate=args.fee_rate,
             fee_pct=args.fee_pct,
+            default_maker_fee_rate=settings.risk.maker_fee_rate,
+            default_taker_fee_rate=settings.risk.taker_fee_rate,
         )
         fee_gst_rate = _fee_gst_rate_from_args(
             fee_gst_rate=args.fee_gst_rate,
             fee_gst_pct=args.fee_gst_pct,
+            default=settings.risk.fee_gst_rate,
         )
         funding_fee_rate = _funding_fee_rate_from_args(
             funding_fee_rate=args.funding_fee_rate,
@@ -2160,10 +2413,13 @@ def main() -> None:
             taker_fee_pct=args.taker_fee_pct,
             fee_rate=args.fee_rate,
             fee_pct=args.fee_pct,
+            default_maker_fee_rate=settings.risk.maker_fee_rate,
+            default_taker_fee_rate=settings.risk.taker_fee_rate,
         )
         fee_gst_rate = _fee_gst_rate_from_args(
             fee_gst_rate=args.fee_gst_rate,
             fee_gst_pct=args.fee_gst_pct,
+            default=settings.risk.fee_gst_rate,
         )
         funding_fee_rate = _funding_fee_rate_from_args(
             funding_fee_rate=args.funding_fee_rate,
@@ -2233,6 +2489,63 @@ def main() -> None:
             output_dir=args.output_dir,
             max_runs=args.max_runs,
         )
+    elif args.command == "quick-validate":
+        maker_fee_rate, taker_fee_rate = _fee_rates_from_args(
+            maker_fee_rate=args.maker_fee_rate,
+            maker_fee_pct=args.maker_fee_pct,
+            taker_fee_rate=args.taker_fee_rate,
+            taker_fee_pct=args.taker_fee_pct,
+            fee_rate=args.fee_rate,
+            fee_pct=args.fee_pct,
+            default_maker_fee_rate=settings.risk.maker_fee_rate,
+            default_taker_fee_rate=settings.risk.taker_fee_rate,
+        )
+        fee_gst_rate = _fee_gst_rate_from_args(
+            fee_gst_rate=args.fee_gst_rate,
+            fee_gst_pct=args.fee_gst_pct,
+            default=settings.risk.fee_gst_rate,
+        )
+        funding_fee_rate = _funding_fee_rate_from_args(
+            funding_fee_rate=args.funding_fee_rate,
+            funding_fee_pct=args.funding_fee_pct,
+        )
+        quick_validate_command(
+            pairs=args.pairs,
+            intervals=args.intervals,
+            variant_names=args.variant_names,
+            quick_lookback=args.quick_lookback,
+            validation_lookback=args.validation_lookback,
+            final_lookback=args.final_lookback,
+            quick_max_runs=args.quick_max_runs,
+            top_validation=args.top_validation,
+            top_final=args.top_final,
+            quick_only=args.quick_only,
+            account_equity=args.equity if args.equity is not None else settings.paper_starting_equity,
+            leverage=args.leverage,
+            risk_per_trade_pct=args.risk_per_trade_pct,
+            risk_grid=args.risk_grid,
+            leverage_grid=args.leverage_grid,
+            compound_risk_equity=args.compound_risk_equity,
+            stop_loss_pct=args.stop_loss_pct,
+            take_profit_pct=args.take_profit_pct,
+            take_profit_grid=args.take_profit_grid,
+            maker_fee_rate=maker_fee_rate,
+            taker_fee_rate=taker_fee_rate,
+            fee_gst_rate=fee_gst_rate,
+            entry_fee_type=args.entry_fee_type,
+            exit_fee_type=args.exit_fee_type,
+            slippage_pct=args.slippage_pct,
+            stop_slippage_pct=args.stop_slippage_pct,
+            funding_fee_rate=funding_fee_rate,
+            funding_interval_hours=args.funding_interval_hours,
+            trailing_grid=args.trailing_grid,
+            atr_grid=args.atr_grid,
+            atr_period=args.atr_period,
+            atr_stop_multiple=args.atr_stop_multiple,
+            atr_take_profit_multiple=args.atr_take_profit_multiple,
+            atr_take_profit_mode=args.atr_take_profit_mode,
+            output_dir=args.output_dir,
+        )
     elif args.command == "dashboard":
         maker_fee_rate, taker_fee_rate = _fee_rates_from_args(
             maker_fee_rate=args.maker_fee_rate,
@@ -2241,10 +2554,13 @@ def main() -> None:
             taker_fee_pct=args.taker_fee_pct,
             fee_rate=args.fee_rate,
             fee_pct=args.fee_pct,
+            default_maker_fee_rate=settings.risk.maker_fee_rate,
+            default_taker_fee_rate=settings.risk.taker_fee_rate,
         )
         fee_gst_rate = _fee_gst_rate_from_args(
             fee_gst_rate=args.fee_gst_rate,
             fee_gst_pct=args.fee_gst_pct,
+            default=settings.risk.fee_gst_rate,
         )
         funding_fee_rate = _funding_fee_rate_from_args(
             funding_fee_rate=args.funding_fee_rate,

@@ -44,7 +44,7 @@ class FuturesOrderRequest:
     time_in_force: str | None = "good_till_cancel"
     hidden: bool = False
     post_only: bool = False
-    margin_currency_short_name: str = "USDT"
+    margin_currency_short_name: str = "INR"
     position_margin_type: str | None = None
     take_profit_price: Decimal | None = None
     stop_loss_price: Decimal | None = None

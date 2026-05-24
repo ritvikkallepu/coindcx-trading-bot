@@ -28,6 +28,7 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(settings.is_paper_trading)
             self.assertFalse(settings.live_trading_allowed)
             self.assertEqual(settings.futures_margin_currency, "INR")
+            self.assertEqual(settings.paper_starting_equity_currency, "INR")
             safe = settings.safe_dict()
             self.assertEqual(safe["coindcx_api_key"], "abcd...efgh")
             self.assertEqual(safe["coindcx_api_secret"], "secr...alue")

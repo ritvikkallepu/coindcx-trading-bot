@@ -68,6 +68,149 @@ def _normalize_dashboard_pair(value: object) -> str:
     return f"B-{base}_{quote}"
 
 
+def _paper_quantity_unit(pair: object) -> str:
+    symbol = str(pair or "")
+    if symbol.startswith("B-"):
+        symbol = symbol[2:]
+    return symbol.split("_", 1)[0] or "contracts"
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _enrich_paper_trade_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Backfill display-only fields for old paper_trades.csv rows.
+
+    New rows are written with explicit INR/risk metadata. Older rows were logged
+    before those columns existed, so the dashboard should not silently render
+    zeros for notional and risk.
+    """
+    pair = row.get("pair", "")
+    row.setdefault("quantity_unit", _paper_quantity_unit(pair))
+    quantity = _decimal_or_none(row.get("position_size") or row.get("quantity"))
+    entry = _decimal_or_none(row.get("entry_price"))
+    quote_to_margin_rate = _decimal_or_none(row.get("quote_to_margin_rate"))
+    legacy = quote_to_margin_rate is None
+    if quote_to_margin_rate is None:
+        quote_to_margin_rate = Decimal("1")
+    unit_contract_value = _decimal_or_none(row.get("unit_contract_value")) or Decimal("1")
+
+    if not row.get("position_notional") and quantity is not None and entry is not None:
+        row["position_notional"] = str(abs(quantity * entry * quote_to_margin_rate * unit_contract_value))
+    if not row.get("notional_currency"):
+        row["notional_currency"] = "LEGACY" if legacy else "INR"
+    if not row.get("price_quote_currency"):
+        row["price_quote_currency"] = "USDT"
+    if not row.get("quote_to_margin_rate"):
+        row["quote_to_margin_rate"] = str(quote_to_margin_rate)
+    if not row.get("unit_contract_value"):
+        row["unit_contract_value"] = str(unit_contract_value)
+    if not row.get("exit_fee") and row.get("fees"):
+        row["exit_fee"] = row.get("fees", "")
+    if not row.get("total_fees"):
+        row["total_fees"] = row.get("fees", "")
+    if legacy:
+        row["legacy_currency_math"] = "true"
+    return row
+
+
+def _paper_trade_key(row: dict[str, Any]) -> tuple[str, ...]:
+    fill_id = str(row.get("fill_id") or "").strip()
+    if fill_id:
+        return (
+            "fill_id",
+            fill_id,
+            str(row.get("order_id") or "").strip(),
+            str(row.get("timestamp") or "").strip(),
+            str(row.get("pair") or "").strip(),
+        )
+    return (
+        "composite",
+        str(row.get("timestamp") or "").strip(),
+        str(row.get("pair") or "").strip(),
+        str(row.get("direction") or "").strip(),
+        str(row.get("entry_price") or "").strip(),
+        str(row.get("exit_price") or "").strip(),
+        str(row.get("position_size") or row.get("quantity") or "").strip(),
+        str(row.get("net_pnl") or "").strip(),
+        str(row.get("exit_reason") or row.get("reason") or "").strip(),
+    )
+
+
+def _summarize_paper_trades(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    closed_count = len(trades)
+    wins = 0
+    losses = 0
+    gross_pnl = Decimal("0")
+    net_pnl = Decimal("0")
+    fees = Decimal("0")
+    win_pnl = Decimal("0")
+    loss_pnl = Decimal("0")
+    best_trade: Decimal | None = None
+    worst_trade: Decimal | None = None
+    notional = Decimal("0")
+
+    for row in trades:
+        row_net = _decimal_or_none(row.get("net_pnl")) or Decimal("0")
+        row_gross = _decimal_or_none(row.get("gross_pnl")) or Decimal("0")
+        row_fees = (
+            _decimal_or_none(row.get("total_fees"))
+            or _decimal_or_none(row.get("fees"))
+            or Decimal("0")
+        )
+        row_notional = (
+            _decimal_or_none(row.get("position_notional"))
+            or _decimal_or_none(row.get("notional"))
+            or Decimal("0")
+        )
+        gross_pnl += row_gross
+        net_pnl += row_net
+        fees += row_fees
+        notional += abs(row_notional)
+        best_trade = row_net if best_trade is None else max(best_trade, row_net)
+        worst_trade = row_net if worst_trade is None else min(worst_trade, row_net)
+        if row_net > 0:
+            wins += 1
+            win_pnl += row_net
+        elif row_net < 0:
+            losses += 1
+            loss_pnl += abs(row_net)
+
+    win_rate = (
+        (Decimal(wins) / Decimal(closed_count)) * Decimal("100")
+        if closed_count
+        else Decimal("0")
+    )
+    profit_factor: Decimal | None
+    if loss_pnl == 0:
+        profit_factor = None
+    else:
+        profit_factor = win_pnl / loss_pnl
+
+    return {
+        "closed_trades": closed_count,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": str(win_rate),
+        "gross_pnl": str(gross_pnl),
+        "net_pnl": str(net_pnl),
+        "fees": str(fees),
+        "avg_win": str(win_pnl / Decimal(wins)) if wins else "0",
+        "avg_loss": str(loss_pnl / Decimal(losses)) if losses else "0",
+        "best_trade": str(best_trade) if best_trade is not None else "0",
+        "worst_trade": str(worst_trade) if worst_trade is not None else "0",
+        "profit_factor": str(profit_factor) if profit_factor is not None else None,
+        "closed_notional": str(notional),
+        "fees_cost_pct": str((fees / notional) * Decimal("100")) if notional > 0 else "0",
+    }
+
+
 class DashboardHTTPServer(ThreadingHTTPServer):
     def __init__(
         self,
@@ -112,8 +255,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_backtest(params)
             return
         if parsed.path == "/api/paper-status":
-            from app.live.paper_loop import get_live_state
-            self._send_json(get_live_state())
+            from app.live.paper_loop import get_active_loop, get_live_state
+            state = get_live_state()
+            active_loop = get_active_loop()
+            if active_loop is not None and not state.get("running"):
+                state = dict(state)
+                state["running"] = True
+                watchlist = getattr(active_loop, "_watchlist", None) or []
+                if watchlist and not state.get("pair"):
+                    state["pair"] = ", ".join(watchlist)
+                interval = getattr(active_loop, "_current_interval", "")
+                if interval and not state.get("interval"):
+                    state["interval"] = interval
+            self._send_json(state)
             return
         if parsed.path == "/api/paper-trades":
             self._send_paper_trades()
@@ -145,12 +299,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def _handle_paper_start(self, params: dict[str, Any]) -> None:
         import threading
         from app.live.paper_loop import PaperTradingLoop
-        from app.live.paper_loop import get_live_state
+        from app.live.paper_loop import get_active_loop, get_live_state
         from app.strategies.defaults import STRATEGY_CHOICES
         from app.backtest.data_loader import REST_RESOLUTION_BY_INTERVAL
 
         state = get_live_state()
-        if state["running"]:
+        if state["running"] or get_active_loop() is not None:
             self._send_json({"error": "Paper loop is already running."}, 
                             status=HTTPStatus.CONFLICT)
             return
@@ -162,6 +316,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             pairs = [_normalize_dashboard_pair(p) for p in pair_val if str(p).strip()]
         else:
             pairs = [_normalize_dashboard_pair(self.server.settings.default_pair)]
+        pairs = [pair for pair in pairs if pair]
+        if not pairs:
+            self._send_json({"error": "At least one paper-trading pair is required."}, 
+                            status=HTTPStatus.BAD_REQUEST)
+            return
 
         interval = str(params.get("interval") or "15m")
         strategy = str(params.get("strategy") or "adaptive_hybrid")
@@ -234,6 +393,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         strategy_interval = str(params.get("strategy_interval") or interval)
         execution_interval = str(params.get("execution_interval") or "1m")
+        if strategy_interval not in REST_RESOLUTION_BY_INTERVAL:
+            self._send_json({"error": f"Unsupported strategy interval: {strategy_interval}"}, 
+                            status=HTTPStatus.BAD_REQUEST)
+            return
+        if paper_intrabar_enabled and execution_interval not in REST_RESOLUTION_BY_INTERVAL:
+            self._send_json({"error": f"Unsupported execution interval: {execution_interval}"}, 
+                            status=HTTPStatus.BAD_REQUEST)
+            return
 
         # Build modified risk settings
         new_risk = replace(
@@ -277,6 +444,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 from app.live.paper_loop import _update_live_state
                 _update_live_state(running=False, error=str(exc))
                 logging.getLogger(__name__).exception("Paper loop crashed: %s", exc)
+            finally:
+                with self.server._paper_lock:
+                    if self.server._paper_loop is loop:
+                        self.server._paper_loop = None
 
         t = threading.Thread(target=run_loop, daemon=True, name="paper-loop")
         with self.server._paper_lock:
@@ -286,8 +457,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                          "strategy": strategy})
 
     def _handle_paper_stop(self) -> None:
+        from app.live.paper_loop import get_active_loop
         with self.server._paper_lock:
-            loop = self.server._paper_loop
+            loop = self.server._paper_loop or get_active_loop()
         if loop is None:
             self._send_json({"error": "No paper loop is running."}, 
                             status=HTTPStatus.CONFLICT)
@@ -327,6 +499,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                  import threading
                  def async_add():
                      try:
+                        from app.data.gap_guard import CandleGapGuard
                         strategy_interval = loop.settings.strategy_interval if loop.settings.paper_intrabar_enabled else loop._current_interval
                         loop.gap_guards[pair] = CandleGapGuard(strategy_interval)
                         loop._warm_up(pair, strategy_interval)
@@ -354,16 +527,22 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"added": True, "pair": pair})
 
     def _handle_paper_reset(self) -> None:
-        from app.live.paper_loop import get_active_loop, _update_live_state
+        from app.live.paper_loop import get_active_loop, set_active_loop, _update_live_state
         from app.persistence.paper_state import PaperStateStore, PaperSessionStore
         import os
         
-        loop = get_active_loop()
+        with self.server._paper_lock:
+            loop = self.server._paper_loop or get_active_loop()
+            self.server._paper_loop = None
+            self.server._paper_thread = None
         if loop:
             loop.stop()
+        set_active_loop(None)
         
         # Clear persistent stores
-        PaperStateStore().clear()
+        state_store = PaperStateStore()
+        state_store.clear()
+        state_store.close()
         PaperSessionStore().clear()
         
         # Clear summary csv
@@ -372,14 +551,31 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             
         # Reset live state
         _update_live_state(
+            running=False,
+            pair="",
+            watchlist=[],
+            scanned_pairs={},
+            interval="",
+            strategy="",
             candle_count=0,
             equity="0",
+            starting_equity="0",
             realized_pnl="0",
+            unrealized_pnl="0",
+            net_realized_pnl="0",
             fees_paid="0",
+            open_notional="0",
+            return_abs="0",
+            return_pct="0",
+            max_drawdown_pct="0",
+            peak_equity="0",
             open_positions=0,
             total_fills=0,
             positions_json="[]",
+            equity_history_json="[]",
+            candles_json="{}",
             last_updated=None,
+            error="",
         )
         
         self._send_json({"reset": True})
@@ -452,14 +648,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         from pathlib import Path
         path = Path("paper_trades.csv")
         if not path.exists():
-            self._send_json({"trades": []})
+            self._send_json({"trades": [], "summary": _summarize_paper_trades([])})
             return
         trades = []
+        seen: set[tuple[str, ...]] = set()
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                trades.append(dict(row))
-        self._send_json({"trades": list(reversed(trades[-100:]))})
+                enriched = _enrich_paper_trade_row(dict(row))
+                key = _paper_trade_key(enriched)
+                if key in seen:
+                    continue
+                seen.add(key)
+                trades.append(enriched)
+        self._send_json(
+            {
+                "trades": list(reversed(trades[-100:])),
+                "summary": _summarize_paper_trades(trades),
+            }
+        )
 
     def _send_backtest(self, params: dict[str, Any]) -> None:
         try:
@@ -760,6 +967,9 @@ def run_backtest_for_dashboard(
         starting_equity=equity,
         leverage=leverage,
         strategy_name=strategy,
+        margin_currency=settings.futures_margin_currency,
+        price_quote_currency=settings.price_quote_currency,
+        quote_to_margin_rate=settings.quote_to_margin_rate,
         risk_per_trade_pct=risk_per_trade_pct,
         compound_risk_equity=compound_risk_equity,
         stop_loss_pct=stop_loss_pct,

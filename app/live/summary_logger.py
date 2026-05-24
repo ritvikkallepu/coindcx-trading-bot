@@ -5,6 +5,7 @@ import logging
 from decimal import Decimal
 from pathlib import Path
 from datetime import datetime, timezone
+from tempfile import NamedTemporaryFile
 
 
 class PaperTradingSummaryLogger:
@@ -18,21 +19,33 @@ class PaperTradingSummaryLogger:
         self.warning_fired = False
         
         self._header = [
+            "fill_id", "order_id",
             "timestamp", "pair", "interval", "strategy", "direction", 
-            "entry_price", "exit_price", "position_size", "gross_pnl", 
-            "fees", "net_pnl", "net_pnl_pct", "equity_after", 
-            "exit_reason", "hold_duration_candles"
+            "entry_price", "exit_price", "stop_loss", "take_profit",
+            "position_size", "quantity_unit",
+            "position_notional", "notional_currency", "price_quote_currency",
+            "quote_to_margin_rate", "unit_contract_value",
+            "risk_percent_used", "risk_multiplier", "risk_base_mode",
+            "risk_base_amount", "planned_risk_amount", "required_margin",
+            "available_equity", "margin_ok", "account_blown",
+            "fee_type", "fee_rate", "fee_gst_rate", "effective_fee_rate",
+            "entry_fee", "exit_fee", "total_fees",
+            "gross_pnl", "fees", "net_pnl", "net_pnl_pct", "equity_after",
+            "exit_reason", "hold_duration_candles", "legacy_currency_math",
         ]
 
     def on_trade_closed(self, trade: dict) -> None:
-        file_exists = self.csv_path.exists()
+        self._ensure_header()
+        trade_key = _trade_key(trade)
+        if trade_key in self._existing_trade_keys():
+            self.logger.warning(
+                "Skipping duplicate paper closed-trade row for %s.",
+                "|".join(trade_key),
+            )
+            return
         
         with open(self.csv_path, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=self._header)
-            if not file_exists:
-                writer.writeheader()
-            
-            # Format row data
             row = {k: str(trade.get(k, "")) for k in self._header}
             writer.writerow(row)
         
@@ -82,3 +95,66 @@ class PaperTradingSummaryLogger:
             recovery_threshold = self.peak_equity * Decimal("0.95")
             if current_equity >= recovery_threshold:
                 self.warning_fired = False
+
+    def _ensure_header(self) -> None:
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.csv_path.exists() or self.csv_path.stat().st_size == 0:
+            with open(self.csv_path, mode="w", newline="", encoding="utf-8") as f:
+                csv.DictWriter(f, fieldnames=self._header).writeheader()
+            return
+
+        with open(self.csv_path, mode="r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing_header = list(reader.fieldnames or [])
+            if existing_header == self._header:
+                return
+            rows = list(reader)
+
+        # Migrate old paper-trade CSVs in place so newly added INR/risk fields
+        # are not silently dropped when the file already exists.
+        with NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            delete=False,
+            dir=str(self.csv_path.parent),
+        ) as tmp:
+            writer = csv.DictWriter(tmp, fieldnames=self._header)
+            writer.writeheader()
+            for row in rows:
+                migrated = {key: str(row.get(key, "") or "") for key in self._header}
+                if "quote_to_margin_rate" not in existing_header:
+                    migrated["legacy_currency_math"] = "true"
+                writer.writerow(migrated)
+            tmp_path = Path(tmp.name)
+
+        tmp_path.replace(self.csv_path)
+
+    def _existing_trade_keys(self) -> set[tuple[str, ...]]:
+        if not self.csv_path.exists() or self.csv_path.stat().st_size == 0:
+            return set()
+        with open(self.csv_path, mode="r", newline="", encoding="utf-8") as f:
+            return {_trade_key(row) for row in csv.DictReader(f)}
+
+
+def _trade_key(row: dict) -> tuple[str, ...]:
+    fill_id = str(row.get("fill_id") or "").strip()
+    if fill_id:
+        return (
+            "fill_id",
+            fill_id,
+            str(row.get("order_id") or "").strip(),
+            str(row.get("timestamp") or "").strip(),
+            str(row.get("pair") or "").strip(),
+        )
+    return (
+        "composite",
+        str(row.get("timestamp") or "").strip(),
+        str(row.get("pair") or "").strip(),
+        str(row.get("direction") or "").strip(),
+        str(row.get("entry_price") or "").strip(),
+        str(row.get("exit_price") or "").strip(),
+        str(row.get("position_size") or row.get("quantity") or "").strip(),
+        str(row.get("net_pnl") or "").strip(),
+        str(row.get("exit_reason") or row.get("reason") or "").strip(),
+    )

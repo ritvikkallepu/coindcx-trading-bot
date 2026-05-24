@@ -24,11 +24,19 @@ class MarketDataPipeline:
         self.logger = logger or logging.getLogger(__name__)
 
     def handle_raw(self, event_name: str, payload: Any) -> list[MarketEvent]:
-        events = normalize_coindcx_event(
-            event_name,
-            payload,
-            default_pair=self.default_pair,
-        )
+        try:
+            events = normalize_coindcx_event(
+                event_name,
+                payload,
+                default_pair=self.default_pair,
+            )
+        except ValueError:
+            self.logger.warning(
+                "Skipping unsupported or malformed CoinDCX market event %s.",
+                event_name,
+                exc_info=True,
+            )
+            return []
         for event in events:
             self.store.apply(event)
             if self.on_event is not None:

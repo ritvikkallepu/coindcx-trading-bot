@@ -27,6 +27,11 @@ class ATRPolicy:
         data = asdict(self)
         return {
             **data,
+            "atr_dynamic_exits_enabled": (
+                self.atr_stop_enabled
+                or self.atr_take_profit_enabled
+                or self.atr_trailing_enabled
+            ),
             "atr_policy": data,
             "atr_policy_reason": self.reason,
         }
@@ -52,6 +57,33 @@ class ATRPolicyRouter:
             direction=direction,
             scores=(ema_score, bb_score, visual_score, oi_score),
         )
+
+        if metadata.get("entry_type") == "intrabar_reversal_breakout":
+            is_ignition = metadata.get("breakout_variant") == "momentum_ignition"
+            return ATRPolicy(
+                trade_mode="momentum_ignition" if is_ignition else "intrabar_reversal_breakout",
+                atr_profile="momentum_ignition_runner" if is_ignition else "breakout_runner",
+                entry_allowed=True,
+                atr_stop_enabled=True,
+                atr_take_profit_enabled=False,
+                atr_trailing_enabled=True,
+                partial_take_profit_enabled=False,
+                stop_atr_multiple=Decimal("1.8") if is_ignition else Decimal("2.0"),
+                take_profit_atr_multiple=Decimal("0"),
+                trailing_atr_multiple=Decimal("1.8") if is_ignition else Decimal("2.0"),
+                atr_take_profit_mode="none",
+                risk_multiplier=_decimal_from_metadata(
+                    metadata.get("setup_tier_risk_multiplier"),
+                    Decimal("0.25") if is_ignition else Decimal("0.5"),
+                ),
+                reason=(
+                    "Momentum ignition: smaller-risk runner for vertical live bursts with "
+                    "ATR stop, ATR trailing, breakeven, and profit lock."
+                    if is_ignition
+                    else "Intrabar reversal breakout: reduced-risk runner with ATR stop, "
+                    "ATR trailing, breakeven, and profit lock."
+                ),
+            )
 
         low_volatility = natr_pct is not None and natr_pct < Decimal("0.03")
         compression_or_breakout = (

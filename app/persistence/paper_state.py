@@ -1,11 +1,31 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from tempfile import NamedTemporaryFile
 from typing import Any
 from app.utils.json import to_jsonable
+
+
+_SESSION_SAVE_LOCK = threading.Lock()
+_STRING_METADATA_KEY_HINTS = ("id", "pair", "symbol", "strategy", "reason", "type", "mode", "currency", "unit")
+
+
+def _decimal_field(values: dict[str, Any], key: str) -> Decimal:
+    return Decimal(str(values[key]))
+
+
+def _optional_decimal_field(values: dict[str, Any], key: str) -> Decimal | None:
+    value = values.get(key)
+    if value is None or value == "":
+        return None
+    return Decimal(str(value))
+
 
 class PaperStateStore:
     def __init__(self, db_path: str = "paper_state.db") -> None:
@@ -137,8 +157,8 @@ class PaperStateStore:
 
         return {
             "equity": Decimal(equity),
-            "positions": self._restore_decimals(json.loads(positions_json)),
-            "fills": self._restore_decimals(json.loads(fills_json)),
+            "positions": json.loads(positions_json),
+            "fills": json.loads(fills_json),
             "daily_pnl": Decimal(daily_pnl),
             "realized_pnl": Decimal(daily_pnl),
             "daily_limit_equity": Decimal(daily_limit_equity),
@@ -161,42 +181,56 @@ class PaperStateStore:
             return [self._restore_decimals(i) for i in obj]
         return obj
 
+    def _restore_metadata(self, obj: Any, *, key: str = "") -> Any:
+        if isinstance(obj, str):
+            normalized_key = key.lower()
+            if any(hint in normalized_key for hint in _STRING_METADATA_KEY_HINTS):
+                return obj
+            return self._restore_decimals(obj)
+        if isinstance(obj, dict):
+            return {k: self._restore_metadata(v, key=str(k)) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._restore_metadata(item, key=key) for item in obj]
+        return obj
+
     def _restore_position(self, d: dict[str, Any]) -> PaperPosition:
         from app.broker.models import PaperPosition
         from app.strategies.base import SignalDirection
 
-        d = self._restore_decimals(d)
+        metadata = self._restore_metadata(d.get("metadata", {}))
         # Handle Enum
         direction = SignalDirection(d["direction"])
         return PaperPosition(
-            pair=d["pair"],
+            pair=str(d["pair"]),
             direction=direction,
-            quantity=d["quantity"],
-            entry_price=d["entry_price"],
-            leverage=d["leverage"],
-            opened_at_ms=d["opened_at_ms"],
-            updated_at_ms=d["updated_at_ms"],
-            strategy_name=d["strategy_name"],
-            stop_loss=d.get("stop_loss"),
-            take_profit=d.get("take_profit"),
-            metadata=d.get("metadata", {}),
+            quantity=_decimal_field(d, "quantity"),
+            entry_price=_decimal_field(d, "entry_price"),
+            leverage=_decimal_field(d, "leverage"),
+            opened_at_ms=int(d["opened_at_ms"]),
+            updated_at_ms=int(d["updated_at_ms"]),
+            strategy_name=str(d["strategy_name"]),
+            stop_loss=_optional_decimal_field(d, "stop_loss"),
+            take_profit=_optional_decimal_field(d, "take_profit"),
+            quote_to_margin_rate=_optional_decimal_field(d, "quote_to_margin_rate") or Decimal("1"),
+            unit_contract_value=_optional_decimal_field(d, "unit_contract_value") or Decimal("1"),
+            metadata=metadata if isinstance(metadata, dict) else {},
         )
 
     def _restore_fill(self, d: dict[str, Any]) -> PaperFill:
         from app.broker.models import PaperFill, PaperOrderSide
 
-        d = self._restore_decimals(d)
+        metadata = self._restore_metadata(d.get("metadata", {}))
         return PaperFill(
-            fill_id=d["fill_id"],
-            order_id=d["order_id"],
-            pair=d["pair"],
+            fill_id=str(d["fill_id"]),
+            order_id=str(d["order_id"]),
+            pair=str(d["pair"]),
             side=PaperOrderSide(d["side"]),
-            quantity=d["quantity"],
-            price=d["price"],
-            fee=d["fee"],
-            timestamp_ms=d["timestamp_ms"],
-            realized_pnl=d.get("realized_pnl", Decimal("0")),
-            metadata=d.get("metadata", {}),
+            quantity=_decimal_field(d, "quantity"),
+            price=_decimal_field(d, "price"),
+            fee=_decimal_field(d, "fee"),
+            timestamp_ms=int(d["timestamp_ms"]),
+            realized_pnl=_optional_decimal_field(d, "realized_pnl") or Decimal("0"),
+            metadata=metadata if isinstance(metadata, dict) else {},
         )
 
     def clear(self) -> None:
@@ -242,6 +276,7 @@ class PaperSessionStore:
         from pathlib import Path
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._recovery_path = self.file_path.with_name(f"{self.file_path.name}.recovery")
 
     def _serialize(self, obj: Any) -> Any:
         from enum import Enum
@@ -281,19 +316,87 @@ class PaperSessionStore:
 
     def save_session(self, state: dict[str, Any]) -> None:
         serializable = to_jsonable(state)
-        with open(self.file_path, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, indent=2)
+        payload = json.dumps(serializable, indent=2)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = None
+        with _SESSION_SAVE_LOCK:
+            try:
+                with NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    delete=False,
+                    dir=str(self.file_path.parent),
+                    prefix=f".{self.file_path.name}.",
+                    suffix=".tmp",
+                ) as f:
+                    tmp_path = f.name
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                if self._replace_with_retry(tmp_path, self.file_path):
+                    self._cleanup_recovery()
+                    return
+
+                # If OneDrive/AV/another process keeps the main file locked,
+                # preserve the latest session in a recovery file and let the
+                # bot keep running. load_session() prefers this file when newer.
+                if self._replace_with_retry(tmp_path, self._recovery_path):
+                    return
+
+                raise PermissionError(
+                    f"Could not replace {self.file_path} or recovery session file."
+                )
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+    def _replace_with_retry(self, source: str, target: Any) -> bool:
+        for attempt in range(8):
+            try:
+                os.replace(source, target)
+                return True
+            except PermissionError:
+                time.sleep(min(0.05 * (2 ** attempt), 1.0))
+        return False
 
     def load_session(self) -> dict[str, Any] | None:
-        if not self.file_path.exists():
+        paths = self._load_candidates()
+        if not paths:
             return None
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return self._deserialize(data)
+            except Exception:
+                continue
+        return None
+
+    def _load_candidates(self) -> list[Any]:
+        paths = [path for path in [self.file_path, self._recovery_path] if path.exists()]
+        return sorted(paths, key=lambda path: path.stat().st_mtime, reverse=True)
+
+    def _cleanup_recovery(self) -> None:
+        if not self._recovery_path.exists():
+            return
         try:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return self._deserialize(data)
-        except Exception:
-            return None
+            self._recovery_path.unlink()
+        except OSError:
+            pass
 
     def clear(self) -> None:
-        if self.file_path.exists():
-            self.file_path.unlink()
+        for path in [self.file_path, self._recovery_path]:
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        for path in self.file_path.parent.glob(f".{self.file_path.name}.*.tmp"):
+            try:
+                path.unlink()
+            except OSError:
+                pass

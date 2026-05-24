@@ -20,7 +20,7 @@ class FuturesOrderRequestTests(unittest.TestCase):
         self.assertNotIn("time_in_force", payload)
         self.assertNotIn("price", payload)
         self.assertNotIn("stop_price", payload)
-        self.assertEqual(payload["margin_currency_short_name"], "USDT")
+        self.assertEqual(payload["margin_currency_short_name"], "INR")
 
     def test_market_order_rejects_time_in_force(self) -> None:
         with self.assertRaises(ValueError):

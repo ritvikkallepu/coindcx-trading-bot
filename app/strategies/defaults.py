@@ -28,10 +28,23 @@ def default_strategy_engine() -> StrategyEngine:
     )
 
 
+def all_strategy_engine() -> StrategyEngine:
+    return StrategyEngine(
+        [
+            EMARSICrossoverStrategy(),
+            BollingerVolumeMeanReversionStrategy(),
+            HybridMetaStrategy(),
+            HybridMetaV2Strategy(),
+            AdaptiveHybridStrategy(),
+            BollingerDynamicFuturesGridStrategy(),
+        ]
+    )
+
+
 def strategy_engine_for_name(name: str) -> StrategyEngine:
     normalized = name.strip().lower()
     if normalized == "all":
-        return default_strategy_engine()
+        return all_strategy_engine()
     if normalized == "ema_rsi_trend":
         return StrategyEngine([EMARSICrossoverStrategy()])
     if normalized == "bb_volume_reversion":

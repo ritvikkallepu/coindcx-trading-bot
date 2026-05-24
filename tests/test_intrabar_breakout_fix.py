@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-import pytest
+try:
+    import pytest
+except ModuleNotFoundError:  # Allows unittest discovery in the bundled runtime.
+    class _PytestFallback:
+        @staticmethod
+        def fixture(func=None, **kwargs):
+            if func is None:
+                return lambda wrapped: wrapped
+            return func
+
+    pytest = _PytestFallback()
 from decimal import Decimal
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
