@@ -65,6 +65,14 @@ class BacktestConfig:
     atr_take_profit_multiple: Decimal = Decimal("3")
     atr_trailing_multiple: Decimal = Decimal("2.0")
     atr_take_profit_mode: str = "none"
+    bb_trail_enabled: bool = False
+    bb_trail_buffer_multiplier: Decimal = Decimal("1.0")
+    bb_trail_activation_r: Decimal = Decimal("0.5")
+    bb_trail_stage2_r: Decimal = Decimal("0.5")
+    bb_trail_stage3_r: Decimal = Decimal("1.0")
+    bb_trail_force_close_r: Decimal = Decimal("4.0")
+    bb_trail_partial_close_at_tp: bool = True
+    bb_trail_partial_close_pct: Decimal = Decimal("0.60")
     execution_interval: str | None = None
     paper_intrabar_enabled: bool = False
     strategy_interval: str | None = None
@@ -74,6 +82,8 @@ class BacktestConfig:
     intrabar_reentry_enabled: bool = False
     max_reentries_per_candle: int = 0
     reentry_cooldown_candles: int = 1
+    previous_parent_high: Decimal | None = None
+    previous_parent_low: Decimal | None = None
     intrabar_reversal_breakout_enabled: bool = True
     reversal_breakout_min_execution_candles: int = 2
     reversal_breakout_volume_ratio: Decimal = Decimal("2.0")
@@ -130,6 +140,38 @@ class BacktestConfig:
     min_atr_pct: Decimal = Decimal("0.002")
     block_flat_ema_enabled: bool = False
     block_low_atr_enabled: bool = False
+
+    # Entry Timing and Quality
+    balanced_breakout_enabled: bool = True
+    balanced_breakout_volume_ratio_min: Decimal = Decimal("1.8")
+    balanced_breakout_body_ratio_min: Decimal = Decimal("0.60")
+    balanced_breakout_close_position_min: Decimal = Decimal("0.70")
+    balanced_breakout_max_extension_atr: Decimal = Decimal("2.0")
+    balanced_breakout_max_age_candles: int = 2
+    balanced_breakout_risk_multiplier: Decimal = Decimal("0.50")
+    
+    false_breakout_filter_enabled: bool = True
+    false_breakout_max_wick_ratio: Decimal = Decimal("0.45")
+    false_breakout_require_close_outside_parent: bool = True
+    
+    late_chase_block_enabled: bool = True
+    late_chase_max_consecutive_impulse_candles: int = 3
+    late_chase_volume_fade_ratio: Decimal = Decimal("0.75")
+    late_chase_max_extension_atr: Decimal = Decimal("2.2")
+    
+    pullback_entry_enabled: bool = True
+    pullback_max_age_candles: int = 8
+    pullback_max_distance_from_ema_atr: Decimal = Decimal("0.6")
+    pullback_resume_body_ratio_min: Decimal = Decimal("0.45")
+    pullback_risk_multiplier: Decimal = Decimal("0.50")
+    
+    signal_flip_grace_candles: int = 2
+    signal_flip_confirm_candles: int = 2
+    time_stop_extend_if_momentum_strong: bool = True
+    
+    # Profit Locking (Virtual Accounting)
+    profit_locking_enabled: bool = True
+    auto_lock_profit_pct: Decimal = Decimal("100")
 
     def __post_init__(self) -> None:
         if self.requested_candles is not None and self.requested_candles <= 0:
@@ -233,6 +275,18 @@ class BacktestTrade:
     fees: Decimal
     net_pnl: Decimal
     exit_reason: str
+    
+    # New ROE and Notional fields
+    entry_notional: Decimal = Decimal("0")
+    exit_notional: Decimal = Decimal("0")
+    leverage: Decimal = Decimal("1")
+    margin_used: Decimal = Decimal("0")
+    net_pct_of_notional: Decimal = Decimal("0")
+    gross_roe_pct: Decimal = Decimal("0")
+    net_roe_pct: Decimal = Decimal("0")
+    account_equity_at_entry: Decimal = Decimal("0")
+    account_impact_pct: Decimal = Decimal("0")
+    
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -264,6 +318,15 @@ class BacktestMetrics:
     max_drawdown_pct: Decimal
     sharpe_ratio: Decimal | None
     funding_paid: Decimal = Decimal("0")
+    
+    # Profit Locking Metrics
+    final_total_equity: Decimal = Decimal("0")
+    final_tradable_equity: Decimal = Decimal("0")
+    final_locked_profit: Decimal = Decimal("0")
+    max_daily_loss_hit_count: int = 0
+    trades_blocked_by_profit_lock_or_daily_loss: int = 0
+    returns_total_equity_pct: Decimal = Decimal("0")
+    returns_tradable_equity_pct: Decimal = Decimal("0")
 
     def to_dict(self) -> dict[str, Any]:
         return convert_for_json(asdict(self))

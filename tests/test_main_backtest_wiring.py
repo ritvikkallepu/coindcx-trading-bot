@@ -6,10 +6,15 @@ from unittest.mock import MagicMock, patch
 
 from app.backtest.models import BacktestConfig, BacktestMetrics, BacktestResult
 from app.broker.models import PaperAccountSnapshot
-from app.main import backtest_command
+from app.main import backtest_command, build_parser
 
 
 class MainBacktestWiringTests(unittest.TestCase):
+    def test_dashboard_parser_defaults_to_hybrid_meta_v2(self) -> None:
+        args = build_parser().parse_args(["dashboard"])
+
+        self.assertEqual(args.strategy, "hybrid_meta_v2")
+
     @patch("app.main.record_backtest_result", return_value={})
     @patch("app.main._print_json")
     @patch("app.main.BacktestEngine")

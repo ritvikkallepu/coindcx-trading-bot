@@ -47,6 +47,23 @@ class SignalFunnelReason(str, Enum):
     CONTROLLED_SHORT_BLOCKED = "controlled_short_blocked"
     OI_SHORT_RESTRICTION = "oi_short_restriction"
     ATR_POLICY_ENTRY_BLOCKED = "atr_policy_entry_blocked"
+    BB_ENTRY_GATE_BLOCKED = "bb_entry_gate_blocked"
+    
+    # Entry Timing and Quality
+    FALSE_BREAKOUT_WEAK_CLOSE = "false_breakout_weak_close"
+    FALSE_BREAKOUT_LOW_VOLUME = "false_breakout_low_volume"
+    FALSE_BREAKOUT_SMALL_BODY = "false_breakout_small_body"
+    FALSE_BREAKOUT_CLOSED_BACK_INSIDE_RANGE = "false_breakout_closed_back_inside_range"
+    FALSE_BREAKOUT_TOO_EXTENDED = "false_breakout_too_extended"
+    FALSE_BREAKOUT_LATE_IMPULSE = "false_breakout_late_impulse"
+    FALSE_BREAKOUT_HIGHER_CONTEXT_BLOCK = "false_breakout_higher_context_block"
+    FALSE_BREAKOUT_SLIPPAGE_BLOCK = "false_breakout_slippage_block"
+    
+    LATE_CHASE_BREAKOUT_TOO_OLD = "late_chase_breakout_too_old"
+    LATE_CHASE_ATR_EXTENSION = "late_chase_atr_extension"
+    LATE_CHASE_CONSECUTIVE_IMPULSE = "late_chase_consecutive_impulse"
+    LATE_CHASE_VOLUME_FADED = "late_chase_volume_faded"
+    LATE_CHASE_EXHAUSTION_WICK = "late_chase_exhaustion_wick"
     
     # Execution / Risk Filters
     COOLDOWN_BLOCKED = "cooldown_blocked"

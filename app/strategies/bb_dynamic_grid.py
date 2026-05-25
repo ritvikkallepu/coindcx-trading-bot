@@ -444,6 +444,8 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
         context: StrategyContext,
     ) -> dict[str, Any]:
         activation_pct, distance_pct = self._trail_settings(context)
+        config = context.features.get("backtest_config")
+        config = config if isinstance(config, dict) else {}
         return {
             "strategy_type": "bb_dynamic_grid",
             "bb_middle": band.middle,
@@ -453,8 +455,31 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
             "atr": atr,
             "grid_levels": self.grid_levels,
             "max_grid_entries": self.max_grid_entries,
+            "trailing_stop_enabled": _bool_value(
+                config.get("trailing_stop_enabled"),
+                False,
+            ),
             "trail_activation_pct": activation_pct,
             "trail_distance_pct": distance_pct,
+            "trailing_stop_activation_pct": activation_pct,
+            "trailing_stop_distance_pct": distance_pct,
+            "atr_dynamic_exits_enabled": _bool_value(
+                config.get("atr_dynamic_exits_enabled"),
+                False,
+            ),
+            "atr_stop_enabled": _bool_value(config.get("atr_stop_enabled"), False),
+            "atr_take_profit_enabled": _bool_value(
+                config.get("atr_take_profit_enabled"),
+                False,
+            ),
+            "atr_trailing_enabled": _bool_value(
+                config.get("atr_trailing_enabled"),
+                False,
+            ),
+            "profit_lock_enabled": _bool_value(
+                config.get("profit_lock_enabled"),
+                False,
+            ),
         }
 
     def _entry_confidence(
@@ -531,6 +556,19 @@ def _decimal(value: Any, default: Decimal) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return default
+
+
+def _bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:

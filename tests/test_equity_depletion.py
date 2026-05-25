@@ -77,7 +77,8 @@ class EquityDepletionTests(unittest.TestCase):
             risk_per_trade_pct=Decimal("100"),
             compound_risk_equity=False,
             atr_period=1,
-            atr_entry_filter_enabled=False
+            atr_entry_filter_enabled=False,
+            profit_locking_enabled=False
         )
         risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_daily_loss_pct=Decimal("100"), max_total_risk_pct=Decimal("100"))
         engine = BacktestEngine(config=config, strategy_engine=StrategyEngine([TwoEntryStrategy()]), risk_manager=RiskManager(settings=risk_settings))
@@ -103,7 +104,8 @@ class EquityDepletionTests(unittest.TestCase):
             leverage=Decimal("20"), 
             risk_per_trade_pct=Decimal("50"),
             atr_period=1,
-            atr_entry_filter_enabled=False
+            atr_entry_filter_enabled=False,
+            profit_locking_enabled=False
         )
         risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_total_risk_pct=Decimal("100"), max_leverage=100)
         engine = BacktestEngine(config=config, strategy_engine=StrategyEngine([MockBankruptStrategy(Decimal("1"), Decimal("0.99"))]), risk_manager=RiskManager(settings=risk_settings))
@@ -159,12 +161,13 @@ class EquityDepletionTests(unittest.TestCase):
             pair="B-SOL_USDT",
             interval="1h",
             starting_equity=Decimal("1000"),
-            leverage=Decimal("1"), 
+            leverage=Decimal("1"),
             risk_per_trade_pct=Decimal("80"),
             compound_risk_equity=False,
             atr_period=1,
             atr_entry_filter_enabled=False,
-            stop_loss_cooldown_candles=0
+            stop_loss_cooldown_candles=0,
+            profit_locking_enabled=False
         )
         risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_daily_loss_pct=Decimal("100"), max_leverage=100, max_total_risk_pct=Decimal("100"))
         engine = BacktestEngine(config=config, strategy_engine=StrategyEngine([HighRiskStrategy()]), risk_manager=RiskManager(settings=risk_settings))
@@ -190,7 +193,8 @@ class EquityDepletionTests(unittest.TestCase):
             risk_per_trade_pct=Decimal("10"), 
             compound_risk_equity=False,
             atr_period=1,
-            atr_entry_filter_enabled=False
+            atr_entry_filter_enabled=False,
+            profit_locking_enabled=False
         )
         risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_total_risk_pct=Decimal("100"))
         engine = BacktestEngine(config=config, strategy_engine=StrategyEngine([TwoEntryStrategy()]), risk_manager=RiskManager(settings=risk_settings))
@@ -215,7 +219,8 @@ class EquityDepletionTests(unittest.TestCase):
             risk_per_trade_pct=Decimal("10"),
             compound_risk_equity=False,
             atr_period=1,
-            atr_entry_filter_enabled=False
+            atr_entry_filter_enabled=False,
+            profit_locking_enabled=False
         )
         risk_settings = RiskSettings(max_open_positions=1, max_risk_per_trade_pct=Decimal("100"), max_total_risk_pct=Decimal("100"))
         

@@ -68,6 +68,122 @@ def _normalize_dashboard_pair(value: object) -> str:
     return f"B-{base}_{quote}"
 
 
+def _dashboard_pair_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        raw_values = value.split(",")
+    elif isinstance(value, list):
+        raw_values = value
+    elif value is None:
+        raw_values = []
+    else:
+        raw_values = [value]
+
+    pairs: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        pair = _normalize_dashboard_pair(raw)
+        if not pair or pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    return pairs
+
+
+def _paper_pair_overrides(value: object) -> dict[str, dict[str, object]]:
+    if not isinstance(value, dict):
+        return {}
+
+    allowed = {
+        "strategy",
+        "leverage",
+        "risk_pct",
+        "max_daily_loss_pct",
+        "max_open_positions",
+        "max_margin_usage_pct",
+        "allow_multi_pair_positions",
+        "allow_same_pair_pyramiding",
+        "trailing_stop_enabled",
+        "atr_dynamic_exits_enabled",
+        "profit_lock_enabled",
+        "bb_trail_enabled",
+        "max_entries_per_parent_candle",
+    }
+    overrides: dict[str, dict[str, object]] = {}
+    for raw_pair, raw_settings in value.items():
+        pair = _normalize_dashboard_pair(raw_pair)
+        if not pair or not isinstance(raw_settings, dict):
+            continue
+        clean: dict[str, object] = {}
+        for key in allowed:
+            if key not in raw_settings:
+                continue
+            item = raw_settings[key]
+            if item is None or item == "":
+                continue
+            clean[key] = item
+        if clean:
+            overrides[pair] = clean
+    return overrides
+
+
+def _paper_runtime_settings(params: dict[str, Any]) -> dict[str, Any]:
+    interval = str(
+        params.get("strategy_interval")
+        or params.get("interval")
+        or ""
+    ).strip()
+    execution_interval = str(params.get("execution_interval") or "").strip()
+    intrabar = (
+        _bool_param(params.get("paper_intrabar_enabled"), False)
+        if "paper_intrabar_enabled" in params
+        else None
+    )
+    partial_parent = (
+        _bool_param(params.get("use_partial_parent_candle"), False)
+        if "use_partial_parent_candle" in params
+        else None
+    )
+    max_entries = (
+        _positive_int_param(
+            params.get("max_entries_per_parent_candle"),
+            1,
+            name="max_entries_per_parent_candle",
+        )
+        if "max_entries_per_parent_candle" in params
+        else None
+    )
+    leverage = (
+        _decimal_param(params.get("leverage"), Decimal("0"))
+        if "leverage" in params
+        else None
+    )
+
+    if interval:
+        if interval not in REST_RESOLUTION_BY_INTERVAL:
+            raise ValueError(f"Unsupported interval: {interval}")
+    if execution_interval:
+        if execution_interval not in REST_RESOLUTION_BY_INTERVAL:
+            raise ValueError(f"Unsupported execution interval: {execution_interval}")
+        compare_interval = interval or "15m"
+        if interval_to_ms(execution_interval) > interval_to_ms(compare_interval):
+            raise ValueError("Execution interval cannot be larger than the strategy interval.")
+
+    updates: dict[str, Any] = {}
+    if interval:
+        updates["strategy_interval"] = interval
+    if execution_interval:
+        updates["execution_interval"] = execution_interval
+    if intrabar is not None:
+        updates["paper_intrabar_enabled"] = intrabar
+    if partial_parent is not None:
+        updates["use_partial_parent_candle"] = partial_parent
+    if max_entries is not None:
+        updates["max_entries_per_parent_candle"] = max_entries
+    if leverage is not None and leverage > 0:
+        updates["paper_leverage"] = leverage
+    return updates
+
+
 def _paper_quantity_unit(pair: object) -> str:
     symbol = str(pair or "")
     if symbol.startswith("B-"):
@@ -115,6 +231,58 @@ def _enrich_paper_trade_row(row: dict[str, Any]) -> dict[str, Any]:
         row["exit_fee"] = row.get("fees", "")
     if not row.get("total_fees"):
         row["total_fees"] = row.get("fees", "")
+
+    pos_notional = _decimal_or_none(row.get("position_notional") or row.get("entry_notional"))
+    required_margin = _decimal_or_none(row.get("required_margin"))
+    margin_used = _decimal_or_none(row.get("margin_used"))
+    leverage = _decimal_or_none(row.get("leverage"))
+    margin_corrected = False
+
+    # Backfill ROE and Margin Used if missing. Older CSV rows saved
+    # required_margin but not leverage/margin_used, so defaulting to 1x made
+    # the dashboard display notional as margin and understated ROE.
+    if required_margin is not None and required_margin > 0:
+        wrong_notional_margin = (
+            margin_used is not None
+            and pos_notional is not None
+            and margin_used == pos_notional
+            and required_margin < pos_notional
+        )
+        if margin_used is None or margin_used <= 0 or wrong_notional_margin:
+            margin_used = required_margin
+            row["margin_used"] = str(margin_used)
+            margin_corrected = True
+
+    if (
+        pos_notional is not None
+        and pos_notional > 0
+        and margin_used is not None
+        and margin_used > 0
+        and (leverage is None or leverage <= 0 or (leverage == 1 and margin_used != pos_notional))
+    ):
+        leverage = pos_notional / margin_used
+        row["leverage"] = str(leverage)
+    elif leverage is None or leverage <= 0:
+        leverage = Decimal("1")
+        row["leverage"] = "1"
+
+    if (margin_used is None or margin_used <= 0) and pos_notional is not None:
+        margin_used = pos_notional / leverage if leverage > 0 else pos_notional
+        row["margin_used"] = str(margin_used)
+
+    margin_used = _decimal_or_none(row.get("margin_used"))
+    gross_pnl = _decimal_or_none(row.get("gross_pnl") or row.get("pnl"))
+    net_pnl = _decimal_or_none(row.get("net_pnl") or row.get("pnl"))
+    
+    if (not row.get("gross_roe_pct") or margin_corrected) and gross_pnl is not None and margin_used and margin_used > 0:
+        row["gross_roe_pct"] = str(gross_pnl / margin_used * 100)
+    if (not row.get("net_roe_pct") or margin_corrected) and net_pnl is not None and margin_used and margin_used > 0:
+        row["net_roe_pct"] = str(net_pnl / margin_used * 100)
+    
+    equity_at_entry = _decimal_or_none(row.get("account_equity_at_entry"))
+    if not row.get("account_impact_pct") and net_pnl is not None and equity_at_entry and equity_at_entry > 0:
+        row["account_impact_pct"] = str(net_pnl / equity_at_entry * 100)
+
     if legacy:
         row["legacy_currency_math"] = "true"
     return row
@@ -261,7 +429,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if active_loop is not None and not state.get("running"):
                 state = dict(state)
                 state["running"] = True
-                watchlist = getattr(active_loop, "_watchlist", None) or []
+                watchlist = []
+                snapshot_fn = getattr(active_loop, "_watchlist_snapshot", None)
+                if callable(snapshot_fn):
+                    try:
+                        watchlist = list(snapshot_fn())
+                    except Exception:
+                        watchlist = []
+                if not watchlist:
+                    watchlist = getattr(active_loop, "_watchlist", None) or []
                 if watchlist and not state.get("pair"):
                     state["pair"] = ", ".join(watchlist)
                 interval = getattr(active_loop, "_current_interval", "")
@@ -291,6 +467,27 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/paper-add-pair":
             self._handle_paper_add_pair(self._read_json_body())
             return
+        if parsed.path == "/api/paper-watchlist":
+            self._handle_paper_watchlist(self._read_json_body())
+            return
+        if parsed.path == "/api/paper-settings":
+            self._handle_paper_settings(self._read_json_body())
+            return
+        if parsed.path == "/api/paper-remove-pair":
+            self._handle_paper_remove_pair(self._read_json_body())
+            return
+        if parsed.path == "/api/profit-lock/unlock":
+            self._handle_profit_unlock(self._read_json_body())
+            return
+        if parsed.path == "/api/profit-lock/lock":
+            self._handle_profit_lock(self._read_json_body())
+            return
+        if parsed.path == "/api/profit-lock/override-daily-loss":
+            self._handle_override_daily_loss()
+            return
+        if parsed.path == "/api/profit-lock/clear-daily-loss-override":
+            self._handle_clear_daily_loss_override()
+            return
         self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: object) -> None:
@@ -310,20 +507,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         pair_val = params.get("pair") or params.get("pairs") or self.server.settings.default_pair
-        if isinstance(pair_val, str):
-            pairs = [_normalize_dashboard_pair(p) for p in pair_val.split(",") if p.strip()]
-        elif isinstance(pair_val, list):
-            pairs = [_normalize_dashboard_pair(p) for p in pair_val if str(p).strip()]
-        else:
-            pairs = [_normalize_dashboard_pair(self.server.settings.default_pair)]
-        pairs = [pair for pair in pairs if pair]
+        pairs = _dashboard_pair_list(pair_val)
         if not pairs:
             self._send_json({"error": "At least one paper-trading pair is required."}, 
                             status=HTTPStatus.BAD_REQUEST)
             return
 
         interval = str(params.get("interval") or "15m")
-        strategy = str(params.get("strategy") or "adaptive_hybrid")
+        strategy = str(params.get("strategy") or "hybrid_meta_v2")
         
         if interval not in REST_RESOLUTION_BY_INTERVAL:
             self._send_json({"error": f"Unsupported interval: {interval}"}, 
@@ -387,6 +578,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 params.get("profit_lock_enabled"),
                 True,
             )
+            bb_trail_enabled = _bool_param(
+                params.get("bb_trail_enabled"),
+                settings.risk.bb_trail_enabled,
+            )
         except (ValueError, InvalidOperation) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -416,6 +611,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             atr_take_profit_enabled=atr_exits_enabled,
             atr_trailing_enabled=atr_exits_enabled,
             profit_lock_enabled=profit_lock_enabled,
+            bb_trail_enabled=bb_trail_enabled,
         )
 
         # Build a modified settings
@@ -432,7 +628,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             risk=new_risk
         )
 
-        loop = PaperTradingLoop(effective_settings, strategy_name=strategy)
+        pair_overrides = _paper_pair_overrides(params.get("pair_overrides"))
+        loop = PaperTradingLoop(
+            effective_settings,
+            strategy_name=strategy,
+            pair_overrides=pair_overrides,
+        )
         
         with self.server._paper_lock:
             self.server._paper_loop = loop
@@ -453,8 +654,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         with self.server._paper_lock:
             self.server._paper_thread = t
         t.start()
-        self._send_json({"started": True, "pairs": pairs, "interval": interval, 
-                         "strategy": strategy})
+        self._send_json({
+            "started": True,
+            "pairs": pairs,
+            "interval": interval,
+            "strategy": strategy,
+            "pair_overrides": pair_overrides,
+        })
 
     def _handle_paper_stop(self) -> None:
         from app.live.paper_loop import get_active_loop
@@ -480,51 +686,111 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if not loop:
             self._send_json({"error": "Paper loop not running"}, status=HTTPStatus.CONFLICT)
             return
-            
-        if pair in loop._watchlist:
-            self._send_json({"error": f"{pair} already in watchlist"}, status=HTTPStatus.CONFLICT)
-            return
-            
-        # Add to watchlist and initialize if possible
-        loop._watchlist.append(pair)
-        # Note: In a real environment, we'd need to tell the running loop to subscribe 
-        # but for this requirement we'll just update the list so the user sees it.
-        # Ideally the loop's 'run' would need to be dynamic. 
-        # But per the prompt "Add selected pair to watchlist" button is enough for now.
-        # I will also add a dynamic subscription if it's easy.
-        
-        if hasattr(loop, "_ws_client") and loop._ws_client:
-             try:
-                 # Attempt dynamic warmup and subscription
-                 import threading
-                 def async_add():
-                     try:
-                        from app.data.gap_guard import CandleGapGuard
-                        strategy_interval = loop.settings.strategy_interval if loop.settings.paper_intrabar_enabled else loop._current_interval
-                        loop.gap_guards[pair] = CandleGapGuard(strategy_interval)
-                        loop._warm_up(pair, strategy_interval)
-                        if loop.settings.paper_intrabar_enabled:
-                            loop._warm_up_execution(pair, loop.settings.execution_interval)
-                        
-                        from app.exchange.coindcx_ws import MarketSubscription
-                        from app.exchange.coindcx_channels import futures_candle_channel, futures_orderbook_channel
-                        subs = [
-                            MarketSubscription(futures_candle_channel(pair, strategy_interval), "candlestick"),
-                            MarketSubscription(futures_orderbook_channel(pair, 50), "depth-snapshot"),
-                            MarketSubscription(futures_orderbook_channel(pair, 50), "depth-update")
-                        ]
-                        if loop.settings.paper_intrabar_enabled and strategy_interval != loop.settings.execution_interval:
-                            subs.append(MarketSubscription(futures_candle_channel(pair, loop.settings.execution_interval), "candlestick"))
-                        
-                        loop._ws_client.subscribe(subs)
-                     except Exception as e:
-                         logging.getLogger("app.dashboard").error("Failed to add pair %s dynamically: %s", pair, e)
-                 
-                 threading.Thread(target=async_add, daemon=True).start()
-             except Exception:
-                 pass
 
-        self._send_json({"added": True, "pair": pair})
+        try:
+            loop.update_pair_overrides(_paper_pair_overrides(params.get("pair_overrides")))
+            result = loop.add_pair_to_watchlist(pair)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        except Exception as exc:
+            logging.getLogger("app.dashboard").exception("Failed to add %s to watchlist.", pair)
+            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if not result.get("added", False):
+            self._send_json({"error": result.get("reason", f"{pair} already in watchlist")}, status=HTTPStatus.CONFLICT)
+            return
+
+        self._send_json(result)
+
+    def _handle_paper_watchlist(self, params: dict[str, Any]) -> None:
+        raw_pairs = params.get("pairs", params.get("watchlist"))
+        pairs = _dashboard_pair_list(raw_pairs)
+        if not pairs:
+            self._send_json({"error": "At least one pair is required."}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        with self.server._paper_lock:
+            loop = self.server._paper_loop
+
+        if not loop:
+            self._send_json({"error": "Paper loop not running"}, status=HTTPStatus.CONFLICT)
+            return
+
+        try:
+            loop.update_pair_overrides(_paper_pair_overrides(params.get("pair_overrides")))
+            result = loop.update_watchlist(pairs)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        except Exception as exc:
+            logging.getLogger("app.dashboard").exception("Failed to update paper watchlist.")
+            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        self._send_json(result)
+
+    def _handle_paper_settings(self, params: dict[str, Any]) -> None:
+        with self.server._paper_lock:
+            loop = self.server._paper_loop
+
+        if not loop:
+            self._send_json({"error": "Paper loop not running"}, status=HTTPStatus.CONFLICT)
+            return
+
+        try:
+            runtime_result = loop.update_runtime_settings(**_paper_runtime_settings(params))
+            pair_overrides = _paper_pair_overrides(params.get("pair_overrides"))
+            overrides = loop.update_pair_overrides(pair_overrides) if pair_overrides else {}
+            pairs = _dashboard_pair_list(params.get("pairs", params.get("watchlist")))
+            watchlist_result = loop.update_watchlist(pairs) if pairs else None
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        except Exception as exc:
+            logging.getLogger("app.dashboard").exception("Failed to update paper settings.")
+            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        self._send_json(
+            {
+                "updated": True,
+                "runtime": runtime_result,
+                "pair_overrides": overrides,
+                "watchlist": watchlist_result,
+            }
+        )
+
+    def _handle_paper_remove_pair(self, params: dict[str, Any]) -> None:
+        pair = params.get("pair")
+        if not pair:
+            self._send_json({"error": "No pair provided"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        pair = _normalize_dashboard_pair(pair)
+        with self.server._paper_lock:
+            loop = self.server._paper_loop
+
+        if not loop:
+            self._send_json({"error": "Paper loop not running"}, status=HTTPStatus.CONFLICT)
+            return
+
+        try:
+            result = loop.remove_pair_from_watchlist(pair)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        except Exception as exc:
+            logging.getLogger("app.dashboard").exception("Failed to remove %s from watchlist.", pair)
+            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if not result.get("removed", True) and not result.get("updated", False):
+            self._send_json({"error": result.get("reason", f"{pair} is not in watchlist")}, status=HTTPStatus.CONFLICT)
+            return
+
+        self._send_json(result)
 
     def _handle_paper_reset(self) -> None:
         from app.live.paper_loop import get_active_loop, set_active_loop, _update_live_state
@@ -574,11 +840,72 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             positions_json="[]",
             equity_history_json="[]",
             candles_json="{}",
+            pair_profiles={},
+            pair_overrides={},
             last_updated=None,
             error="",
         )
         
         self._send_json({"reset": True})
+
+    def _handle_profit_unlock(self, params: dict[str, Any]) -> None:
+        from app.live.paper_loop import get_active_loop
+        with self.server._paper_lock:
+            loop = self.server._paper_loop or get_active_loop()
+        if loop is None:
+            self._send_json({"error": "No paper loop is running."}, status=HTTPStatus.CONFLICT)
+            return
+        
+        amount = _decimal_or_none(params.get("amount"))
+        reason = str(params.get("reason") or "Manual Dashboard Unlock")
+        if amount is None or amount <= 0:
+            self._send_json({"error": "Invalid amount."}, status=HTTPStatus.BAD_REQUEST)
+            return
+            
+        loop.broker.unlock_profit(amount, reason)
+        self._send_json({"success": True, "message": f"Unlocked {amount} profit."})
+
+    def _handle_profit_lock(self, params: dict[str, Any]) -> None:
+        from app.live.paper_loop import get_active_loop
+        with self.server._paper_lock:
+            loop = self.server._paper_loop or get_active_loop()
+        if loop is None:
+            self._send_json({"error": "No paper loop is running."}, status=HTTPStatus.CONFLICT)
+            return
+        
+        amount = _decimal_or_none(params.get("amount"))
+        reason = str(params.get("reason") or "Manual Dashboard Lock")
+        if amount is None or amount <= 0:
+            self._send_json({"error": "Invalid amount."}, status=HTTPStatus.BAD_REQUEST)
+            return
+            
+        loop.broker.lock_profit(amount, reason)
+        self._send_json({"success": True, "message": f"Locked {amount} profit."})
+
+    def _handle_override_daily_loss(self) -> None:
+        from app.live.paper_loop import get_active_loop
+        with self.server._paper_lock:
+            loop = self.server._paper_loop or get_active_loop()
+        if loop is None:
+            self._send_json({"error": "No paper loop is running."}, status=HTTPStatus.CONFLICT)
+            return
+            
+        loop.broker.protected_profit_override_enabled = True
+        loop.broker._save_state()
+        self._send_json({"success": True, "message": "Daily loss override enabled."})
+
+    def _handle_clear_daily_loss_override(self) -> None:
+        from app.live.paper_loop import get_active_loop
+        with self.server._paper_lock:
+            loop = self.server._paper_loop or get_active_loop()
+        if loop is None:
+            self._send_json({"error": "No paper loop is running."}, status=HTTPStatus.CONFLICT)
+            return
+
+        loop.broker.protected_profit_override_enabled = False
+        loop.broker._save_state()
+        self._send_json({"success": True, "message": "Daily loss override disabled."})
+
 
     def _send_pairs(self) -> None:
         from pathlib import Path

@@ -132,6 +132,35 @@ class IntrabarPaperLoopTests(unittest.TestCase):
         self.assertEqual(payload["atr_best_price"], "110")
         self.assertEqual(payload["stop_type"], "ATR")
 
+    def test_partial_execution_update_marks_open_position_without_entry(self) -> None:
+        pair = "B-BTC_USDT"
+        self.loop.series = {pair: CandleSeries()}
+        self.loop.series[pair].add(_candle("15m", 0, pair=pair))
+        self.loop.execution_series = {pair: CandleSeries()}
+        self.loop.broker.positions[pair] = PaperPosition(
+            pair=pair,
+            direction=SignalDirection.SHORT,
+            quantity=Decimal("2"),
+            entry_price=Decimal("100"),
+            leverage=Decimal("5"),
+            opened_at_ms=0,
+            updated_at_ms=0,
+            strategy_name="hybrid_meta_v2",
+        )
+
+        partial = replace(
+            _candle("1m", 60_000, Decimal("95"), pair=pair),
+            is_closed=False,
+        )
+
+        self.loop._on_candle(partial, allow_partial_execution=True)
+
+        self.assertEqual(self.loop.candle_count, 0)
+        self.assertEqual(self.loop.broker.mark_price_for(pair), Decimal("95"))
+        payload = self.loop._positions_payload()[0]
+        self.assertEqual(payload["mark_price"], "95")
+        self.assertEqual(payload["unrealized_pnl"], "10")
+
     def test_intrabar_same_candle_live_update_replaces_and_reevaluates(self) -> None:
         pair = "B-BTC_USDT"
         self.loop.series = {pair: CandleSeries()}
@@ -382,6 +411,41 @@ class IntrabarPaperLoopTests(unittest.TestCase):
         self.loop._observe_closed_fill(fill, exit_candle)
 
         self.assertIsNone(self.loop._paper_entry_safety_rejection(signal, exit_candle))
+
+    def test_paper_safety_does_not_let_momentum_bypass_loss_cooldown(self) -> None:
+        pair = "B-BTC_USDT"
+        exit_candle = _candle("1m", 60_000, Decimal("95"), pair=pair)
+        fill = PaperFill(
+            fill_id="f1",
+            order_id="o1",
+            pair=pair,
+            side=PaperOrderSide.SELL,
+            quantity=Decimal("1"),
+            price=Decimal("95"),
+            fee=Decimal("1"),
+            timestamp_ms=exit_candle.close_time_ms,
+            realized_pnl=Decimal("-10"),
+            metadata={"exit_trigger_type": "stop_loss"},
+        )
+        signal = StrategySignal(
+            strategy_name="S", pair=pair, interval="15m",
+            action=SignalAction.ENTER_LONG, direction=SignalDirection.LONG,
+            confidence=Decimal("1"), reason="momentum reentry", timestamp_ms=exit_candle.close_time_ms,
+            entry_price=Decimal("100"), stop_loss=Decimal("95"),
+            metadata={
+                "momentum_ignition": True,
+                "final_score": Decimal("0.40"),
+                "agreement_ratio": Decimal("0.50"),
+                "visual_score": Decimal("0.20"),
+            },
+        )
+
+        self.loop._observe_closed_fill(fill, exit_candle)
+
+        self.assertEqual(
+            self.loop._paper_entry_safety_rejection(signal, exit_candle),
+            "paper_pair_stop_loss_cooldown",
+        )
 
     def test_paper_safety_throttles_risk_after_loss(self) -> None:
         pair = "B-BTC_USDT"

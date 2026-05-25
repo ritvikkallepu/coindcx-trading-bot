@@ -33,6 +33,8 @@ def compute_backtest_metrics(
     final_account: PaperAccountSnapshot,
     equity_curve: list[BacktestEquityPoint],
     trades: list[BacktestTrade],
+    max_daily_loss_hit_count: int = 0,
+    trades_blocked_by_profit_lock_or_daily_loss: int = 0,
 ) -> BacktestMetrics:
     starting_equity = config.starting_equity
     final_equity = final_account.equity
@@ -81,6 +83,13 @@ def compute_backtest_metrics(
         max_drawdown_pct=max_drawdown_pct,
         sharpe_ratio=_sharpe_ratio(equity_curve, config.interval),
         funding_paid=final_account.funding_paid,
+        final_total_equity=final_account.total_equity,
+        final_tradable_equity=final_account.tradable_equity,
+        final_locked_profit=final_account.locked_profit,
+        max_daily_loss_hit_count=max_daily_loss_hit_count,
+        trades_blocked_by_profit_lock_or_daily_loss=trades_blocked_by_profit_lock_or_daily_loss,
+        returns_total_equity_pct=total_return_pct,
+        returns_tradable_equity_pct=_pct(final_account.tradable_equity - starting_equity, starting_equity),
     )
 
 

@@ -264,6 +264,9 @@ class CandleSeries:
             return []
         return self._candles[-count:]
 
+    def copy(self) -> CandleSeries:
+        return CandleSeries(list(self), maxlen=self.maxlen)
+
     def closes(self) -> list[Decimal]:
         return [candle.close for candle in self._candles]
 

@@ -941,6 +941,78 @@ class PaperBrokerTests(unittest.TestCase):
         self.assertEqual(position.stop_loss, Decimal("101.25"))
         self.assertEqual(position.metadata["stop_type"], "profit_lock")
 
+    def test_breakeven_stop_covers_fees_and_stop_slippage_before_moving(self) -> None:
+        broker = PaperBroker(
+            starting_equity=Decimal("1000"),
+            maker_fee_rate=Decimal("0.0002"),
+            taker_fee_rate=Decimal("0.0005"),
+            fee_gst_rate=Decimal("0.18"),
+            stop_slippage_pct=Decimal("0.1"),
+        )
+        signal = _entry_signal(
+            stop_loss=Decimal("95"),
+            take_profit=Decimal("120"),
+            metadata={"atr_dynamic_exits_enabled": True},
+        )
+        broker.execute_decision(_decision(signal), market_price=Decimal("100"), timestamp_ms=0)
+
+        broker.update_dynamic_atr_exits(
+            _candle(low=Decimal("100.05"), high=Decimal("100.12"), close=Decimal("100.10")),
+            atr=Decimal("1"),
+            stop_multiple=Decimal("0"),
+            take_profit_multiple=Decimal("0"),
+            stop_enabled=False,
+            take_profit_enabled=False,
+            breakeven_enabled=True,
+            breakeven_activation_r=Decimal("0.01"),
+        )
+        position = broker.positions["B-BTC_USDT"]
+        self.assertEqual(position.stop_loss, Decimal("95"))
+
+        broker.update_dynamic_atr_exits(
+            _candle(low=Decimal("100.8"), high=Decimal("101.2"), close=Decimal("101")),
+            atr=Decimal("1"),
+            stop_multiple=Decimal("0"),
+            take_profit_multiple=Decimal("0"),
+            stop_enabled=False,
+            take_profit_enabled=False,
+            breakeven_enabled=True,
+            breakeven_activation_r=Decimal("0.01"),
+        )
+        position = broker.positions["B-BTC_USDT"]
+        self.assertEqual(position.stop_loss, Decimal("100.182600"))
+        self.assertEqual(position.metadata["stop_type"], "breakeven")
+
+    def test_breakeven_stop_cost_buffer_is_symmetric_for_shorts(self) -> None:
+        broker = PaperBroker(
+            starting_equity=Decimal("1000"),
+            maker_fee_rate=Decimal("0.0002"),
+            taker_fee_rate=Decimal("0.0005"),
+            fee_gst_rate=Decimal("0.18"),
+            stop_slippage_pct=Decimal("0.1"),
+        )
+        signal = _entry_signal(
+            direction=SignalDirection.SHORT,
+            stop_loss=Decimal("105"),
+            take_profit=Decimal("80"),
+            metadata={"atr_dynamic_exits_enabled": True},
+        )
+        broker.execute_decision(_decision(signal), market_price=Decimal("100"), timestamp_ms=0)
+
+        broker.update_dynamic_atr_exits(
+            _candle(low=Decimal("98.8"), high=Decimal("99.2"), close=Decimal("99")),
+            atr=Decimal("1"),
+            stop_multiple=Decimal("0"),
+            take_profit_multiple=Decimal("0"),
+            stop_enabled=False,
+            take_profit_enabled=False,
+            breakeven_enabled=True,
+            breakeven_activation_r=Decimal("0.01"),
+        )
+        position = broker.positions["B-BTC_USDT"]
+        self.assertEqual(position.stop_loss, Decimal("99.817400"))
+        self.assertEqual(position.metadata["stop_type"], "breakeven")
+
     def test_adaptive_stop_management_reacts_to_live_atr(self) -> None:
         def metadata_for_atr(atr: Decimal) -> dict[str, object]:
             broker = PaperBroker(starting_equity=Decimal("1000"))

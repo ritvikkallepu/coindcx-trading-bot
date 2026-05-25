@@ -12,7 +12,7 @@ from app.config import Settings, RiskSettings
 from app.data.candle_builder import OHLCVCandle, CandleSeries
 from app.live.paper_loop import PaperTradingLoop, get_live_state
 from app.strategies.base import SignalAction, SignalDirection, StrategySignal
-from app.broker.models import PaperOrderSide
+from app.broker.models import PaperFill, PaperOrderSide, PaperPosition
 from app.broker.paper import PaperBroker
 from app.live.summary_logger import PaperTradingSummaryLogger
 
@@ -177,7 +177,55 @@ class PaperClosedTradesFixTests(unittest.TestCase):
         with open(self.csv_path, mode="r", newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["exit_reason"], "stop_loss")
+        self.assertEqual(rows[0]["exit_reason"], "breakeven_stop")
+
+    def test_trade_mapping_uses_position_leverage_for_margin_and_roe(self) -> None:
+        pair = "B-BTC_USDT"
+        position = PaperPosition(
+            pair=pair,
+            direction=SignalDirection.LONG,
+            quantity=Decimal("10"),
+            entry_price=Decimal("100"),
+            leverage=Decimal("5"),
+            opened_at_ms=0,
+            updated_at_ms=0,
+            strategy_name="S1",
+            stop_loss=Decimal("95"),
+            take_profit=Decimal("120"),
+            metadata={
+                "account_equity_at_entry": Decimal("100000"),
+                "entry_fee": Decimal("0"),
+            },
+        )
+        fill = PaperFill(
+            fill_id="f1",
+            order_id="o1",
+            pair=pair,
+            side=PaperOrderSide.SELL,
+            quantity=Decimal("10"),
+            price=Decimal("110"),
+            fee=Decimal("0"),
+            timestamp_ms=900000,
+            realized_pnl=Decimal("9800"),
+            metadata={
+                "exit_trigger_type": "stop_loss",
+                "stop_type": "atr",
+                "atr_stop_enabled": True,
+            },
+        )
+
+        trade = self.loop._map_fill_to_trade_dict(
+            fill,
+            _candle("15m", 900000, Decimal("110"), pair=pair),
+            position=position,
+        )
+
+        self.assertEqual(trade["leverage"], "5")
+        self.assertEqual(Decimal(trade["position_notional"]), Decimal("98000"))
+        self.assertEqual(Decimal(trade["margin_used"]), Decimal("19600"))
+        self.assertEqual(Decimal(trade["required_margin"]), Decimal("19600"))
+        self.assertEqual(Decimal(trade["net_roe_pct"]), Decimal("50.0"))
+        self.assertEqual(trade["exit_reason"], "dynamic_atr_stop")
 
     def test_paper_state_serialization_handles_enums(self) -> None:
         # Manually create a position and save it

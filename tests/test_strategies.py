@@ -213,8 +213,7 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signal.strategy_name, "broken")
 
     def test_hybrid_meta_emits_bullish_entry_when_scores_align(self) -> None:
-        closes = [
-            Decimal("100"),
+        closes = [Decimal("100")] * 60 + [
             Decimal("99"),
             Decimal("98"),
             Decimal("97"),
@@ -248,6 +247,37 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signal.strategy_name, "hybrid_meta")
         self.assertIn("final_score", signal.metadata)
         self.assertEqual(signal.metadata["open_interest"]["source"], "not_configured")
+
+    def test_hybrid_meta_profile_risk_multiplier_reduces_default_entry_risk(self) -> None:
+        series = _series_from_closes([Decimal("100")] * 30)
+        strategy = HybridMetaStrategy()
+
+        signal = strategy._entry_signal(
+            context=_context(
+                series,
+                features={
+                    "backtest_config": {
+                        "profile_risk_multiplier": Decimal("0.75"),
+                    },
+                },
+            ),
+            direction=SignalDirection.LONG,
+            final_score=Decimal("0.40"),
+            atr=Decimal("1"),
+            reason="unit profile entry",
+            metadata={
+                "final_score": Decimal("0.40"),
+                "ema_score": Decimal("0.20"),
+                "bb_score": Decimal("0.10"),
+                "visual_score": Decimal("0.10"),
+                "open_interest_score": Decimal("0"),
+                "visual": {"volume_ratio": Decimal("1")},
+            },
+        )
+
+        self.assertEqual(signal.metadata["risk_multiplier"], Decimal("0.75"))
+        self.assertTrue(signal.metadata["risk_multiplier_applies"])
+        self.assertEqual(signal.metadata["profile_risk_multiplier"], Decimal("0.75"))
 
     def test_hybrid_meta_visual_screen_blocks_low_volume(self) -> None:
         closes = [
@@ -355,9 +385,32 @@ class StrategyTests(unittest.TestCase):
         )
         self.assertEqual(active_weight_with_oi, Decimal("1.00"))
 
+    def test_hybrid_meta_v2_excludes_bollinger_from_hybrid_score(self) -> None:
+        strategy = HybridMetaV2Strategy()
+
+        bearish_bb_score, active_weight = strategy._combined_score(
+            ema_score=Decimal("0.6"),
+            bb_score=Decimal("-1.0"),
+            visual_score=Decimal("0.6"),
+            oi_score=Decimal("0"),
+            oi_active=False,
+            include_bb=strategy.hybrid_bollinger_score_enabled,
+        )
+        bullish_bb_score, _ = strategy._combined_score(
+            ema_score=Decimal("0.6"),
+            bb_score=Decimal("1.0"),
+            visual_score=Decimal("0.6"),
+            oi_score=Decimal("0"),
+            oi_active=False,
+            include_bb=strategy.hybrid_bollinger_score_enabled,
+        )
+
+        self.assertFalse(strategy.hybrid_bollinger_score_enabled)
+        self.assertEqual(active_weight, Decimal("0.70"))
+        self.assertEqual(bearish_bb_score, bullish_bb_score)
+
     def test_hybrid_meta_requires_open_interest_for_new_short(self) -> None:
-        closes = [
-            Decimal("100"),
+        closes = [Decimal("100")] * 60 + [
             Decimal("101"),
             Decimal("102"),
             Decimal("103"),
@@ -487,7 +540,7 @@ class StrategyTests(unittest.TestCase):
 
     def test_hybrid_meta_v2_allows_reduced_risk_intrabar_reversal_breakout(self) -> None:
         parent_series = _series_from_closes(
-            [Decimal("100")] * 30,
+            [Decimal("100")] * 60,
             interval="5m",
             base_volume=Decimal("100"),
         )
@@ -606,7 +659,7 @@ class StrategyTests(unittest.TestCase):
 
     def test_hybrid_meta_v2_allows_reduced_risk_momentum_ignition(self) -> None:
         parent_series = _series_from_closes(
-            [Decimal("100")] * 30,
+            [Decimal("100")] * 60,
             interval="5m",
             base_volume=Decimal("100"),
         )

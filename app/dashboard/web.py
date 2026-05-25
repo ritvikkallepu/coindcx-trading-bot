@@ -162,6 +162,115 @@ DASHBOARD_HTML = r"""<!doctype html>
       opacity: 0.68;
     }
 
+    .secondaryButton {
+      min-height: 34px;
+      background: #252a33;
+      color: var(--text);
+      border: 1px solid var(--line);
+      font-size: 12px;
+      padding: 8px 10px;
+    }
+
+    .watchlistActions {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      margin-top: -4px;
+    }
+
+    .watchPairCard {
+      display: grid;
+      gap: 5px;
+      padding: 9px 10px;
+      background: #151821;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-left: 3px solid var(--cyan);
+      border-radius: 6px;
+      min-width: 0;
+      cursor: pointer;
+    }
+
+    .watchPairCard.active {
+      background: #18212a;
+      border-color: rgba(86, 182, 194, 0.45);
+      box-shadow: inset 0 0 0 1px rgba(86, 182, 194, 0.18);
+    }
+
+    .watchPairTop {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 26px;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .watchPairName {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 800;
+      color: var(--text);
+    }
+
+    .watchPairStatus {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .watchPairProfile {
+      color: var(--cyan);
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    .watchPairRemove {
+      width: 26px;
+      min-height: 26px;
+      height: 26px;
+      padding: 0;
+      border-radius: 6px;
+      background: #20242d;
+      color: var(--muted);
+      border: 1px solid var(--line);
+      line-height: 1;
+      font-size: 16px;
+    }
+
+    .watchPairRemove:hover {
+      color: var(--red);
+      border-color: rgba(240, 109, 109, 0.55);
+    }
+
+    .coinTabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 10px 0 12px;
+    }
+
+    .coinTab {
+      min-height: 32px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #151820;
+      color: var(--muted);
+      padding: 7px 11px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .coinTab.active {
+      color: var(--cyan);
+      border-color: rgba(86, 182, 194, 0.55);
+      background: #18212a;
+    }
+
     .runButtonTop {
       width: 100%;
       margin-bottom: 16px;
@@ -463,6 +572,60 @@ DASHBOARD_HTML = r"""<!doctype html>
       z-index: 1;
     }
 
+    #pmTradeTable table {
+      min-width: 1240px;
+    }
+    #pmTradeTable td {
+      vertical-align: top;
+    }
+    .tradeMain {
+      font-weight: 800;
+      color: var(--text);
+      line-height: 1.25;
+    }
+    .tradeSub {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+      margin-top: 3px;
+    }
+    .tradeSub.warn {
+      color: var(--amber);
+    }
+    .tradeSub.good {
+      color: var(--green);
+    }
+    .tradeSub.bad {
+      color: var(--red);
+    }
+    .tradeStack {
+      display: grid;
+      gap: 3px;
+    }
+    .exitPill {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 800;
+      background: #111318;
+      color: var(--muted);
+    }
+    .exitPill.good {
+      color: var(--green);
+      border-color: rgba(64, 201, 138, 0.45);
+    }
+    .exitPill.warn {
+      color: var(--amber);
+      border-color: rgba(230, 180, 80, 0.45);
+    }
+    .exitPill.bad {
+      color: var(--red);
+      border-color: rgba(240, 109, 109, 0.45);
+    }
+
     tr:last-child td {
       border-bottom: 0;
     }
@@ -480,9 +643,113 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     .paperMetricsGrid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 12px;
       margin-bottom: 12px;
+    }
+    #paperMain {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    #paperMain > * {
+      order: 20;
+    }
+    #paperMain > .topbar {
+      order: 1;
+      margin-bottom: 0;
+    }
+    .paperPrimaryMetrics {
+      order: 2;
+      margin-bottom: 0;
+    }
+    .paperTradeDesk {
+      order: 3;
+      margin-bottom: 0 !important;
+    }
+    .paperWatchlistPanel {
+      order: 4;
+      margin-bottom: 0 !important;
+    }
+    .paperTradesPanel {
+      order: 5;
+      margin-top: 0 !important;
+    }
+    .paperDrawer {
+      order: 7;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .paperDrawer summary {
+      min-height: 46px;
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      cursor: pointer;
+      list-style: none;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 800;
+      user-select: none;
+    }
+    .paperDrawer summary::-webkit-details-marker {
+      display: none;
+    }
+    .paperDrawer summary::after {
+      content: "+";
+      display: grid;
+      place-items: center;
+      width: 24px;
+      height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--muted);
+      background: #111318;
+      flex: 0 0 auto;
+    }
+    .paperDrawer[open] summary::after {
+      content: "-";
+    }
+    .drawerSummaryMeta {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-left: auto;
+      min-width: 0;
+    }
+    .paperDrawerBody {
+      padding: 0 14px 14px;
+    }
+    .paperAccountDrawer {
+      order: 7;
+    }
+    .paperAccountStatsDrawer {
+      order: 6;
+    }
+    .paperCandleDrawer {
+      order: 8;
+    }
+    .paperDiagnosticsDrawer {
+      order: 9;
+    }
+    .paperStatsDrawer {
+      order: 10;
+    }
+    #pWatchlistWarning {
+      order: 4;
+      margin-bottom: 0 !important;
+    }
+    #pmError {
+      order: 99;
+    }
+    .paperSecondaryMetrics {
+      margin: 0;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     }
     .metricCard {
       background: var(--panel);
@@ -507,6 +774,70 @@ DASHBOARD_HTML = r"""<!doctype html>
       color: var(--muted);
     }
 
+    .capitalPanel {
+      background: #151820;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+    }
+    .capitalTop {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .capitalTitle {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      min-width: 0;
+    }
+    .capitalTitle h3 {
+      font-size: 14px;
+      line-height: 1.2;
+    }
+    .capitalControls {
+      display: grid;
+      grid-template-columns: minmax(150px, 0.8fr) minmax(220px, 1.35fr) auto;
+      gap: 10px;
+      align-items: end;
+    }
+    .capitalControls input {
+      min-height: 34px;
+      border-radius: 6px;
+      background: #111318;
+    }
+    .capitalActions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .capitalBtn {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 12px;
+      background: #1d2129;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .capitalBtn.lock {
+      border-color: rgba(230, 180, 80, 0.45);
+      color: var(--amber);
+    }
+    .capitalBtn.unlock {
+      border-color: rgba(86, 182, 194, 0.45);
+      color: var(--cyan);
+    }
+    .capitalBtn.danger {
+      border-color: rgba(240, 109, 109, 0.45);
+      color: var(--red);
+      background: rgba(240, 109, 109, 0.08);
+    }
     .posCard {
       background: #111318;
       border: 1px solid var(--line);
@@ -577,6 +908,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: repeat(6, 1fr);
       gap: 12px;
+      margin: 0;
     }
 
     /* Searchable Select */
@@ -645,8 +977,10 @@ DASHBOARD_HTML = r"""<!doctype html>
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
       .metrics { grid-template-columns: repeat(3, 1fr); }
       .strategyBand { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .paperMetricsGrid { grid-template-columns: repeat(2, 1fr); }
+      .paperMetricsGrid { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
       .pmStatsBar { grid-template-columns: repeat(3, 1fr); }
+      .capitalControls { grid-template-columns: minmax(150px, 0.8fr) minmax(220px, 1fr); }
+      .capitalActions { grid-column: 1 / -1; justify-content: flex-end; }
       .grid { grid-template-columns: 1fr; }
     }
 
@@ -656,10 +990,17 @@ DASHBOARD_HTML = r"""<!doctype html>
       .chips { justify-content: flex-start; }
       .metrics { grid-template-columns: 1fr 1fr; }
       .strategyBand { grid-template-columns: 1fr; }
-      .paperMetricsGrid { grid-template-columns: 1fr; }
+      .paperMetricsGrid { grid-template-columns: 1fr 1fr; }
       .pmStatsBar { grid-template-columns: 1fr; }
+      .capitalTop { align-items: flex-start; }
+      .capitalControls { grid-template-columns: 1fr; }
+      .capitalActions { justify-content: stretch; }
+      .capitalActions .capitalBtn { flex: 1; }
       .split { grid-template-columns: 1fr; }
       .metric strong { font-size: 18px; }
+      .drawerSummaryMeta {
+        display: none;
+      }
     }
   </style>
 </head>
@@ -847,7 +1188,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             </div>
           </label>
           <div class="selectionInfo">
-            <span>Selected next: <strong id="p_selectedPairDisplay">-</strong></span>
+            <span>Editing pair: <strong id="p_selectedPairDisplay">-</strong></span>
             <span class="subtle">Internal: <span id="p_selectedPairValue">-</span></span>
             <span class="subtle" id="runningPairLabelWrap" style="display:none; margin-top:4px; border-top:1px solid rgba(255,255,255,0.05); padding-top:4px">
               Currently Running: <strong id="runningPairLabel" style="color:var(--cyan)">-</strong>
@@ -869,9 +1210,9 @@ DASHBOARD_HTML = r"""<!doctype html>
             </label>
             <label>Strategy
               <select id="p_strategy">
+                <option value="hybrid_meta_v2" selected>Weighted Hybrid V2</option>
                 <option value="adaptive_hybrid">Adaptive Hybrid</option>
                 <option value="bb_dynamic_grid">Futures Grid</option>
-                <option value="hybrid_meta_v2">Weighted Hybrid V2</option>
                 <option value="hybrid_meta">Weighted Hybrid</option>
                 <option value="ema_rsi_trend">EMA-RSI Trend</option>
                 <option value="bb_volume_reversion">BB Reversion</option>
@@ -882,9 +1223,12 @@ DASHBOARD_HTML = r"""<!doctype html>
           <label>Watchlist (comma-separated)
             <input id="p_watchlist" type="text" placeholder="B-BTC_USDT, B-SOL_USDT..." />
           </label>
+          <div class="watchlistActions">
+            <button class="secondaryButton" type="button" onclick="applyRunningPaperSettings({quiet:false})">Apply Changes While Running</button>
+          </div>
 
-          <label>Starting Equity (INR)
-            <input id="p_starting_equity" type="number" min="10" step="100" value="10000" />
+          <label>Starting Equity (new session)
+            <input id="p_starting_equity" type="number" min="10" step="100" value="100000" />
           </label>
 
           <!-- Leverage + Risk -->
@@ -932,10 +1276,16 @@ DASHBOARD_HTML = r"""<!doctype html>
             </label>
           </div>
 
-          <label class="checkLine">
-            <span>Profit Lock</span>
-            <input id="p_profit_lock" type="checkbox" checked />
-          </label>
+          <div class="split">
+            <label class="checkLine">
+              <span>Profit Lock</span>
+              <input id="p_profit_lock" type="checkbox" checked />
+            </label>
+            <label class="checkLine">
+              <span>BB Trail</span>
+              <input id="p_bb_trail" type="checkbox" />
+            </label>
+          </div>
 
           <!-- Intrabar Group -->
           <div class="intrabarGroup">
@@ -1061,7 +1411,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <div id="conflictMessage" class="message warn" style="display:none"></div>
             <div class="signalGrid" id="scoreGrid" style="margin-top:12px; display:none">
               <div class="signalCell"><span>EMA Score</span><strong id="vEMA">-</strong></div>
-              <div class="signalCell"><span>BB Score</span><strong id="vBB">-</strong></div>
+              <div class="signalCell"><span id="vBBLabel">BB Gate</span><strong id="vBB">-</strong></div>
               <div class="signalCell"><span>Visual</span><strong id="vVis">-</strong></div>
               <div class="signalCell"><span>OI Score</span><strong id="vOI">-</strong></div>
             </div>
@@ -1117,26 +1467,27 @@ DASHBOARD_HTML = r"""<!doctype html>
               <thead>
                 <tr>
                   <th>#</th>
-                  <th>Entry Time</th>
-                  <th>Exit Time</th>
-                  <th>Duration</th>
+                  <th>Time</th>
                   <th>Pair</th>
-                  <th>Strategy</th>
-                  <th>Side</th>
+                  <th>Dir</th>
                   <th>Entry</th>
                   <th>Exit</th>
-                  <th>Stop Loss</th>
-                  <th>Take Profit</th>
+                  <th>Qty</th>
+                  <th>Notional</th>
+                  <th>Margin Used</th>
+                  <th>Risk Used</th>
+                  <th>Gross PnL</th>
+                  <th>Fees</th>
                   <th>Net PnL</th>
-                  <th>ATR Profile</th>
-                  <th>MFE %</th>
-                  <th>MAE %</th>
-                  <th>R</th>
+                  <th>Net % Notional</th>
+                  <th>Net ROE %</th>
+                  <th>Account Impact %</th>
+                  <th>Hold</th>
                   <th>Reason</th>
                 </tr>
               </thead>
               <tbody id="tradeRows">
-                <tr><td colspan="17">No trades loaded</td></tr>
+                <tr><td colspan="18">No trades loaded</td></tr>
               </tbody>
             </table>
           </div>
@@ -1157,12 +1508,16 @@ DASHBOARD_HTML = r"""<!doctype html>
         </div>
       </div>
 
-        <!-- Live equity metrics row -->
-        <section class="paperMetricsGrid">
+        <section class="paperMetricsGrid paperPrimaryMetrics">
           <div class="metricCard">
-            <div class="metricLabel">Live Equity</div>
-            <div class="metricValue" id="pmEquity">-</div>
-            <div class="metricSub" id="pmEquityBase">-</div>
+            <div class="metricLabel">Total Equity</div>
+            <div class="metricValue" id="pmTotalEquity">-</div>
+            <div class="metricSub" id="pmInitialEquity">Init: -</div>
+          </div>
+          <div class="metricCard">
+            <div class="metricLabel">Tradable Equity</div>
+            <div class="metricValue" id="pmTradableEquity">-</div>
+            <div class="metricSub" id="pmTradableBase">Base: -</div>
           </div>
           <div class="metricCard">
             <div class="metricLabel">Return</div>
@@ -1175,36 +1530,90 @@ DASHBOARD_HTML = r"""<!doctype html>
             <div class="metricSub" id="pmPnlSub">-</div>
           </div>
           <div class="metricCard">
-            <div class="metricLabel">Fees Paid</div>
-            <div class="metricValue" id="pmFees">-</div>
-            <div class="metricSub" id="pmFeesSub">-</div>
+            <div class="metricLabel">Daily Loss Used</div>
+            <div class="metricValue" id="pmDailyLossUsed">-</div>
+            <div class="metricSub" id="pmDailyLossLimit">Limit: -</div>
           </div>
           <div class="metricCard">
-            <div class="metricLabel">Win Rate</div>
-            <div class="metricValue" id="pmWinRate">-</div>
-            <div class="metricSub" id="pmWinRateSub">-</div>
-          </div>
-          <div class="metricCard">
-            <div class="metricLabel">Max Drawdown</div>
-            <div class="metricValue" id="pmMaxDD">-</div>
-          </div>
-          <div class="metricCard">
-            <div class="metricLabel">Candles</div>
-            <div class="metricValue" id="pmCandles">-</div>
-            <div class="metricSub" id="pmCandlesSub">-</div>
-          </div>
-          <div class="metricCard">
-            <div class="metricLabel">Total Fills</div>
+            <div class="metricLabel">Fills</div>
             <div class="metricValue" id="pmFillCount">-</div>
             <div class="metricSub" id="pmFillSub">-</div>
           </div>
         </section>
 
+        <details class="paperDrawer paperAccountStatsDrawer">
+          <summary>
+            <span>Account Details</span>
+            <span class="drawerSummaryMeta"><span class="chip" id="pmFillCountChip">0 fills</span></span>
+          </summary>
+          <div class="paperDrawerBody">
+            <section class="paperMetricsGrid paperSecondaryMetrics">
+              <div class="metricCard">
+                <div class="metricLabel">Locked Profit</div>
+                <div class="metricValue" id="pmLockedProfit" style="color:var(--amber)">-</div>
+                <div class="metricSub" id="pmUnlockedProfit">Unlocked: -</div>
+              </div>
+              <div class="metricCard">
+                <div class="metricLabel">Win Rate</div>
+                <div class="metricValue" id="pmWinRate">-</div>
+                <div class="metricSub" id="pmWinRateSub">-</div>
+              </div>
+              <div class="metricCard">
+                <div class="metricLabel">Max Drawdown</div>
+                <div class="metricValue" id="pmMaxDD">-</div>
+                <div class="metricSub" id="pmPeakEquity">Peak: -</div>
+              </div>
+              <div class="metricCard">
+                <div class="metricLabel">Fees Paid</div>
+                <div class="metricValue" id="pmFees">-</div>
+                <div class="metricSub" id="pmFeesSub">-</div>
+              </div>
+              <div class="metricCard">
+                <div class="metricLabel">Candles</div>
+                <div class="metricValue" id="pmCandles">-</div>
+                <div class="metricSub" id="pmCandlesSub">-</div>
+              </div>
+              <div class="metricCard">
+                <div class="metricLabel">Status</div>
+                <div class="metricValue" id="pmProfitLockStatus" style="font-size:16px">-</div>
+                <div class="metricSub" id="pmOverrideStatus">Override: Off</div>
+              </div>
+            </section>
+          </div>
+        </details>
+
+        <details class="paperDrawer paperAccountDrawer">
+          <summary>
+            <span>Capital Controls</span>
+            <span class="drawerSummaryMeta"><span class="chip bad" id="pmOverrideSummary">Override: Off</span></span>
+          </summary>
+          <div class="paperDrawerBody">
+          <div class="capitalTop">
+            <div class="capitalTitle">
+              <span class="subtle">Manual adjustments</span>
+            </div>
+            <button id="pmOverrideBtn" class="capitalBtn danger" onclick="handleOverrideDailyLoss()">Override Daily Loss</button>
+          </div>
+          <div class="capitalControls">
+            <label>Amount
+              <input id="pmCapitalAmount" type="number" step="100" placeholder="1000" />
+            </label>
+            <label>Reason
+              <input id="pmCapitalReason" type="text" placeholder="Manual adjustment" />
+            </label>
+            <div class="capitalActions">
+              <button class="capitalBtn lock" onclick="handleProfitLockAction('lock')">Lock Profit</button>
+              <button class="capitalBtn unlock" onclick="handleProfitLockAction('unlock')">Unlock</button>
+            </div>
+          </div>
+          </div>
+        </details>
+
         <!-- Watchlist Status -->
         <div id="pWatchlistWarning" class="alert warning" style="display: none; margin-bottom: 12px; padding: 10px; border-radius: 4px; background: rgba(245, 158, 11, 0.1); border: 1px solid var(--amber); color: var(--amber); font-size: 0.85rem;">
           Only selected pair is being scanned. Add pairs to Watchlist to scan multiple coins.
         </div>
-        <section class="panel" style="margin-bottom:12px">
+        <section class="panel paperWatchlistPanel" style="margin-bottom:12px">
           <div class="panelHeader">
             <h3>Active Watchlist & Scanning</h3>
             <span class="chip" id="pScannedCount">0 pairs</span>
@@ -1217,8 +1626,52 @@ DASHBOARD_HTML = r"""<!doctype html>
           </div>
         </section>
 
-        <!-- Live equity chart -->
-        <section class="grid" style="margin-bottom:12px">
+        <details class="paperDrawer paperDiagnosticsDrawer">
+          <summary>
+            <span>Entry Type Performance</span>
+            <span class="drawerSummaryMeta"><span class="chip" id="pmEntryTotalCount">0 entries</span></span>
+          </summary>
+          <div class="paperDrawerBody">
+          <div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin-top:8px;" id="pmEntryCountsDisplay">
+            <!-- Counts will appear here -->
+          </div>
+          </div>
+        </details>
+
+        <details class="paperDrawer paperDiagnosticsDrawer">
+          <summary>
+            <span>Recent Entry Diagnostics</span>
+            <span class="drawerSummaryMeta"><span class="chip">Last 20 attempts</span></span>
+          </summary>
+          <div class="paperDrawerBody">
+          <div class="tableWrap" style="max-height: 320px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Pair</th>
+                  <th>Profile</th>
+                  <th>Side</th>
+                  <th>Type</th>
+                  <th>Decision</th>
+                  <th>Reason</th>
+                  <th>Vol Ratio</th>
+                  <th>Body %</th>
+                  <th>Ext ATR</th>
+                  <th>BB Pos</th>
+                  <th>BB Gate</th>
+                  <th>Age</th>
+                </tr>
+              </thead>
+              <tbody id="pmDiagRows">
+                <tr><td colspan="13">No diagnostic data yet</td></tr>
+              </tbody>
+            </table>
+          </div>
+          </div>
+        </details>
+
+        <section class="grid paperTradeDesk" style="margin-bottom:12px">
           <div class="panel">
             <div class="panelHeader">
               <h3>Live Equity Curve</h3>
@@ -1242,29 +1695,38 @@ DASHBOARD_HTML = r"""<!doctype html>
           </div>
         </section>
 
-        <section class="panel" style="margin-bottom:12px">
-          <div class="panelHeader">
-            <h3>Live Candle Curve</h3>
-            <div style="display:flex; gap:8px; align-items:center">
+        <details class="paperDrawer paperCandleDrawer">
+          <summary>
+            <span>Live Candle Curve</span>
+            <span class="drawerSummaryMeta">
               <span class="chip" id="pmCandlePairChip">-</span>
               <span class="chip" id="pmCandleCountChip">0 candles</span>
-            </div>
-          </div>
+            </span>
+          </summary>
+          <div class="paperDrawerBody">
+          <div id="pmCandleTabs" class="coinTabs"></div>
           <div class="chart" id="paperCandleChart"></div>
-        </section>
+          </div>
+        </details>
 
-        <!-- Session statistics -->
-        <section id="pmStatsBar" class="pmStatsBar" style="display:none; margin-bottom:12px">
-          <div class="miniStat"><span>Avg Win</span><strong id="pmAvgWin">-</strong></div>
-          <div class="miniStat"><span>Avg Loss</span><strong id="pmAvgLoss">-</strong></div>
-          <div class="miniStat"><span>Best Trade</span><strong id="pmBestTrade">-</strong></div>
-          <div class="miniStat"><span>Worst Trade</span><strong id="pmWorstTrade">-</strong></div>
-          <div class="miniStat"><span>Profit Factor</span><strong id="pmProfitFactor">-</strong></div>
-          <div class="miniStat"><span>Total Closed</span><strong id="pmTotalClosed">-</strong></div>
-        </section>
+        <details class="paperDrawer paperStatsDrawer">
+          <summary>
+            <span>Session Stats</span>
+            <span class="drawerSummaryMeta"><span class="chip" id="pmTotalClosedChip">0 closed</span></span>
+          </summary>
+          <div class="paperDrawerBody">
+            <section id="pmStatsBar" class="pmStatsBar" style="display:none; margin-bottom:12px">
+              <div class="miniStat"><span>Avg Win</span><strong id="pmAvgWin">-</strong></div>
+              <div class="miniStat"><span>Avg Loss</span><strong id="pmAvgLoss">-</strong></div>
+              <div class="miniStat"><span>Best Trade</span><strong id="pmBestTrade">-</strong></div>
+              <div class="miniStat"><span>Worst Trade</span><strong id="pmWorstTrade">-</strong></div>
+              <div class="miniStat"><span>Profit Factor</span><strong id="pmProfitFactor">-</strong></div>
+              <div class="miniStat"><span>Total Closed</span><strong id="pmTotalClosed">-</strong></div>
+            </section>
+          </div>
+        </details>
 
-        <!-- Recent closed trades -->
-        <section class="panel" style="margin-top:0">
+        <section class="panel paperTradesPanel" style="margin-top:0">
           <div class="panelHeader">
             <h3>Closed Trades</h3>
             <div style="display:flex; gap:8px; align-items:center">
@@ -1283,19 +1745,22 @@ DASHBOARD_HTML = r"""<!doctype html>
                   <th>Dir</th>
                   <th>Entry</th>
                   <th>Exit</th>
-                  <th>Qty / Unit</th>
+                  <th>Qty</th>
                   <th>Notional</th>
+                  <th>Margin Used</th>
                   <th>Risk Used</th>
                   <th>Gross PnL</th>
                   <th>Fees</th>
                   <th>Net PnL</th>
-                  <th>Net %</th>
+                  <th>Net % of Notional</th>
+                  <th>Net ROE %</th>
+                  <th>Account Impact %</th>
                   <th>Hold</th>
                   <th>Reason</th>
                 </tr>
               </thead>
               <tbody id="pmTradeRows">
-                <tr><td colspan="15">No closed trades yet</td></tr>
+                <tr><td colspan="18">No closed trades yet</td></tr>
               </tbody>
             </table>
           </div>
@@ -1365,6 +1830,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       fExpTot: document.getElementById('fExpTot'),
       fUnexpTot: document.getElementById('fUnexpTot'),
       vEMA: document.getElementById('vEMA'),
+      vBBLabel: document.getElementById('vBBLabel'),
       vBB: document.getElementById('vBB'),
       vVis: document.getElementById('vVis'),
       vOI: document.getElementById('vOI'),
@@ -1395,6 +1861,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       p_trailing_stop: document.getElementById('p_trailing_stop'),
       p_atr_exits: document.getElementById('p_atr_exits'),
       p_profit_lock: document.getElementById('p_profit_lock'),
+      p_bb_trail: document.getElementById('p_bb_trail'),
       p_intrabar: document.getElementById('p_intrabar'),
       p_exec_interval: document.getElementById('p_exec_interval'),
       p_max_entries: document.getElementById('p_max_entries'),
@@ -1408,6 +1875,21 @@ DASHBOARD_HTML = r"""<!doctype html>
       const parsed = Number(value);
       return Number.isFinite(parsed) ? parsed : 0;
     };
+    const hasValue = value => (
+      value !== undefined &&
+      value !== null &&
+      String(value).trim() !== '' &&
+      String(value).trim().toLowerCase() !== 'none'
+    );
+    const firstValue = (...values) => values.find(hasValue);
+    const maybeNum = value => hasValue(value) ? num(value) : null;
+    const fmtMoney = value => hasValue(value) ? money(value) : '-';
+    const fmtPct = value => hasValue(value) ? `${num(value).toFixed(2)}%` : '-';
+    const approxSame = (a, b) => (
+      Number.isFinite(a) &&
+      Number.isFinite(b) &&
+      Math.abs(a - b) <= Math.max(0.000001, Math.abs(b) * 0.0000001)
+    );
     const boolVal = value => {
       if (value === true) return true;
       if (value === false || value === null || value === undefined) return false;
@@ -1512,6 +1994,204 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     let allPairs = []; // Stores {pair: 'B-BTC_USDT', display_name: 'BTC-USDT'}
+    let activePaperSettingsPair = '';
+    let paperDefaultSettings = null;
+    let paperPairSettings = {};
+    let dirtyPaperPairSettings = new Set();
+    let applyingPaperPairSettings = false;
+    let paperIsRunning = false;
+    let paperSettingsAutoApplyTimer = null;
+    let paperSettingsAutoApplyInFlight = false;
+    let paperDailyLossOverrideActive = false;
+    const paperPairFieldMap = {
+      strategy: ['p_strategy', 'value'],
+      leverage: ['p_leverage', 'value'],
+      risk_pct: ['p_risk_pct', 'value'],
+      max_daily_loss_pct: ['p_max_daily_loss_pct', 'value'],
+      max_open_positions: ['p_max_open', 'value'],
+      max_margin_usage_pct: ['p_max_margin', 'value'],
+      allow_multi_pair_positions: ['p_multi_pair', 'checked'],
+      allow_same_pair_pyramiding: ['p_pyramiding', 'checked'],
+      trailing_stop_enabled: ['p_trailing_stop', 'checked'],
+      atr_dynamic_exits_enabled: ['p_atr_exits', 'checked'],
+      profit_lock_enabled: ['p_profit_lock', 'checked'],
+      bb_trail_enabled: ['p_bb_trail', 'checked'],
+      max_entries_per_parent_candle: ['p_max_entries', 'value']
+    };
+
+    function paperSettingsFromControls() {
+      const settings = {};
+      for (const [key, [id, prop]] of Object.entries(paperPairFieldMap)) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        settings[key] = prop === 'checked' ? Boolean(el.checked) : el.value;
+      }
+      return settings;
+    }
+
+    function clonePaperSettings(settings) {
+      return {...(settings || {})};
+    }
+
+    function applyPaperSettingsToControls(settings) {
+      applyingPaperPairSettings = true;
+      try {
+        for (const [key, [id, prop]] of Object.entries(paperPairFieldMap)) {
+          if (!(key in settings)) continue;
+          const el = document.getElementById(id);
+          if (!el) continue;
+          if (prop === 'checked') el.checked = Boolean(settings[key]);
+          else el.value = settings[key];
+        }
+        document.getElementById('p_intrabar_settings').style.display = ids.p_intrabar.checked ? 'flex' : 'none';
+        refreshExecIntervalOptions();
+      } finally {
+        applyingPaperPairSettings = false;
+      }
+    }
+
+    function paperPairDisplay(pair) {
+      const normalized = normalizePair(pair);
+      const match = allPairs.find(p => p.pair === normalized);
+      return match ? match.display_name : normalized;
+    }
+
+    function setPaperPairSelection(pair) {
+      const normalized = normalizePair(pair);
+      if (!normalized) return;
+      const display = paperPairDisplay(normalized);
+      ids.p_pairSearchInput.value = display;
+      document.getElementById('p_selectedPairDisplay').textContent = display;
+      document.getElementById('p_selectedPairValue').textContent = normalized;
+      selectPaperSettingsPair(normalized);
+    }
+
+    function saveActivePaperPairSettings() {
+      if (applyingPaperPairSettings || !activePaperSettingsPair) return;
+      paperPairSettings[activePaperSettingsPair] = paperSettingsFromControls();
+    }
+
+    function ensurePaperPairSettings(pair) {
+      const normalized = normalizePair(pair);
+      if (!normalized) return {};
+      if (!paperDefaultSettings) {
+        paperDefaultSettings = paperSettingsFromControls();
+      }
+      if (!paperPairSettings[normalized]) {
+        paperPairSettings[normalized] = clonePaperSettings(paperDefaultSettings);
+      }
+      return paperPairSettings[normalized];
+    }
+
+    function selectPaperSettingsPair(pair) {
+      const normalized = normalizePair(pair);
+      if (!normalized) return;
+      if (activePaperSettingsPair && activePaperSettingsPair !== normalized) {
+        saveActivePaperPairSettings();
+      }
+      activePaperSettingsPair = normalized;
+      applyPaperSettingsToControls(ensurePaperPairSettings(normalized));
+    }
+
+    function watchlistPairsFromInput() {
+      return parsePaperWatchlistInput().map(normalizePair).filter(Boolean);
+    }
+
+    function pairOverridesForPairs(pairs) {
+      saveActivePaperPairSettings();
+      const overrides = {};
+      for (const pair of pairs.map(normalizePair).filter(Boolean)) {
+        overrides[pair] = clonePaperSettings(ensurePaperPairSettings(pair));
+      }
+      return overrides;
+    }
+
+    function paperRuntimePairs() {
+      const watchlistPairs = watchlistPairsFromInput();
+      if (watchlistPairs.length) return watchlistPairs;
+      const selected = getSelectedPair('p_');
+      return selected ? [selected] : [];
+    }
+
+    function paperRuntimePayload() {
+      const pairs = paperRuntimePairs().map(normalizePair).filter(Boolean);
+      return {
+        pairs,
+        interval: document.getElementById('p_interval').value,
+        strategy_interval: document.getElementById('p_interval').value,
+        execution_interval: document.getElementById('p_exec_interval').value,
+        paper_intrabar_enabled: document.getElementById('p_intrabar').checked,
+        use_partial_parent_candle: document.getElementById('p_partial_htf').checked,
+        max_entries_per_parent_candle: document.getElementById('p_max_entries').value,
+        leverage: document.getElementById('p_leverage').value,
+        pair_overrides: pairOverridesForPairs(pairs),
+      };
+    }
+
+    function schedulePaperSettingsAutoApply() {
+      if (!paperIsRunning) return;
+      if (paperSettingsAutoApplyTimer) clearTimeout(paperSettingsAutoApplyTimer);
+      paperSettingsAutoApplyTimer = setTimeout(() => {
+        applyRunningPaperSettings({quiet: true});
+      }, 700);
+    }
+
+    async function applyRunningPaperSettings({quiet = false} = {}) {
+      if (!paperIsRunning || paperSettingsAutoApplyInFlight) return;
+      const payload = paperRuntimePayload();
+      if (!payload.pairs.length) return;
+      paperSettingsAutoApplyInFlight = true;
+      try {
+        await fetchJson('/api/paper-settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        markPaperPairsSynced(payload.pairs);
+        if (!quiet) {
+          document.getElementById('paperMessage').textContent = 'Running paper settings updated.';
+          document.getElementById('paperMessage').className = 'message good';
+        }
+      } catch(e) {
+        document.getElementById('paperMessage').textContent = e.message;
+        document.getElementById('paperMessage').className = 'message error';
+      } finally {
+        paperSettingsAutoApplyInFlight = false;
+      }
+    }
+
+    function mergePaperPairOverrides(overrides) {
+      if (!overrides || typeof overrides !== 'object') return;
+      for (const [pair, settings] of Object.entries(overrides)) {
+        const normalized = normalizePair(pair);
+        if (!normalized || !settings || typeof settings !== 'object') continue;
+        if (!paperPairSettings[normalized] || !dirtyPaperPairSettings.has(normalized)) {
+          paperPairSettings[normalized] = {
+            ...clonePaperSettings(paperPairSettings[normalized]),
+            ...clonePaperSettings(settings)
+          };
+          if (normalized === activePaperSettingsPair && !dirtyPaperPairSettings.has(normalized)) {
+            applyPaperSettingsToControls(paperPairSettings[normalized]);
+          }
+        }
+      }
+    }
+
+    function markPaperPairsSynced(pairs) {
+      (pairs || []).map(normalizePair).filter(Boolean).forEach(pair => {
+        dirtyPaperPairSettings.delete(pair);
+      });
+    }
+
+    function handlePaperControlEdited() {
+      if (applyingPaperPairSettings) return;
+      const pair = getSelectedPair('p_') || activePaperSettingsPair;
+      if (!pair) return;
+      activePaperSettingsPair = normalizePair(pair);
+      saveActivePaperPairSettings();
+      dirtyPaperPairSettings.add(activePaperSettingsPair);
+      schedulePaperSettingsAutoApply();
+    }
 
     function setupSearchableDropdown(inputId, listId, displayId, valueId) {
       const input = document.getElementById(inputId);
@@ -1555,6 +2235,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         display.textContent = disp;
         valEl.textContent = pair;
         list.classList.remove('open');
+        if (valueId === 'p_selectedPairValue') {
+          selectPaperSettingsPair(pair);
+        }
       });
 
       document.addEventListener('click', (e) => {
@@ -1578,12 +2261,12 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     function getSelectedPair(prefix = '') {
       // If we have a value in the internal label, use it
-      const valEl = document.getElementById(prefix ? prefix + '_selectedPairValue' : 'selectedPairValue');
+      const valEl = document.getElementById(prefix ? prefix + 'selectedPairValue' : 'selectedPairValue');
       if (valEl && valEl.textContent !== '-') return valEl.textContent;
       
       // Fallback to normalizing whatever is in the search input
       const input = document.getElementById(prefix ? prefix + 'pairSearchInput' : 'pairSearchInput');
-      return normalizePair(input.value);
+      return input ? normalizePair(input.value) : '';
     }
 
     function normalizePair(val) {
@@ -1665,8 +2348,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       
       // Initialize Paper sidebar fields
       if (ids.p_interval) ids.p_interval.value = defaults.interval || '15m';
-      if (ids.p_strategy) ids.p_strategy.value = defaults.strategy || 'adaptive_hybrid';
-      if (ids.p_starting_equity) ids.p_starting_equity.value = defaults.equity || '10000';
+      if (ids.p_strategy) ids.p_strategy.value = defaults.strategy || 'hybrid_meta_v2';
+      if (ids.p_starting_equity) ids.p_starting_equity.value = defaults.equity || '100000';
       if (ids.p_leverage) ids.p_leverage.value = defaults.leverage || '5';
       if (ids.p_risk_pct) ids.p_risk_pct.value = initialConfig.risk_per_trade_pct || '1';
       if (ids.p_max_daily_loss_pct) ids.p_max_daily_loss_pct.value = initialConfig.max_daily_loss_pct || '3';
@@ -1674,6 +2357,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       ids.p_trailing_stop.checked = Boolean(initialConfig.trailing_stop_enabled);
       ids.p_atr_exits.checked = Boolean(defaults.atr_dynamic_exits_enabled);
       ids.p_profit_lock.checked = true;
+      ids.p_bb_trail.checked = Boolean(initialConfig.bb_trail_enabled);
       ids.p_intrabar.checked = Boolean(defaults.paper_intrabar_enabled);
       if (ids.p_exec_interval) ids.p_exec_interval.value = defaults.execution_interval || '1m';
       if (ids.p_max_entries) ids.p_max_entries.value = defaults.max_reentries_per_candle || '1';
@@ -1681,6 +2365,11 @@ DASHBOARD_HTML = r"""<!doctype html>
       
       document.getElementById('p_intrabar_settings').style.display = ids.p_intrabar.checked ? 'flex' : 'none';
       refreshExecIntervalOptions();
+      paperDefaultSettings = paperSettingsFromControls();
+      activePaperSettingsPair = getSelectedPair('p_');
+      if (activePaperSettingsPair) {
+        paperPairSettings[activePaperSettingsPair] = {...paperDefaultSettings};
+      }
 
       refreshFeeRatePreview();
       ids.trailing_stop_enabled.checked = Boolean(initialConfig.trailing_stop_enabled);
@@ -1765,6 +2454,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       ids.qDetail.textContent = '-';
       ids.qLabel.style.color = 'var(--amber)';
       ids.vEMA.textContent = '-';
+      ids.vBBLabel.textContent = 'BB Gate';
       ids.vBB.textContent = '-';
       ids.vVis.textContent = '-';
       ids.vOI.textContent = '-';
@@ -1924,11 +2614,21 @@ DASHBOARD_HTML = r"""<!doctype html>
       if (meta && meta.ema_score !== undefined) {
         ids.scoreGrid.style.display = 'grid';
         ids.vEMA.textContent = num(meta.ema_score).toFixed(2);
-        ids.vBB.textContent = num(meta.bb_score).toFixed(2);
+        if (meta.bb_score_used_in_hybrid === false) {
+          ids.vBBLabel.textContent = 'BB Gate';
+          if (meta.bb_entry_gate_enabled) {
+            ids.vBB.textContent = meta.bb_entry_gate_passed ? 'Pass' : 'Block';
+          } else {
+            ids.vBB.textContent = 'Off';
+          }
+        } else {
+          ids.vBBLabel.textContent = 'BB Score';
+          ids.vBB.textContent = num(meta.bb_score).toFixed(2);
+        }
         ids.vVis.textContent = num(meta.visual_score).toFixed(2);
         ids.vOI.textContent = num(meta.open_interest_score).toFixed(2);
 
-        if (meta.ema_opposed_direction) {
+        if (meta.bb_score_used_in_hybrid !== false && meta.ema_opposed_direction) {
           ids.conflictMessage.style.display = 'block';
           ids.conflictMessage.textContent = 'Conflict: BB score opposed EMA direction in the last trade.';
         } else {
@@ -2083,30 +2783,41 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     function renderTrades(trades) {
       if (!trades.length) {
-        ids.tradeRows.innerHTML = '<tr><td colspan="15">No closed trades</td></tr>';
+        ids.tradeRows.innerHTML = '<tr><td colspan="18">No trades loaded</td></tr>';
         return;
       }
       ids.tradeRows.innerHTML = trades.map(trade => {
         const pnl = num(trade.net_pnl);
+        const gross = num(trade.gross_pnl);
+        const fees = num(trade.fees);
         const cls = pnl >= 0 ? 'good' : 'bad';
         const meta = trade.metadata || {};
+        
+        const entryNotional = num(trade.entry_notional || 0);
+        const marginUsed = num(trade.margin_used || 0);
+        
+        const netPctNotional = num(trade.net_pct_of_notional || 0).toFixed(2) + '%';
+        const netRoePct = num(trade.net_roe_pct || 0).toFixed(2) + '%';
+        const accountImpactPct = num(trade.account_impact_pct || 0).toFixed(2) + '%';
+
         return `<tr>
           <td>${escapeHtml(trade.trade_number || '')}</td>
           <td>${escapeHtml(trade.entry_time || formatMs(trade.entry_time_ms))}</td>
-          <td>${escapeHtml(trade.exit_time || formatMs(trade.exit_time_ms))}</td>
-          <td>${escapeHtml(trade.duration || durationMs(num(trade.exit_time_ms) - num(trade.entry_time_ms)))}</td>
           <td>${escapeHtml(trade.pair)}</td>
-          <td>${escapeHtml(trade.strategy_name)}</td>
           <td>${escapeHtml(trade.direction)}</td>
           <td>${compact(trade.entry_price)}</td>
           <td>${compact(trade.exit_price)}</td>
-          <td>${compact(meta.initial_stop_loss || meta.atr_stop_loss)}</td>
-          <td>${compact(meta.take_profit || meta.atr_take_profit)}</td>
-          <td><span class="chip ${cls}">${money(trade.net_pnl)}</span></td>
-          <td>${escapeHtml(meta.atr_profile || '-')}</td>
-          <td>${compact(meta.mfe_pct)}</td>
-          <td>${compact(meta.mae_pct)}</td>
-          <td>${compact(meta.r_multiple)}</td>
+          <td>${compact(trade.quantity)}</td>
+          <td>${money(entryNotional)}</td>
+          <td>${money(marginUsed)}</td>
+          <td>${num(meta.risk_percent_used || 0).toFixed(2)}%</td>
+          <td>${money(gross)}</td>
+          <td>${money(fees)}</td>
+          <td><span class="chip ${cls}">${money(pnl)}</span></td>
+          <td style="color:${pnl>=0?'var(--green)':'var(--red)'}">${netPctNotional}</td>
+          <td style="color:${pnl>=0?'var(--green)':'var(--red)'}">${netRoePct}</td>
+          <td style="color:${pnl>=0?'var(--green)':'var(--red)'}">${accountImpactPct}</td>
+          <td>${escapeHtml(trade.duration || durationMs(num(trade.exit_time_ms) - num(trade.entry_time_ms)))}</td>
           <td>${escapeHtml(trade.exit_reason)}</td>
         </tr>`;
       }).join('');
@@ -2252,10 +2963,27 @@ DASHBOARD_HTML = r"""<!doctype html>
       const chart = document.getElementById('paperCandleChart');
       const pairChip = document.getElementById('pmCandlePairChip');
       const countChip = document.getElementById('pmCandleCountChip');
+      const tabs = document.getElementById('pmCandleTabs');
       const data = typeof payload === 'string' ? safeParseJson(payload, {}) : (payload || {});
-      const candles = Array.isArray(data.candles) ? data.candles : [];
+      const pairMap = data.pairs && typeof data.pairs === 'object' ? data.pairs : {};
+      const pairKeys = Object.keys(pairMap);
+      if (!window.pmActiveChartPair || (pairKeys.length && !pairMap[window.pmActiveChartPair])) {
+        window.pmActiveChartPair = data.pair || pairKeys[0] || '';
+      }
+      const selected = (window.pmActiveChartPair && pairMap[window.pmActiveChartPair])
+        ? pairMap[window.pmActiveChartPair]
+        : data;
+      const candles = Array.isArray(selected.candles) ? selected.candles : [];
 
-      if (pairChip) pairChip.textContent = data.pair ? `${data.pair} ${data.interval || ''}` : '-';
+      if (tabs) {
+        tabs.innerHTML = pairKeys.map(pair => {
+          const active = pair === (selected.pair || window.pmActiveChartPair);
+          const count = pairMap[pair] && Array.isArray(pairMap[pair].candles) ? pairMap[pair].candles.length : 0;
+          return `<button type="button" class="coinTab ${active ? 'active' : ''}" onclick='selectPaperCandleTab(${JSON.stringify(pair)})'>${escapeHtml(pair)} <span class="subtle">${count}</span></button>`;
+        }).join('');
+      }
+
+      if (pairChip) pairChip.textContent = selected.pair ? `${selected.pair} ${selected.interval || ''}` : '-';
       if (countChip) countChip.textContent = `${candles.length} candles`;
       if (!candles.length) {
         chart.innerHTML = '<div style="height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px">Waiting for live candles...</div>';
@@ -2315,6 +3043,87 @@ DASHBOARD_HTML = r"""<!doctype html>
       </svg>`;
     }
 
+    function selectPaperCandleTab(pair) {
+      window.pmActiveChartPair = pair;
+      setPaperPairSelection(pair);
+      if (window.pmLastCandlePayload) {
+        renderPaperCandleChart(window.pmLastCandlePayload);
+      }
+    }
+
+    function formatLeverage(value) {
+      if (!Number.isFinite(value) || value <= 0) return '-';
+      const digits = value >= 10 ? 1 : 2;
+      return `${value.toFixed(digits).replace(/\.?0+$/, '')}x`;
+    }
+
+    function paperExitInfo(reason, pnl) {
+      const raw = String(reason || '').trim();
+      const normalized = raw.toLowerCase().replace(/\s+/g, '_');
+      const won = pnl > 0;
+      const map = {
+        dynamic_atr_stop: ['ATR Stop', won ? 'good' : 'warn'],
+        dynamic_atr_stop_gapped: ['ATR Gap Stop', won ? 'good' : 'warn'],
+        trailing_stop: ['Trailing Stop', won ? 'good' : 'warn'],
+        trailing_stop_gapped: ['Trailing Gap Stop', won ? 'good' : 'warn'],
+        profit_lock_stop: ['Profit Lock', won ? 'good' : 'warn'],
+        profit_lock_stop_gapped: ['Profit Lock Gap', won ? 'good' : 'warn'],
+        breakeven_stop: ['Breakeven', won ? 'good' : 'warn'],
+        breakeven_stop_gapped: ['Breakeven Gap', won ? 'good' : 'warn'],
+        take_profit: ['Take Profit', 'good'],
+        dynamic_atr_take_profit: ['ATR Take Profit', 'good'],
+        stop_loss: ['Hard Stop', 'bad'],
+        hard_stop_loss: ['Hard Stop', 'bad'],
+        signal: ['Signal Exit', won ? 'good' : 'warn'],
+      };
+      const found = map[normalized];
+      if (found) return { label: found[0], cls: found[1], raw };
+      if (normalized.includes('atr')) return { label: 'ATR Stop', cls: won ? 'good' : 'warn', raw };
+      if (normalized.includes('profit_lock')) return { label: 'Profit Lock', cls: won ? 'good' : 'warn', raw };
+      if (normalized.includes('breakeven')) return { label: 'Breakeven', cls: won ? 'good' : 'warn', raw };
+      if (normalized.includes('trailing')) return { label: 'Trailing Stop', cls: won ? 'good' : 'warn', raw };
+      if (normalized.includes('stop')) return { label: 'Hard Stop', cls: won ? 'warn' : 'bad', raw };
+      return { label: raw || 'Exit', cls: won ? 'good' : 'warn', raw };
+    }
+
+    function paperTradeAmounts(t) {
+      const entryNotional = Math.abs(num(firstValue(
+        t.entry_notional,
+        t.position_notional,
+        t.notional_margin,
+        t.notional,
+        0
+      )));
+      const exitNotional = Math.abs(num(firstValue(t.exit_notional, entryNotional || 0)));
+      const requiredMargin = maybeNum(t.required_margin);
+      let marginUsed = maybeNum(t.margin_used);
+      let leverage = maybeNum(t.leverage);
+
+      if (requiredMargin !== null && requiredMargin > 0) {
+        const marginLooksLikeNotional = (
+          marginUsed !== null &&
+          entryNotional > 0 &&
+          approxSame(marginUsed, entryNotional) &&
+          requiredMargin < entryNotional
+        );
+        if (marginUsed === null || marginUsed <= 0 || marginLooksLikeNotional) {
+          marginUsed = requiredMargin;
+        }
+      }
+      if (
+        entryNotional > 0 &&
+        marginUsed !== null &&
+        marginUsed > 0 &&
+        (leverage === null || leverage <= 0 || (approxSame(leverage, 1) && !approxSame(marginUsed, entryNotional)))
+      ) {
+        leverage = entryNotional / marginUsed;
+      }
+      if ((marginUsed === null || marginUsed <= 0) && entryNotional > 0 && leverage !== null && leverage > 0) {
+        marginUsed = entryNotional / leverage;
+      }
+      return { entryNotional, exitNotional, marginUsed, leverage };
+    }
+
     function renderPaperTrades(trades) {
       const rows = trades || [];
       const tbody = document.getElementById('pmTradeRows');
@@ -2324,7 +3133,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       countChip.textContent = `${rows.length} trades`;
 
       if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="15">No closed trades yet - open positions will appear here when they close</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="18">No closed trades yet - open positions will appear here when they close</td></tr>';
         winChip.textContent = '-';
         winChip.className = 'chip';
         return;
@@ -2340,9 +3149,6 @@ DASHBOARD_HTML = r"""<!doctype html>
         const side = escapeHtml(t.direction || t.side || '');
         const qtyUnit = t.quantity_unit || 'contracts';
         const qty = `${compact(t.position_size || t.quantity || 0)} ${escapeHtml(qtyUnit)}`;
-        const notional = num(t.position_notional || t.notional_margin || 0);
-        const currency = escapeHtml(t.notional_currency || 'INR');
-        const legacy = String(t.legacy_currency_math || '').toLowerCase() === 'true';
         const totalFees = num(t.total_fees || t.fees || t.fee || 0);
         const riskUsed = t.risk_percent_used !== undefined && t.risk_percent_used !== ''
           ? `${num(t.risk_percent_used).toFixed(2)}%`
@@ -2350,7 +3156,20 @@ DASHBOARD_HTML = r"""<!doctype html>
         const reason = escapeHtml(t.exit_reason || t.reason || '');
         const time = escapeHtml(t.timestamp || t.exit_time || '-');
         const hold = t.hold_duration_candles !== undefined ? `${t.hold_duration_candles}c` : '-';
-        const netPct = t.net_pnl_pct !== undefined ? `${num(t.net_pnl_pct).toFixed(2)}%` : '-';
+        const { entryNotional, marginUsed } = paperTradeAmounts(t);
+        
+        const netPctValue = maybeNum(t.net_pnl_pct);
+        const netPctNotional = netPctValue !== null
+          ? `${netPctValue.toFixed(2)}%`
+          : (entryNotional > 0 ? `${(pnl / entryNotional * 100).toFixed(2)}%` : '-');
+        
+        const netRoeValue = maybeNum(t.net_roe_pct);
+        const netRoePct = netRoeValue !== null
+          ? `${netRoeValue.toFixed(2)}%`
+          : (marginUsed && marginUsed > 0 ? `${(pnl / marginUsed * 100).toFixed(2)}%` : '-');
+        
+        const accountImpactValue = maybeNum(t.account_impact_pct);
+        const accountImpactPct = accountImpactValue !== null ? `${accountImpactValue.toFixed(2)}%` : '-';
 
         return `<tr>
           <td>${rows.length - i}</td>
@@ -2360,12 +3179,15 @@ DASHBOARD_HTML = r"""<!doctype html>
           <td>${compact(t.entry_price)}</td>
           <td>${compact(t.exit_price)}</td>
           <td>${qty}</td>
-          <td>${money(notional)} <small style="color:${legacy ? 'var(--warn)' : 'var(--muted)'}">${currency}${legacy ? ' legacy' : ''}</small></td>
+          <td>${money(entryNotional)}</td>
+          <td>${marginUsed !== null ? money(marginUsed) : '-'}</td>
           <td>${riskUsed}</td>
           <td>${money(gross)}</td>
           <td>${money(totalFees)}</td>
           <td><span class="chip ${isWin?'good':'bad'}">${money(pnl)}</span></td>
-          <td style="color:${isWin?'var(--green)':'var(--red)'}">${netPct}</td>
+          <td style="color:${isWin?'var(--green)':'var(--red)'}">${netPctNotional}</td>
+          <td style="color:${isWin?'var(--green)':'var(--red)'}">${netRoePct}</td>
+          <td style="color:${isWin?'var(--green)':'var(--red)'}">${accountImpactPct}</td>
           <td>${hold}</td>
           <td>${reason}</td>
         </tr>`;
@@ -2405,6 +3227,22 @@ DASHBOARD_HTML = r"""<!doctype html>
           ['ATR Best', priceOrDash(p.atr_best_price)],
           ['Stop Type', p.stop_type ? String(p.stop_type) : '-']
         ];
+        if (boolVal(p.bb_trail_enabled)) {
+          const partialPct = p.bb_trail_partial_close_pct !== undefined && String(p.bb_trail_partial_close_pct) !== ''
+            ? Math.round(num(p.bb_trail_partial_close_pct) * 100)
+            : 60;
+          const tpMode = boolVal(p.tp_is_partial_close)
+            ? `Partial (${partialPct}%) + Trail`
+            : 'Trail only';
+          auditItems.push(
+            ['BB Stage', p.bb_trail_stage ? `Stage ${escapeHtml(String(p.bb_trail_stage))}` : '-'],
+            ['BB Mid', priceOrDash(p.bb_mid)],
+            ['BB Buffer', priceOrDash(p.bb_buffer_atr)],
+            ['BB Entry Pos', priceOrDash(p.bb_entry_band_position)],
+            ['BB Entry Gate', boolVal(p.bb_entry_gate_passed) ? 'Passed' : '-'],
+            ['TP Mode', tpMode]
+          );
+        }
 
         const footerItems = [
           p.strategy,
@@ -2424,6 +3262,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <div class="posGrid">
               <div><span>Qty (${escapeHtml(p.quantity_unit || 'contracts')})</span><strong>${compact(p.quantity)}</strong></div>
               <div><span>Entry</span><strong>${compact(p.entry_price)}</strong></div>
+              <div><span>Mark</span><strong>${compact(p.mark_price || p.entry_price)}</strong></div>
               <div><span>Notional (${escapeHtml(p.notional_currency || 'INR')})</span><strong>${money(notional)}</strong></div>
               <div><span>Risk Used</span><strong>${riskUsed}</strong></div>
             </div>
@@ -2451,6 +3290,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 
       if (!num(stats.closed_trades)) {
         bar.style.display = 'none';
+        const totalClosedChip = document.getElementById('pmTotalClosedChip');
+        if (totalClosedChip) totalClosedChip.textContent = '0 closed';
         return;
       }
       bar.style.display = 'grid';
@@ -2484,6 +3325,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       }
 
       document.getElementById('pmTotalClosed').textContent = compact(stats.closed_trades);
+      const totalClosedChip = document.getElementById('pmTotalClosedChip');
+      if (totalClosedChip) totalClosedChip.textContent = `${compact(stats.closed_trades)} closed`;
     }
 
     async function refreshPaperStatus() {
@@ -2494,6 +3337,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         ]);
 
         const running = data.running;
+        paperIsRunning = Boolean(running);
         const trades = tradesData.trades || [];
         const tradeSummary = tradesData.summary || paperTradeSummaryFromRows(trades);
         const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
@@ -2527,13 +3371,44 @@ DASHBOARD_HTML = r"""<!doctype html>
         const grossClosedPnl = num(tradeSummary.gross_pnl);
         const fees = num(data.fees_paid);
 
-        // Update Row 1
-        set('pmEquity', money(displayEquity));
-        set('pmEquityBase', `Initial: ${money(startEq)}`);
-        
+        // Update Row 1: Equity and Returns
+        const initialEquity = num(data.initial_equity) > 0 ? num(data.initial_equity) : startEq;
+        set('pmTotalEquity', money(data.total_equity || displayEquity));
+        set('pmInitialEquity', `Initial: ${money(initialEquity)}`);
+
+        set('pmTradableEquity', money(data.tradable_equity || displayEquity));
+        set('pmTradableBase', `Base: ${money(data.tradable_base || startEq)}`);
+
+        set('pmLockedProfit', money(data.locked_profit || 0));
+        set('pmUnlockedProfit', `Unlocked: ${money(data.unlocked_profit || 0)}`);
+
+        const dailyLossUsed = num(data.daily_drawdown || 0);
+        const dailyLossLimit = initialEquity * (num(document.getElementById('p_max_daily_loss_pct').value) / 100);
+        set('pmDailyLossUsed', money(dailyLossUsed));
+        set('pmDailyLossLimit', `Limit: ${money(dailyLossLimit)}`);
+        col('pmDailyLossUsed', dailyLossUsed < dailyLossLimit * 0.8);
+
+        set('pmProfitLockStatus', boolVal(data.profit_lock_enabled) ? 'Active' : 'Disabled');
+        paperDailyLossOverrideActive = boolVal(data.protected_profit_override_enabled);
+        set('pmOverrideStatus', paperDailyLossOverrideActive ? 'OVERRIDE ON' : 'Override: Off');
+        const ovrEl = document.getElementById('pmOverrideStatus');
+        if (ovrEl) ovrEl.style.color = paperDailyLossOverrideActive ? 'var(--red)' : 'var(--muted)';
+        const ovrSummary = document.getElementById('pmOverrideSummary');
+        if (ovrSummary) {
+          ovrSummary.textContent = paperDailyLossOverrideActive ? 'Override On' : 'Override Off';
+          ovrSummary.className = `chip ${paperDailyLossOverrideActive ? 'bad' : ''}`;
+        }
+
+        const pmOvrBtn = document.getElementById('pmOverrideBtn');
+        if (pmOvrBtn) {
+          pmOvrBtn.disabled = !running;
+          pmOvrBtn.textContent = paperDailyLossOverrideActive
+            ? 'Disable Daily Loss Override'
+            : 'Override Daily Loss';
+        }
+
         set('pmReturn', returnPct.toFixed(2) + '%');
         col('pmReturn', returnPct >= 0);
-        
         const absSign = returnAbs >= 0 ? '+' : '';
         set('pmReturnAbs', absSign + money(Math.abs(returnAbs)) + (returnAbs < 0 ? ' loss' : ' gain'));
         col('pmReturnAbs', returnAbs >= 0);
@@ -2599,6 +3474,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           set('pmPeakLabel', 'Peak: ' + money(peak));
           renderPaperEquityChart(window.pmEquityHistory);
         }
+        window.pmLastCandlePayload = data.candles_json;
         renderPaperCandleChart(data.candles_json);
 
         set('pmCandles', data.candle_count);
@@ -2672,6 +3548,18 @@ DASHBOARD_HTML = r"""<!doctype html>
         // Update Watchlist UI
         const watchlist = data.watchlist || [];
         const scanned = data.scanned_pairs || {};
+        const pairProfiles = data.pair_profiles || {};
+        mergePaperPairOverrides(data.pair_overrides || {});
+        const pWatchlistInput = document.getElementById('p_watchlist');
+        if (
+          pWatchlistInput
+          && running
+          && watchlist.length
+          && document.activeElement !== pWatchlistInput
+          && !dirtyPaperPairSettings.size
+        ) {
+          pWatchlistInput.value = watchlist.join(', ');
+        }
         const pWatchlistDisplay = document.getElementById('pWatchlistDisplay');
         const pScannedCount = document.getElementById('pScannedCount');
         const pWatchlistWarning = document.getElementById('pWatchlistWarning');
@@ -2688,10 +3576,69 @@ DASHBOARD_HTML = r"""<!doctype html>
           } else {
             pWatchlistDisplay.innerHTML = watchlist.map(pair => {
               const status = scanned[pair] || 'Initializing...';
-              return `<div style="padding: 8px; background: #1a1d24; border-radius: 4px; border-left: 3px solid var(--cyan);">
-                <div style="font-weight: bold; margin-bottom: 2px;">${escapeHtml(pair)}</div>
-                <div style="font-size: 0.75rem; color: #888;">${escapeHtml(status)}</div>
+              const profile = pairProfiles[pair] || {};
+              const profileLabel = profile.label || '';
+              const active = pair === window.pmActiveChartPair;
+              return `<div class="watchPairCard ${active ? 'active' : ''}" onclick='selectPaperCandleTab(${JSON.stringify(pair)})'>
+                <div class="watchPairTop">
+                  <div class="watchPairName" title="${escapeHtml(pair)}">${escapeHtml(pair)}</div>
+                  <button class="watchPairRemove" type="button" title="Remove ${escapeHtml(pair)} from running watchlist" onclick='event.stopPropagation(); removeFromRunningWatchlist(${JSON.stringify(pair)})'>&times;</button>
+                </div>
+                ${profileLabel ? `<div class="watchPairProfile">${escapeHtml(profileLabel)}</div>` : ''}
+                <div class="watchPairStatus" title="${escapeHtml(status)}">${escapeHtml(status)}</div>
               </div>`;
+            }).join('');
+          }
+        }
+
+        // Entry Type Counts
+        const entryCounts = data.entry_type_counts || {};
+        const pmEntryTotalCount = document.getElementById('pmEntryTotalCount');
+        const pmEntryCountsDisplay = document.getElementById('pmEntryCountsDisplay');
+        if (pmEntryCountsDisplay) {
+          const countKeys = Object.keys(entryCounts).sort();
+          let totalE = 0;
+          pmEntryCountsDisplay.innerHTML = countKeys.map(key => {
+            const count = entryCounts[key];
+            if (['balanced_breakout', 'pullback_continuation', 'confirmed_trend', 'intrabar_reversal_breakout'].includes(key)) {
+                totalE += count;
+            }
+            const label = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+            const color = key.includes('blocked') ? 'var(--red)' : 'var(--cyan)';
+            return `<div class="posAuditItem" style="border-left: 3px solid ${color}">
+              <span>${escapeHtml(label)}</span>
+              <strong>${count}</strong>
+            </div>`;
+          }).join('') || '<p style="color:var(--muted); font-size:12px">No entry data recorded.</p>';
+          if (pmEntryTotalCount) pmEntryTotalCount.textContent = `${totalE} entries`;
+        }
+
+        // Recent Diagnostics
+        const diags = data.recent_diagnostics || [];
+        const pmDiagRows = document.getElementById('pmDiagRows');
+        if (pmDiagRows) {
+          if (!diags.length) {
+            pmDiagRows.innerHTML = '<tr><td colspan="13">No diagnostic data yet</td></tr>';
+          } else {
+            pmDiagRows.innerHTML = diags.slice().reverse().map(d => {
+              const decCls = d.decision === 'entered' ? 'good' : d.decision === 'rejected' ? 'bad' : 'muted';
+              const gate = String(d.bb_gate || '-');
+              const gateCls = gate === 'pass' ? 'good' : gate === 'blocked' ? 'bad' : '';
+              return `<tr>
+                <td>${escapeHtml(d.time)}</td>
+                <td>${escapeHtml(d.pair)}</td>
+                <td><small style="color:var(--cyan)">${escapeHtml(d.profile || '-')}</small></td>
+                <td style="color:${d.side==='long'?'var(--green)':'var(--red)'}">${escapeHtml(d.side)}</td>
+                <td><small>${escapeHtml(d.entry_type)}</small></td>
+                <td><span class="chip ${decCls}">${escapeHtml(d.decision)}</span></td>
+                <td><small style="color:var(--muted)">${escapeHtml(d.reason)}</small></td>
+                <td>${d.volume_ratio}</td>
+                <td>${d.body_ratio}</td>
+                <td>${d.extension_atr}</td>
+                <td>${escapeHtml(d.bb_position || '-')}</td>
+                <td><span class="chip ${gateCls}">${escapeHtml(gate)}</span></td>
+                <td>${d.breakout_age}</td>
+              </tr>`;
             }).join('');
           }
         }
@@ -2701,13 +3648,56 @@ DASHBOARD_HTML = r"""<!doctype html>
       }
     }
 
+    async function handleProfitLockAction(action) {
+      const amount = document.getElementById('pmCapitalAmount').value;
+      const reason = document.getElementById('pmCapitalReason').value;
+      if (!amount) {
+        alert('Please enter an amount.');
+        return;
+      }
+      try {
+        const payload = await fetchJson(`/api/profit-lock/${action}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amount, reason })
+        });
+        document.getElementById('paperMessage').textContent = payload.message;
+        document.getElementById('paperMessage').className = 'message good';
+        refreshPaperStatus();
+      } catch(e) {
+        document.getElementById('paperMessage').textContent = e.message;
+        document.getElementById('paperMessage').className = 'message error';
+      }
+    }
+
+    async function handleOverrideDailyLoss() {
+      const active = paperDailyLossOverrideActive;
+      const prompt = active
+        ? 'Disable the daily loss override and let the loss guard block new trades again?'
+        : 'Are you sure you want to override the daily loss limit? This will allow the bot to continue trading today.';
+      if (!confirm(prompt)) return;
+      const endpoint = active
+        ? '/api/profit-lock/clear-daily-loss-override'
+        : '/api/profit-lock/override-daily-loss';
+      try {
+        const payload = await fetchJson(endpoint, { method: 'POST' });
+        document.getElementById('paperMessage').textContent = payload.message;
+        document.getElementById('paperMessage').className = 'message good';
+        refreshPaperStatus();
+      } catch(e) {
+        document.getElementById('paperMessage').textContent = e.message;
+        document.getElementById('paperMessage').className = 'message error';
+      }
+    }
+
     async function startPaper() {
       const selectedPair = getSelectedPair('p_');
       const watchlistRaw = document.getElementById('p_watchlist').value.trim();
       const pairs = watchlistRaw ? watchlistRaw.split(',').map(s => s.trim()) : [selectedPair];
+      const normalizedPairs = pairs.map(normalizePair).filter(Boolean);
       
       const payload = {
-        pairs,
+        pairs: normalizedPairs,
         interval: document.getElementById('p_interval').value,
         strategy: document.getElementById('p_strategy').value,
         starting_equity: document.getElementById('p_starting_equity').value,
@@ -2721,11 +3711,13 @@ DASHBOARD_HTML = r"""<!doctype html>
         trailing_stop_enabled: document.getElementById('p_trailing_stop').checked,
         atr_dynamic_exits_enabled: document.getElementById('p_atr_exits').checked,
         profit_lock_enabled: document.getElementById('p_profit_lock').checked,
+        bb_trail_enabled: document.getElementById('p_bb_trail').checked,
         paper_intrabar_enabled: document.getElementById('p_intrabar').checked,
         strategy_interval: document.getElementById('p_interval').value,
         execution_interval: document.getElementById('p_exec_interval').value,
         use_partial_parent_candle: document.getElementById('p_partial_htf').checked,
         max_entries_per_parent_candle: document.getElementById('p_max_entries').value,
+        pair_overrides: pairOverridesForPairs(normalizedPairs),
       };
       document.getElementById('startPaperBtn').disabled = true;
       document.getElementById('paperMessage').textContent = 'Starting...';
@@ -2735,6 +3727,8 @@ DASHBOARD_HTML = r"""<!doctype html>
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify(payload)
         });
+        markPaperPairsSynced(normalizedPairs);
+        paperIsRunning = true;
         document.getElementById('stopPaperBtn').disabled = false;
         document.getElementById('paperMessage').textContent = 'Paper loop started. Loading live candles...';
         document.getElementById('paperMessage').className = 'message good';
@@ -2742,6 +3736,57 @@ DASHBOARD_HTML = r"""<!doctype html>
         document.getElementById('startPaperBtn').disabled = false;
         document.getElementById('paperMessage').textContent = e.message;
         document.getElementById('paperMessage').className = 'message error';
+      }
+    }
+
+    function parsePaperWatchlistInput() {
+      const raw = document.getElementById('p_watchlist').value.trim();
+      return raw.split(',').map(s => s.trim()).filter(Boolean);
+    }
+
+    async function applyRunningWatchlist() {
+      const pairs = watchlistPairsFromInput();
+      const message = document.getElementById('paperMessage');
+      if (!pairs.length) {
+        message.textContent = 'Enter at least one pair in the watchlist.';
+        message.className = 'message error';
+        return;
+      }
+      try {
+        const payload = await fetchJson('/api/paper-watchlist', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ pairs, pair_overrides: pairOverridesForPairs(pairs) })
+        });
+        markPaperPairsSynced(pairs);
+        const added = payload.added && payload.added.length ? ` Added: ${payload.added.join(', ')}.` : '';
+        const removed = payload.removed && payload.removed.length ? ` Removed: ${payload.removed.join(', ')}.` : '';
+        message.textContent = `Running watchlist updated.${added}${removed}`;
+        message.className = 'message good';
+        refreshPaperStatus();
+      } catch(e) {
+        message.textContent = e.message;
+        message.className = 'message error';
+      }
+    }
+
+    async function removeFromRunningWatchlist(pair) {
+      const message = document.getElementById('paperMessage');
+      try {
+        const payload = await fetchJson('/api/paper-remove-pair', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ pair })
+        });
+        if (payload.watchlist) {
+          document.getElementById('p_watchlist').value = payload.watchlist.join(', ');
+        }
+        message.textContent = `Removed ${pair} from running watchlist.`;
+        message.className = 'message good';
+        refreshPaperStatus();
+      } catch(e) {
+        message.textContent = e.message;
+        message.className = 'message error';
       }
     }
 
@@ -2773,12 +3818,20 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     async function addCurrentToWatchlist() {
       const pair = getSelectedPair('p_');
+      const normalized = normalizePair(pair);
       try {
-        await fetchJson('/api/paper-add-pair', {
+        const payload = await fetchJson('/api/paper-add-pair', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ pair })
+          body: JSON.stringify({
+            pair: normalized,
+            pair_overrides: pairOverridesForPairs([normalized])
+          })
         });
+        markPaperPairsSynced([normalized]);
+        if (payload.watchlist) {
+          document.getElementById('p_watchlist').value = payload.watchlist.join(', ');
+        }
         document.getElementById('paperMessage').textContent = `Added ${pair} to watchlist.`;
         document.getElementById('paperMessage').className = 'message good';
         refreshPaperStatus();
@@ -2788,10 +3841,27 @@ DASHBOARD_HTML = r"""<!doctype html>
       }
     }
 
-    document.getElementById('p_interval').addEventListener('change', refreshExecIntervalOptions);
+    Object.values(paperPairFieldMap).forEach(([id, prop]) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener(prop === 'checked' ? 'change' : 'input', handlePaperControlEdited);
+      el.addEventListener('change', handlePaperControlEdited);
+    });
+
+    document.getElementById('p_interval').addEventListener('change', () => {
+      refreshExecIntervalOptions();
+      schedulePaperSettingsAutoApply();
+    });
     document.getElementById('p_intrabar').addEventListener('change', (e) => {
         document.getElementById('p_intrabar_settings').style.display = e.target.checked ? 'flex' : 'none';
+        schedulePaperSettingsAutoApply();
     });
+    document.getElementById('p_exec_interval').addEventListener('change', schedulePaperSettingsAutoApply);
+    document.getElementById('p_partial_htf').addEventListener('change', schedulePaperSettingsAutoApply);
+    document.getElementById('p_watchlist').addEventListener('change', schedulePaperSettingsAutoApply);
+    document.getElementById('p_watchlist').addEventListener('blur', schedulePaperSettingsAutoApply);
+    document.getElementById('startPaperBtn').textContent = 'Start';
+    document.getElementById('stopPaperBtn').textContent = 'Stop';
     
     refreshExecIntervalOptions();
 
@@ -2800,6 +3870,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       try {
         await fetchJson('/api/paper-stop', {method: 'POST', 
                         headers: {'Content-Type': 'application/json'}, body: '{}'});
+        paperIsRunning = false;
         document.getElementById('startPaperBtn').disabled = false;
         document.getElementById('paperMessage').textContent = 'Paper loop stopped.';
         document.getElementById('paperMessage').className = 'message warn';
@@ -2837,6 +3908,19 @@ DASHBOARD_HTML = r"""<!doctype html>
     ids.runButton.addEventListener('click', runBacktest);
     ids.strategy.addEventListener('change', refreshStrategyPreview);
     ids.interval.addEventListener('change', refreshStrategyPreview);
+
+    window.handleProfitLockAction = handleProfitLockAction;
+    window.handleOverrideDailyLoss = handleOverrideDailyLoss;
+    window.addCurrentToWatchlist = addCurrentToWatchlist;
+    window.applyRunningWatchlist = applyRunningWatchlist;
+    window.applyRunningPaperSettings = applyRunningPaperSettings;
+    window.removeFromRunningWatchlist = removeFromRunningWatchlist;
+    window.selectPaperCandleTab = selectPaperCandleTab;
+    window.startPaper = startPaper;
+    window.stopPaper = stopPaper;
+    window.resetPaper = resetPaper;
+    window.runBacktest = runBacktest;
+    window.refreshStrategyPreview = refreshStrategyPreview;
     ids.maker_fee_pct.addEventListener('input', refreshFeeRatePreview);
     ids.taker_fee_pct.addEventListener('input', refreshFeeRatePreview);
     ids.fee_gst_pct.addEventListener('input', refreshFeeRatePreview);
@@ -2847,3 +3931,4 @@ DASHBOARD_HTML = r"""<!doctype html>
 </body>
 </html>
 """
+

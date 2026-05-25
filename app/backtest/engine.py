@@ -11,6 +11,7 @@ from app.backtest.models import (
     BacktestEquityPoint,
     BacktestResult,
     BacktestTrade,
+    _decimal_metadata,
 )
 from app.broker.models import PaperExecutionReport, PaperFill, PaperOrder
 from app.broker.paper import PaperBroker
@@ -20,6 +21,7 @@ from app.data.open_interest import OpenInterestFeatureSeries
 from app.execution.engine import PaperExecutionEngine
 from app.risk.limits import daily_loss_limit_amount
 from app.risk.manager import RiskManager
+from app.risk.pair_profiles import apply_pair_profile_to_config
 from app.risk.models import InstrumentMetadata, OpenPosition, RiskDecision
 from app.strategies.base import (
     SignalAction,
@@ -243,6 +245,9 @@ class BacktestEngine:
             account_currency=self.config.margin_currency,
             price_quote_currency=self.config.price_quote_currency,
         )
+        broker.profit_lock_enabled = self.config.profit_locking_enabled
+        broker.auto_lock_profit_pct = self.config.auto_lock_profit_pct
+
         execution = PaperExecutionEngine(broker)
         series = CandleSeries(maxlen=max(len(all_candles), 1))
         reports: list[PaperExecutionReport] = []
@@ -253,6 +258,10 @@ class BacktestEngine:
         daily_net_pnl: dict[str, Decimal] = {}
         daily_start_equity: dict[str, Decimal] = {}
         halted_days: set[str] = set()
+        
+        max_daily_loss_hit_count = 0
+        trades_blocked_by_profit_lock_or_daily_loss = 0
+        
         safety_state = _BacktestSafetyState(
             config=self.config,
             interval_ms=interval_to_ms(self.config.interval),
@@ -262,9 +271,10 @@ class BacktestEngine:
         for candle in all_candles:
             day = _day_key(candle.close_time_ms)
             if day not in daily_start_equity:
-                daily_start_equity[day] = broker.snapshot({self.config.pair: candle.open}).equity
+                daily_start_equity[day] = broker.snapshot({self.config.pair: candle.open}).tradable_base
 
             if pending_decisions:
+                # ... rest of loop ...
                 pending_decisions = _fill_pending_decisions(
                     pending_decisions,
                     execution=execution,
@@ -306,6 +316,7 @@ class BacktestEngine:
                 day_start_equity=daily_start_equity[day],
                 risk_manager=self.risk_manager,
             ):
+                max_daily_loss_hit_count += 1
                 reports.extend(
                     _force_close_open_positions(
                         execution=execution,
@@ -363,27 +374,27 @@ class BacktestEngine:
                 )
                 snapshot = broker.snapshot({self.config.pair: candle.close})
                 risk_equity = _risk_sizing_equity(
-                    snapshot_equity=snapshot.equity,
+                    snapshot=snapshot,
                     config=self.config,
                 )
                 decision = self.risk_manager.evaluate_signal(
                     signal,
                     account_equity=risk_equity,
-                    available_equity=snapshot.equity,
+                    available_equity=snapshot.tradable_equity if self.config.profit_locking_enabled else snapshot.equity,
                     risk_base_mode=_risk_base_mode(self.config),
                     open_positions=_risk_open_positions(broker),
-                    daily_realized_pnl=daily_net_pnl.get(
-                        _day_key(candle.close_time_ms),
-                        Decimal("0"),
-                    ),
-                    daily_loss_limit_equity=daily_start_equity[day],
+                    daily_realized_pnl=-snapshot.daily_loss_from_tradable_base if self.config.profit_locking_enabled else daily_net_pnl.get(_day_key(candle.close_time_ms), Decimal("0")),
+                    daily_loss_limit_equity=snapshot.tradable_base if self.config.profit_locking_enabled else daily_start_equity[day],
                     instrument=self.instrument,
                     requested_leverage=self.config.leverage,
                     quote_to_margin_rate=self.config.quote_to_margin_rate,
                     unit_contract_value=self.config.unit_contract_value,
                     trading_mode="paper",
                     live_trading_enabled=False,
+                    protected_profit_override_enabled=snapshot.protected_profit_override_enabled,
                 )
+                if not decision.approved and ("Daily loss reached" in decision.reason or "profit lock" in decision.reason.lower()):
+                    trades_blocked_by_profit_lock_or_daily_loss += 1
                 decision = _apply_entry_safety_filter(
                     decision,
                     series=series,
@@ -451,7 +462,9 @@ class BacktestEngine:
                     halted_days.add(day)
                     break
 
-            if day not in halted_days and self.config.atr_dynamic_exits_enabled:
+            if day not in halted_days and (
+                self.config.atr_dynamic_exits_enabled or self.config.bb_trail_enabled
+            ):
                 broker.update_dynamic_atr_exits(
                     candle,
                     atr=indicators.atr,
@@ -470,6 +483,15 @@ class BacktestEngine:
                     profit_lock_r=self.config.profit_lock_r,
                     atr_trail_after_r_enabled=self.config.atr_trail_after_r_enabled,
                     atr_trail_activation_r=self.config.atr_trail_activation_r,
+                    bb_band=indicators.bollinger,
+                    bb_trail_enabled=self.config.bb_trail_enabled,
+                    bb_trail_buffer_multiplier=self.config.bb_trail_buffer_multiplier,
+                    bb_trail_activation_r=self.config.bb_trail_activation_r,
+                    bb_trail_stage2_r=self.config.bb_trail_stage2_r,
+                    bb_trail_stage3_r=self.config.bb_trail_stage3_r,
+                    bb_trail_force_close_r=self.config.bb_trail_force_close_r,
+                    bb_trail_partial_close_at_tp=self.config.bb_trail_partial_close_at_tp,
+                    bb_trail_partial_close_pct=self.config.bb_trail_partial_close_pct,
                 )
 
             equity_curve.append(_equity_point(broker, candle))
@@ -509,6 +531,8 @@ class BacktestEngine:
             final_account=final_account,
             equity_curve=equity_curve,
             trades=trades,
+            max_daily_loss_hit_count=max_daily_loss_hit_count,
+            trades_blocked_by_profit_lock_or_daily_loss=trades_blocked_by_profit_lock_or_daily_loss,
         )
         return BacktestResult(
             config=self.config,
@@ -552,6 +576,9 @@ class BacktestEngine:
             account_currency=self.config.margin_currency,
             price_quote_currency=self.config.price_quote_currency,
         )
+        broker.profit_lock_enabled = self.config.profit_locking_enabled
+        broker.auto_lock_profit_pct = self.config.auto_lock_profit_pct
+
         execution = PaperExecutionEngine(broker)
         series = CandleSeries(maxlen=max(len(all_candles), 1))
         reports: list[PaperExecutionReport] = []
@@ -562,6 +589,10 @@ class BacktestEngine:
         daily_net_pnl: dict[str, Decimal] = {}
         daily_start_equity: dict[str, Decimal] = {}
         halted_days: set[str] = set()
+        
+        max_daily_loss_hit_count = 0
+        trades_blocked_by_profit_lock_or_daily_loss = 0
+
         safety_state = _BacktestSafetyState(
             config=self.config,
             interval_ms=interval_to_ms(self.config.interval),
@@ -575,7 +606,7 @@ class BacktestEngine:
             if day not in daily_start_equity:
                 daily_start_equity[day] = broker.snapshot(
                     {self.config.pair: parent_candle.open}
-                ).equity
+                ).tradable_base
 
             parent_reentries = 0
             parent_breakout_entries = 0
@@ -632,6 +663,7 @@ class BacktestEngine:
                     day_start_equity=daily_start_equity[day],
                     risk_manager=self.risk_manager,
                 ):
+                    max_daily_loss_hit_count += 1
                     reports.extend(
                         _force_close_open_positions(
                             execution=execution,
@@ -647,6 +679,7 @@ class BacktestEngine:
                     halted_days.add(day)
                     break
 
+                # Task 1: Check for breakout entries in early children
                 if (
                     day not in halted_days
                     and self.config.intrabar_reversal_breakout_enabled
@@ -656,28 +689,36 @@ class BacktestEngine:
                     and not pending_decisions
                     and not safety_state.active(child.close_time_ms)
                 ):
+                    # Task 11: Parity - strategy needs current child candle as 'latest'
+                    provisional_series = series.copy()
+                    provisional_series.add(child)
+                    
                     indicators = latest_indicator_snapshot(
-                        series,
+                        provisional_series,
                         atr_period=self.config.atr_period,
+                    )
+                    prev_parent = series.latest() # 'series' still only has closed parents
+                    features = _strategy_features(
+                        broker,
+                        self.config.pair,
+                        self.config,
+                        open_interest=self.open_interest_features.latest_at_or_before(
+                            child.close_time_ms
+                        ),
+                        execution_candles=parent_execution_history,
+                        execution_interval=execution_interval,
+                        previous_parent_high=prev_parent.high if prev_parent else None,
+                        previous_parent_low=prev_parent.low if prev_parent else None,
                     )
                     context = StrategyContext(
                         pair=self.config.pair,
                         interval=self.config.interval,
-                        candles=series,
+                        candles=provisional_series,
                         indicators=indicators,
-                        features=_strategy_features(
-                            broker,
-                            self.config.pair,
-                            self.config,
-                            open_interest=self.open_interest_features.latest_at_or_before(
-                                child.close_time_ms
-                            ),
-                            execution_candles=parent_execution_history,
-                            execution_interval=execution_interval,
-                        ),
+                        features=features,
                     )
                     for signal in self.strategy_engine.evaluate(context):
-                        if signal.metadata.get("entry_type") != "intrabar_reversal_breakout":
+                        if signal.metadata.get("entry_type") not in {"intrabar_reversal_breakout", "balanced_breakout", "pullback_continuation"}:
                             continue
                         signal = _apply_exit_overrides(
                             signal,
@@ -688,24 +729,24 @@ class BacktestEngine:
                         decision = self.risk_manager.evaluate_signal(
                             signal,
                             account_equity=_risk_sizing_equity(
-                                snapshot_equity=snapshot.equity,
+                                snapshot=snapshot,
                                 config=self.config,
                             ),
-                            available_equity=snapshot.equity,
+                            available_equity=snapshot.tradable_equity if self.config.profit_locking_enabled else snapshot.equity,
                             risk_base_mode=_risk_base_mode(self.config),
                             open_positions=_risk_open_positions(broker),
-                            daily_realized_pnl=daily_net_pnl.get(
-                                _day_key(child.close_time_ms),
-                                Decimal("0"),
-                            ),
-                            daily_loss_limit_equity=daily_start_equity[day],
+                            daily_realized_pnl=-snapshot.daily_loss_from_tradable_base if self.config.profit_locking_enabled else daily_net_pnl.get(_day_key(child.close_time_ms), Decimal("0")),
+                            daily_loss_limit_equity=snapshot.tradable_base if self.config.profit_locking_enabled else daily_start_equity[day],
                             instrument=self.instrument,
                             requested_leverage=self.config.leverage,
                             quote_to_margin_rate=self.config.quote_to_margin_rate,
                             unit_contract_value=self.config.unit_contract_value,
                             trading_mode="paper",
                             live_trading_enabled=False,
+                            protected_profit_override_enabled=snapshot.protected_profit_override_enabled,
                         )
+                        if not decision.approved and ("Daily loss reached" in decision.reason or "profit lock" in decision.reason.lower()):
+                            trades_blocked_by_profit_lock_or_daily_loss += 1
                         decision = _apply_entry_safety_filter(
                             decision,
                             series=series,
@@ -713,33 +754,7 @@ class BacktestEngine:
                             indicators=indicators,
                             config=self.config,
                         )
-                        if _entry_blocked_by_loss_cooldown(
-                            decision.signal,
-                            safety_state=safety_state,
-                            timestamp_ms=child.close_time_ms,
-                        ):
-                            reason = safety_state.reason(child.close_time_ms)
-                            decision = RiskDecision(
-                                approved=False,
-                                reason=reason,
-                                signal=replace(
-                                    decision.signal,
-                                    metadata={
-                                        **decision.signal.metadata,
-                                        "funnel_reason": SignalFunnelReason.COOLDOWN_BLOCKED.value,
-                                    },
-                                ),
-                            )
-                            safety_state.record_blocked(reason)
-                        if _should_defer_decision(decision):
-                            parent_breakout_entries += 1
-                            pending_decisions.append(
-                                _PendingDecision(
-                                    decision=decision,
-                                    generated_at_ms=child.close_time_ms,
-                                )
-                            )
-                        else:
+                        if decision.approved:
                             report = execution.process_decision(
                                 decision,
                                 market_price=child.close,
@@ -780,24 +795,24 @@ class BacktestEngine:
                     decision = self.risk_manager.evaluate_signal(
                         reentry_signal,
                         account_equity=_risk_sizing_equity(
-                            snapshot_equity=snapshot.equity,
+                            snapshot=snapshot,
                             config=self.config,
                         ),
-                        available_equity=snapshot.equity,
+                        available_equity=snapshot.tradable_equity if self.config.profit_locking_enabled else snapshot.equity,
                         risk_base_mode=_risk_base_mode(self.config),
                         open_positions=_risk_open_positions(broker),
-                        daily_realized_pnl=daily_net_pnl.get(
-                            _day_key(child.close_time_ms),
-                            Decimal("0"),
-                        ),
-                        daily_loss_limit_equity=daily_start_equity[day],
+                        daily_realized_pnl=-snapshot.daily_loss_from_tradable_base if self.config.profit_locking_enabled else daily_net_pnl.get(_day_key(child.close_time_ms), Decimal("0")),
+                        daily_loss_limit_equity=snapshot.tradable_base if self.config.profit_locking_enabled else daily_start_equity[day],
                         instrument=self.instrument,
                         requested_leverage=self.config.leverage,
                         quote_to_margin_rate=self.config.quote_to_margin_rate,
                         unit_contract_value=self.config.unit_contract_value,
                         trading_mode="paper",
                         live_trading_enabled=False,
+                        protected_profit_override_enabled=snapshot.protected_profit_override_enabled,
                     )
+                    if not decision.approved and ("Daily loss reached" in decision.reason or "profit lock" in decision.reason.lower()):
+                        trades_blocked_by_profit_lock_or_daily_loss += 1
                     decision = _apply_entry_safety_filter(
                         decision,
                         series=series,
@@ -882,24 +897,24 @@ class BacktestEngine:
                     decision = self.risk_manager.evaluate_signal(
                         signal,
                         account_equity=_risk_sizing_equity(
-                            snapshot_equity=snapshot.equity,
+                            snapshot=snapshot,
                             config=self.config,
                         ),
-                        available_equity=snapshot.equity,
+                        available_equity=snapshot.tradable_equity if self.config.profit_locking_enabled else snapshot.equity,
                         risk_base_mode=_risk_base_mode(self.config),
                         open_positions=_risk_open_positions(broker),
-                        daily_realized_pnl=daily_net_pnl.get(
-                            _day_key(parent_candle.close_time_ms),
-                            Decimal("0"),
-                        ),
-                        daily_loss_limit_equity=daily_start_equity[day],
+                        daily_realized_pnl=-snapshot.daily_loss_from_tradable_base if self.config.profit_locking_enabled else daily_net_pnl.get(_day_key(parent_candle.close_time_ms), Decimal("0")),
+                        daily_loss_limit_equity=snapshot.tradable_base if self.config.profit_locking_enabled else daily_start_equity[day],
                         instrument=self.instrument,
                         requested_leverage=self.config.leverage,
                         quote_to_margin_rate=self.config.quote_to_margin_rate,
                         unit_contract_value=self.config.unit_contract_value,
                         trading_mode="paper",
                         live_trading_enabled=False,
+                        protected_profit_override_enabled=snapshot.protected_profit_override_enabled,
                     )
+                    if not decision.approved and ("Daily loss reached" in decision.reason or "profit lock" in decision.reason.lower()):
+                        trades_blocked_by_profit_lock_or_daily_loss += 1
                     decision = _apply_entry_safety_filter(
                         decision,
                         series=series,
@@ -943,7 +958,7 @@ class BacktestEngine:
                             daily_net_pnl=daily_net_pnl,
                             safety_state=safety_state,
                         )
-                if self.config.atr_dynamic_exits_enabled:
+                if self.config.atr_dynamic_exits_enabled or self.config.bb_trail_enabled:
                     broker.update_dynamic_atr_exits(
                         parent_candle,
                         atr=indicators.atr,
@@ -962,6 +977,15 @@ class BacktestEngine:
                         profit_lock_r=self.config.profit_lock_r,
                         atr_trail_after_r_enabled=self.config.atr_trail_after_r_enabled,
                         atr_trail_activation_r=self.config.atr_trail_activation_r,
+                        bb_band=indicators.bollinger,
+                        bb_trail_enabled=self.config.bb_trail_enabled,
+                        bb_trail_buffer_multiplier=self.config.bb_trail_buffer_multiplier,
+                        bb_trail_activation_r=self.config.bb_trail_activation_r,
+                        bb_trail_stage2_r=self.config.bb_trail_stage2_r,
+                        bb_trail_stage3_r=self.config.bb_trail_stage3_r,
+                        bb_trail_force_close_r=self.config.bb_trail_force_close_r,
+                        bb_trail_partial_close_at_tp=self.config.bb_trail_partial_close_at_tp,
+                        bb_trail_partial_close_pct=self.config.bb_trail_partial_close_pct,
                     )
 
             equity_curve.append(_equity_point(broker, parent_candle))
@@ -1002,6 +1026,8 @@ class BacktestEngine:
             final_account=final_account,
             equity_curve=equity_curve,
             trades=trades,
+            max_daily_loss_hit_count=max_daily_loss_hit_count,
+            trades_blocked_by_profit_lock_or_daily_loss=trades_blocked_by_profit_lock_or_daily_loss,
         )
         return BacktestResult(
             config=self.config,
@@ -1106,9 +1132,11 @@ def _entry_safety_rejection_reason(
     if not config.atr_entry_filter_enabled:
         return _component_agreement_rejection(signal, config=config)
 
-    is_reversal_breakout = (
-        signal.metadata.get("entry_type") == "intrabar_reversal_breakout"
-    )
+    is_reversal_breakout = signal.metadata.get("entry_type") in {
+        "intrabar_reversal_breakout",
+        "balanced_breakout",
+        "pullback_continuation",
+    }
     candle_range = latest_candle.high - latest_candle.low
     if not is_reversal_breakout and candle_range > atr * ENTRY_SAFETY_SPIKE_ATR_MULTIPLE:
         return (
@@ -1439,11 +1467,13 @@ def _reject_unfilled_pending_decisions(
 
 def _risk_sizing_equity(
     *,
-    snapshot_equity: Decimal,
+    snapshot: PaperAccountSnapshot,
     config: BacktestConfig,
 ) -> Decimal:
     if config.compound_risk_equity:
-        return snapshot_equity
+        if config.profit_locking_enabled:
+            return snapshot.tradable_equity
+        return snapshot.equity
     return config.starting_equity
 
 
@@ -1696,14 +1726,15 @@ def _daily_loss_kill_switch_reached(
     day_start_equity: Decimal,
     risk_manager: RiskManager,
 ) -> bool:
-    if day_start_equity <= 0:
-        return False
     snapshot = broker.snapshot({candle.pair: candle.close})
-    daily_equity_pnl = snapshot.equity - day_start_equity
-    if daily_equity_pnl >= 0:
+    if snapshot.initial_equity <= 0:
         return False
-    limit = daily_loss_limit_amount(day_start_equity, risk_manager.settings)
-    return abs(daily_equity_pnl) >= limit
+        
+    # Daily loss calculated from start-of-day tradable base
+    drawdown = max(Decimal("0"), day_start_equity - snapshot.tradable_equity)
+    limit = daily_loss_limit_amount(snapshot.initial_equity, risk_manager.settings)
+    
+    return drawdown >= limit and not snapshot.protected_profit_override_enabled
 
 
 def _force_close_open_positions(
@@ -1783,29 +1814,64 @@ def _record_report(
     fees = entry_leg.entry_fee + report.fill.fee
     gross_pnl = report.fill.realized_pnl
     
+    # Calculate additional metrics
+    pos = report.position
+    entry_notional = pos.notional
+    exit_notional = (
+        report.fill.quantity 
+        * report.fill.price 
+        * pos.unit_contract_value 
+        * pos.quote_to_margin_rate
+    )
+    leverage = pos.leverage
+    margin_used = entry_notional / leverage if leverage > 0 else Decimal("0")
+    net_pnl = gross_pnl - fees
+    
+    net_pct_of_notional = (net_pnl / entry_notional * 100) if entry_notional > 0 else Decimal("0")
+    gross_roe_pct = (gross_pnl / margin_used * 100) if margin_used > 0 else Decimal("0")
+    net_roe_pct = (net_pnl / margin_used * 100) if margin_used > 0 else Decimal("0")
+    
+    account_equity_at_entry = _decimal_metadata(pos.metadata.get("account_equity_at_entry")) or Decimal("0")
+    account_impact_pct = (net_pnl / account_equity_at_entry * 100) if account_equity_at_entry > 0 else Decimal("0")
+
     # Collate metadata from position and report
     metadata = {
-        **report.position.metadata,
+        **pos.metadata,
         **(report.signal.metadata if report.signal is not None else {}),
         **report.fill.metadata,
         "equity_after_trade": report.account.equity,
         "account_blown": report.account.equity <= 0,
         "available_equity": report.account.equity,
+        "entry_notional": entry_notional,
+        "exit_notional": exit_notional,
+        "margin_used": margin_used,
+        "gross_roe_pct": gross_roe_pct,
+        "net_roe_pct": net_roe_pct,
+        "account_impact_pct": account_impact_pct,
     }
     
     trade = BacktestTrade(
         pair=report.order.pair,
-        strategy_name=report.position.strategy_name,
-        direction=report.position.direction,
+        strategy_name=pos.strategy_name,
+        direction=pos.direction,
         quantity=report.fill.quantity,
-        entry_price=report.position.entry_price,
+        entry_price=pos.entry_price,
         exit_price=report.fill.price,
-        entry_time_ms=report.position.opened_at_ms,
+        entry_time_ms=pos.opened_at_ms,
         exit_time_ms=report.fill.timestamp_ms,
         gross_pnl=gross_pnl,
         fees=fees,
-        net_pnl=gross_pnl - fees,
+        net_pnl=net_pnl,
         exit_reason=report.reason,
+        entry_notional=entry_notional,
+        exit_notional=exit_notional,
+        leverage=leverage,
+        margin_used=margin_used,
+        net_pct_of_notional=net_pct_of_notional,
+        gross_roe_pct=gross_roe_pct,
+        net_roe_pct=net_roe_pct,
+        account_equity_at_entry=account_equity_at_entry,
+        account_impact_pct=account_impact_pct,
         metadata=metadata,
     )
     trades.append(trade)
@@ -1979,9 +2045,14 @@ def _strategy_features(
     open_interest: dict[str, object] | None = None,
     execution_candles: list[OHLCVCandle] | None = None,
     execution_interval: str | None = None,
+    previous_parent_high: Decimal | None = None,
+    previous_parent_low: Decimal | None = None,
 ) -> dict[str, object]:
-    features: dict[str, object] = {
-        "backtest_config": {
+    profile_config, pair_profile = apply_pair_profile_to_config(
+        pair,
+        {
+            "previous_parent_high": previous_parent_high,
+            "previous_parent_low": previous_parent_low,
             "risk_per_trade_pct": config.risk_per_trade_pct,
             "trade_quality_mode": config.trade_quality_mode,
             "controlled_shorts_enabled": config.controlled_shorts_enabled,
@@ -2001,6 +2072,14 @@ def _strategy_features(
             "atr_stop_enabled": config.atr_stop_enabled,
             "atr_take_profit_enabled": config.atr_take_profit_enabled,
             "atr_trailing_enabled": config.atr_trailing_enabled,
+            "bb_trail_enabled": config.bb_trail_enabled,
+            "bb_trail_buffer_multiplier": config.bb_trail_buffer_multiplier,
+            "bb_trail_activation_r": config.bb_trail_activation_r,
+            "bb_trail_stage2_r": config.bb_trail_stage2_r,
+            "bb_trail_stage3_r": config.bb_trail_stage3_r,
+            "bb_trail_force_close_r": config.bb_trail_force_close_r,
+            "bb_trail_partial_close_at_tp": config.bb_trail_partial_close_at_tp,
+            "bb_trail_partial_close_pct": config.bb_trail_partial_close_pct,
             "atr_entry_filter_enabled": config.atr_entry_filter_enabled,
             "atr_policy_mode": config.atr_policy_mode,
             "intrabar_reversal_breakout_enabled": (
@@ -2029,7 +2108,33 @@ def _strategy_features(
             "reversal_breakout_profit_lock_activation_r": config.reversal_breakout_profit_lock_activation_r,
             "reversal_breakout_profit_lock_r": config.reversal_breakout_profit_lock_r,
             "reversal_breakout_time_stop_candles": config.reversal_breakout_time_stop_candles,
-        }
+            "balanced_breakout_enabled": config.balanced_breakout_enabled,
+            "balanced_breakout_volume_ratio_min": config.balanced_breakout_volume_ratio_min,
+            "balanced_breakout_body_ratio_min": config.balanced_breakout_body_ratio_min,
+            "balanced_breakout_close_position_min": config.balanced_breakout_close_position_min,
+            "balanced_breakout_max_extension_atr": config.balanced_breakout_max_extension_atr,
+            "balanced_breakout_max_age_candles": config.balanced_breakout_max_age_candles,
+            "balanced_breakout_risk_multiplier": config.balanced_breakout_risk_multiplier,
+            "false_breakout_filter_enabled": config.false_breakout_filter_enabled,
+            "false_breakout_max_wick_ratio": config.false_breakout_max_wick_ratio,
+            "false_breakout_require_close_outside_parent": config.false_breakout_require_close_outside_parent,
+            "late_chase_block_enabled": config.late_chase_block_enabled,
+            "late_chase_max_consecutive_impulse_candles": config.late_chase_max_consecutive_impulse_candles,
+            "late_chase_volume_fade_ratio": config.late_chase_volume_fade_ratio,
+            "late_chase_max_extension_atr": config.late_chase_max_extension_atr,
+            "pullback_entry_enabled": config.pullback_entry_enabled,
+            "pullback_max_age_candles": config.pullback_max_age_candles,
+            "pullback_max_distance_from_ema_atr": config.pullback_max_distance_from_ema_atr,
+            "pullback_resume_body_ratio_min": config.pullback_resume_body_ratio_min,
+            "pullback_risk_multiplier": config.pullback_risk_multiplier,
+            "signal_flip_grace_candles": config.signal_flip_grace_candles,
+            "signal_flip_confirm_candles": config.signal_flip_confirm_candles,
+            "time_stop_extend_if_momentum_strong": config.time_stop_extend_if_momentum_strong,
+        },
+    )
+    features: dict[str, object] = {
+        "backtest_config": profile_config,
+        "pair_profile": pair_profile.metadata(),
     }
     if execution_candles:
         features["execution_candles"] = execution_candles[-30:]

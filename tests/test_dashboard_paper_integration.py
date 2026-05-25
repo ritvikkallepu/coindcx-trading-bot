@@ -8,7 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from app.config import Settings
-from app.dashboard.server import DashboardRequestHandler, _normalize_dashboard_pair
+from app.dashboard.server import DashboardRequestHandler, _enrich_paper_trade_row, _normalize_dashboard_pair
 from app.live.paper_loop import LivePaperState, get_live_state, _update_live_state
 
 class MockServer:
@@ -123,6 +123,34 @@ class TestPaperDashboardIntegration(unittest.TestCase):
         self.assertEqual(summary["fees"], "5")
         self.assertEqual(summary["closed_notional"], "1800")
         self.assertEqual(summary["profit_factor"], str(Decimal("97") / Decimal("52")))
+
+    def test_enrich_old_row_uses_required_margin_for_roe_backfill(self) -> None:
+        row = {
+            "pair": "B-BSB_USDT",
+            "direction": "long",
+            "entry_price": "1.370195",
+            "exit_price": "1.368825",
+            "position_size": "85550",
+            "position_notional": "117218.815035",
+            "required_margin": "23443.763007",
+            "gross_pnl": "-117.218815",
+            "net_pnl": "-213.972397",
+            "account_equity_at_entry": "95821.986",
+            "exit_reason": "stop_loss",
+        }
+
+        enriched = _enrich_paper_trade_row(dict(row))
+
+        self.assertEqual(enriched["margin_used"], "23443.763007")
+        self.assertEqual(Decimal(enriched["leverage"]), Decimal("5"))
+        self.assertEqual(
+            Decimal(enriched["net_roe_pct"]),
+            Decimal(row["net_pnl"]) / Decimal(row["required_margin"]) * Decimal("100"),
+        )
+        self.assertEqual(
+            Decimal(enriched["gross_roe_pct"]),
+            Decimal(row["gross_pnl"]) / Decimal(row["required_margin"]) * Decimal("100"),
+        )
 
     def test_trades_endpoint_deduplicates_same_closed_trade(self) -> None:
         header = [
@@ -257,6 +285,7 @@ class TestPaperDashboardIntegration(unittest.TestCase):
                     "trailing_stop_enabled": "true",
                     "atr_dynamic_exits_enabled": "false",
                     "profit_lock_enabled": "true",
+                    "bb_trail_enabled": "true",
                 },
             )
 
@@ -271,6 +300,114 @@ class TestPaperDashboardIntegration(unittest.TestCase):
         self.assertFalse(effective_settings.risk.atr_take_profit_enabled)
         self.assertFalse(effective_settings.risk.atr_trailing_enabled)
         self.assertTrue(effective_settings.risk.profit_lock_enabled)
+        self.assertTrue(effective_settings.risk.bb_trail_enabled)
+
+    def test_paper_start_defaults_to_hybrid_meta_v2(self) -> None:
+        self.server.settings = Settings()
+        self.server._paper_thread = None
+
+        with (
+            patch("app.live.paper_loop.get_live_state", return_value={"running": False}),
+            patch("app.live.paper_loop.PaperTradingLoop") as loop_cls,
+            patch("threading.Thread") as thread_cls,
+        ):
+            thread_cls.return_value = MagicMock()
+
+            DashboardRequestHandler._handle_paper_start(
+                self.handler,
+                {"pair": "B-BTC_USDT", "interval": "5m"},
+            )
+
+        self.assertEqual(loop_cls.call_args.kwargs["strategy_name"], "hybrid_meta_v2")
+        response = self.handler._send_json.call_args.args[0]
+        self.assertEqual(response["strategy"], "hybrid_meta_v2")
+
+    def test_paper_start_passes_pair_overrides_to_loop(self) -> None:
+        self.server.settings = Settings()
+        self.server._paper_thread = None
+
+        with (
+            patch("app.live.paper_loop.get_live_state", return_value={"running": False}),
+            patch("app.live.paper_loop.PaperTradingLoop") as loop_cls,
+            patch("threading.Thread") as thread_cls,
+        ):
+            thread_cls.return_value = MagicMock()
+
+            DashboardRequestHandler._handle_paper_start(
+                self.handler,
+                {
+                    "pairs": ["BTC-USDT", "EDEN-USDT"],
+                    "interval": "5m",
+                    "strategy": "hybrid_meta_v2",
+                    "pair_overrides": {
+                        "BTC-USDT": {"strategy": "bb_dynamic_grid", "risk_pct": "2", "bb_trail_enabled": "true"},
+                        "B-EDEN_USDT": {"leverage": "3"},
+                    },
+                },
+            )
+
+        overrides = loop_cls.call_args.kwargs["pair_overrides"]
+        self.assertEqual(overrides["B-BTC_USDT"]["strategy"], "bb_dynamic_grid")
+        self.assertEqual(overrides["B-BTC_USDT"]["risk_pct"], "2")
+        self.assertTrue(overrides["B-BTC_USDT"]["bb_trail_enabled"])
+        self.assertEqual(overrides["B-EDEN_USDT"]["leverage"], "3")
+
+    def test_paper_settings_updates_running_loop_without_restart(self) -> None:
+        loop = MagicMock()
+        loop.update_runtime_settings.return_value = {"updated": True, "interval": "5m"}
+        loop.update_pair_overrides.return_value = {"B-BTC_USDT": {"risk_pct": Decimal("2")}}
+        loop.update_watchlist.return_value = {"updated": True, "watchlist": ["B-BTC_USDT"]}
+        self.server._paper_loop = loop
+
+        DashboardRequestHandler._handle_paper_settings(
+            self.handler,
+            {
+                "pairs": ["BTC-USDT"],
+                "interval": "5m",
+                "execution_interval": "1m",
+                "paper_intrabar_enabled": "true",
+                "use_partial_parent_candle": "true",
+                "max_entries_per_parent_candle": "3",
+                "leverage": "5",
+                "pair_overrides": {
+                    "BTC-USDT": {
+                        "strategy": "hybrid_meta_v2",
+                        "risk_pct": "2",
+                        "bb_trail_enabled": "true",
+                    }
+                },
+            },
+        )
+
+        loop.update_runtime_settings.assert_called_once_with(
+            strategy_interval="5m",
+            execution_interval="1m",
+            paper_intrabar_enabled=True,
+            use_partial_parent_candle=True,
+            max_entries_per_parent_candle=3,
+            paper_leverage=Decimal("5"),
+        )
+        loop.update_pair_overrides.assert_called_once()
+        overrides = loop.update_pair_overrides.call_args.args[0]
+        self.assertEqual(overrides["B-BTC_USDT"]["risk_pct"], "2")
+        self.assertTrue(overrides["B-BTC_USDT"]["bb_trail_enabled"])
+        loop.update_watchlist.assert_called_once_with(["B-BTC_USDT"])
+        response = self.handler._send_json.call_args.args[0]
+        self.assertTrue(response["updated"])
+
+    def test_clear_daily_loss_override_turns_guard_back_on(self) -> None:
+        broker = MagicMock()
+        broker.protected_profit_override_enabled = True
+        loop = MagicMock()
+        loop.broker = broker
+        self.server._paper_loop = loop
+
+        DashboardRequestHandler._handle_clear_daily_loss_override(self.handler)
+
+        self.assertFalse(broker.protected_profit_override_enabled)
+        broker._save_state.assert_called_once()
+        response = self.handler._send_json.call_args.args[0]
+        self.assertEqual(response["message"], "Daily loss override disabled.")
 
     def test_paper_start_rejects_empty_pair_list(self) -> None:
         self.server.settings = Settings()
@@ -305,6 +442,59 @@ class TestPaperDashboardIntegration(unittest.TestCase):
         status = self.handler._send_json.call_args.kwargs["status"]
         self.assertIn("Unsupported execution interval", response["error"])
         self.assertEqual(status.value, 400)
+
+    def test_paper_add_pair_delegates_to_running_loop(self) -> None:
+        loop = MagicMock()
+        loop.add_pair_to_watchlist.return_value = {
+            "added": True,
+            "pair": "B-AXL_USDT",
+            "watchlist": ["B-BSB_USDT", "B-AXL_USDT"],
+        }
+        self.server._paper_loop = loop
+
+        DashboardRequestHandler._handle_paper_add_pair(self.handler, {"pair": "AXL-USDT"})
+
+        loop.add_pair_to_watchlist.assert_called_once_with("B-AXL_USDT")
+        response = self.handler._send_json.call_args.args[0]
+        self.assertTrue(response["added"])
+        self.assertEqual(response["watchlist"], ["B-BSB_USDT", "B-AXL_USDT"])
+
+    def test_paper_watchlist_replaces_running_loop_watchlist(self) -> None:
+        loop = MagicMock()
+        loop.update_watchlist.return_value = {
+            "updated": True,
+            "watchlist": ["B-BSB_USDT", "B-AXL_USDT"],
+            "added": ["B-AXL_USDT"],
+            "removed": ["B-EDEN_USDT"],
+        }
+        self.server._paper_loop = loop
+
+        DashboardRequestHandler._handle_paper_watchlist(
+            self.handler,
+            {"pairs": "B-BSB_USDT, AXL-USDT, B-BSB_USDT"},
+        )
+
+        loop.update_watchlist.assert_called_once_with(["B-BSB_USDT", "B-AXL_USDT"])
+        response = self.handler._send_json.call_args.args[0]
+        self.assertTrue(response["updated"])
+        self.assertEqual(response["added"], ["B-AXL_USDT"])
+        self.assertEqual(response["removed"], ["B-EDEN_USDT"])
+
+    def test_paper_remove_pair_delegates_to_running_loop(self) -> None:
+        loop = MagicMock()
+        loop.remove_pair_from_watchlist.return_value = {
+            "updated": True,
+            "watchlist": ["B-BSB_USDT"],
+            "removed_pair": "B-AXL_USDT",
+        }
+        self.server._paper_loop = loop
+
+        DashboardRequestHandler._handle_paper_remove_pair(self.handler, {"pair": "AXL-USDT"})
+
+        loop.remove_pair_from_watchlist.assert_called_once_with("B-AXL_USDT")
+        response = self.handler._send_json.call_args.args[0]
+        self.assertTrue(response["updated"])
+        self.assertEqual(response["removed_pair"], "B-AXL_USDT")
 
     def test_paper_reset_clears_live_state_and_server_loop(self) -> None:
         loop = MagicMock()

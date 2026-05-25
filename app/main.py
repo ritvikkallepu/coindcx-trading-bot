@@ -2244,7 +2244,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser.add_argument(
         "--strategy",
         choices=STRATEGY_CHOICES,
-        default="bb_dynamic_grid",
+        default="hybrid_meta_v2",
     )
     return parser
 

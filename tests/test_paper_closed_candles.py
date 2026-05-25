@@ -131,7 +131,26 @@ class PaperClosedCandleTests(unittest.TestCase):
 
         self.assertEqual(candles_payload["pair"], "B-BTC_USDT")
         self.assertEqual(candles_payload["candles"][-1]["close"], "101")
+        self.assertIn("B-BTC_USDT", candles_payload["pairs"])
+        self.assertEqual(
+            candles_payload["pairs"]["B-BTC_USDT"]["candles"][-1]["close"],
+            "101",
+        )
         self.assertEqual(equity_history[-1]["equity"], "10000")
+
+    def test_candle_payload_includes_every_running_watchlist_pair(self) -> None:
+        btc_candle = _candle("1m", 60_000, Decimal("101"), True, pair="B-BTC_USDT")
+        sol_candle = _candle("1m", 60_000, Decimal("55"), True, pair="B-SOL_USDT")
+        self.loop._watchlist = ["B-BTC_USDT", "B-SOL_USDT"]
+        self.loop._record_live_candle(btc_candle)
+        self.loop._record_live_candle(sol_candle)
+
+        payload = self.loop._candles_payload()
+
+        self.assertIn("B-BTC_USDT", payload["pairs"])
+        self.assertIn("B-SOL_USDT", payload["pairs"])
+        self.assertEqual(payload["pairs"]["B-BTC_USDT"]["candles"][-1]["close"], "101")
+        self.assertEqual(payload["pairs"]["B-SOL_USDT"]["candles"][-1]["close"], "55")
 
 
 if __name__ == "__main__":

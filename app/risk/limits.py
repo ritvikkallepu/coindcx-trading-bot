@@ -27,6 +27,8 @@ def daily_loss_limit_amount(
 
 
 def daily_loss_limit_reached(context: RiskContext, settings: RiskSettings) -> bool:
+    if context.protected_profit_override_enabled:
+        return False
     if context.daily_realized_pnl >= 0:
         return False
     base_equity = context.daily_loss_limit_equity or context.account_equity

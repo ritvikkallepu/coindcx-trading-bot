@@ -47,6 +47,16 @@ class PaperStateStore:
                     daily_limit_equity TEXT,
                     fees_paid TEXT,
                     funding_paid TEXT,
+                    initial_equity TEXT,
+                    locked_profit TEXT,
+                    unlocked_profit TEXT,
+                    tradable_base TEXT,
+                    daily_tradable_base_start TEXT,
+                    daily_loss_from_tradable_base TEXT,
+                    profit_lock_enabled INTEGER,
+                    auto_lock_profit_pct TEXT,
+                    protected_profit_override_enabled INTEGER,
+                    last_pnl_reset_day TEXT,
                     saved_at TEXT
                 )
                 """
@@ -59,6 +69,26 @@ class PaperStateStore:
                 )
                 """
             )
+            # Migration: add missing columns if table already existed
+            cursor = conn.execute("PRAGMA table_info(broker_state)")
+            columns = {row[1] for row in cursor.fetchall()}
+            
+            new_cols = {
+                "initial_equity": "TEXT",
+                "locked_profit": "TEXT",
+                "unlocked_profit": "TEXT",
+                "tradable_base": "TEXT",
+                "daily_tradable_base_start": "TEXT",
+                "daily_loss_from_tradable_base": "TEXT",
+                "profit_lock_enabled": "INTEGER",
+                "auto_lock_profit_pct": "TEXT",
+                "protected_profit_override_enabled": "INTEGER",
+                "last_pnl_reset_day": "TEXT"
+            }
+            for col, col_type in new_cols.items():
+                if col not in columns:
+                    conn.execute(f"ALTER TABLE broker_state ADD COLUMN {col} {col_type}")
+            
             conn.commit()
 
     def _serialize_decimal(self, obj: Any) -> Any:
@@ -99,6 +129,18 @@ class PaperStateStore:
         daily_limit_equity = str(snapshot.get("daily_limit_equity", "0"))
         fees_paid = str(snapshot.get("fees_paid", "0"))
         funding_paid = str(snapshot.get("funding_paid", "0"))
+        
+        initial_equity = str(snapshot.get("initial_equity", "0"))
+        locked_profit = str(snapshot.get("locked_profit", "0"))
+        unlocked_profit = str(snapshot.get("unlocked_profit", "0"))
+        tradable_base = str(snapshot.get("tradable_base", "0"))
+        daily_tradable_base_start = str(snapshot.get("daily_tradable_base_start", tradable_base))
+        daily_loss_from_tradable_base = str(snapshot.get("daily_loss_from_tradable_base", "0"))
+        profit_lock_enabled = 1 if snapshot.get("profit_lock_enabled", True) else 0
+        auto_lock_profit_pct = str(snapshot.get("auto_lock_profit_pct", "100"))
+        protected_profit_override_enabled = 1 if snapshot.get("protected_profit_override_enabled", False) else 0
+        last_pnl_reset_day = str(snapshot.get("last_pnl_reset_day", ""))
+        
         saved_at = datetime.now(timezone.utc).isoformat()
 
         with sqlite3.connect(self.db_path) as conn:
@@ -106,9 +148,14 @@ class PaperStateStore:
                 """
                 INSERT INTO broker_state (
                     id, equity, positions, fills, daily_pnl, 
-                    daily_limit_equity, fees_paid, funding_paid, saved_at
+                    daily_limit_equity, fees_paid, funding_paid,
+                    initial_equity, locked_profit, unlocked_profit,
+                    tradable_base, daily_tradable_base_start, daily_loss_from_tradable_base,
+                    profit_lock_enabled, auto_lock_profit_pct,
+                    protected_profit_override_enabled, last_pnl_reset_day,
+                    saved_at
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     equity=excluded.equity,
                     positions=excluded.positions,
@@ -117,6 +164,16 @@ class PaperStateStore:
                     daily_limit_equity=excluded.daily_limit_equity,
                     fees_paid=excluded.fees_paid,
                     funding_paid=excluded.funding_paid,
+                    initial_equity=excluded.initial_equity,
+                    locked_profit=excluded.locked_profit,
+                    unlocked_profit=excluded.unlocked_profit,
+                    tradable_base=excluded.tradable_base,
+                    daily_tradable_base_start=excluded.daily_tradable_base_start,
+                    daily_loss_from_tradable_base=excluded.daily_loss_from_tradable_base,
+                    profit_lock_enabled=excluded.profit_lock_enabled,
+                    auto_lock_profit_pct=excluded.auto_lock_profit_pct,
+                    protected_profit_override_enabled=excluded.protected_profit_override_enabled,
+                    last_pnl_reset_day=excluded.last_pnl_reset_day,
                     saved_at=excluded.saved_at
                 """,
                 (
@@ -127,6 +184,16 @@ class PaperStateStore:
                     daily_limit_equity,
                     fees_paid,
                     funding_paid,
+                    initial_equity,
+                    locked_profit,
+                    unlocked_profit,
+                    tradable_base,
+                    daily_tradable_base_start,
+                    daily_loss_from_tradable_base,
+                    profit_lock_enabled,
+                    auto_lock_profit_pct,
+                    protected_profit_override_enabled,
+                    last_pnl_reset_day,
                     saved_at,
                 ),
             )
@@ -137,7 +204,11 @@ class PaperStateStore:
             row = conn.execute(
                 """
                 SELECT equity, positions, fills, daily_pnl, daily_limit_equity, 
-                       fees_paid, funding_paid 
+                       fees_paid, funding_paid, initial_equity, locked_profit,
+                       unlocked_profit, tradable_base, daily_tradable_base_start,
+                       daily_loss_from_tradable_base,
+                       profit_lock_enabled, auto_lock_profit_pct,
+                       protected_profit_override_enabled, last_pnl_reset_day
                 FROM broker_state WHERE id = 1
                 """
             ).fetchone()
@@ -153,6 +224,16 @@ class PaperStateStore:
             daily_limit_equity,
             fees_paid,
             funding_paid,
+            initial_equity,
+            locked_profit,
+            unlocked_profit,
+            tradable_base,
+            daily_tradable_base_start,
+            daily_loss_from_tradable_base,
+            profit_lock_enabled,
+            auto_lock_profit_pct,
+            protected_profit_override_enabled,
+            last_pnl_reset_day,
         ) = row
 
         return {
@@ -164,6 +245,16 @@ class PaperStateStore:
             "daily_limit_equity": Decimal(daily_limit_equity),
             "fees_paid": Decimal(fees_paid),
             "funding_paid": Decimal(funding_paid),
+            "initial_equity": Decimal(initial_equity) if initial_equity else Decimal("0"),
+            "locked_profit": Decimal(locked_profit) if locked_profit else Decimal("0"),
+            "unlocked_profit": Decimal(unlocked_profit) if unlocked_profit else Decimal("0"),
+            "tradable_base": Decimal(tradable_base) if tradable_base else Decimal("0"),
+            "daily_tradable_base_start": Decimal(daily_tradable_base_start) if daily_tradable_base_start else (Decimal(tradable_base) if tradable_base else Decimal("0")),
+            "daily_loss_from_tradable_base": Decimal(daily_loss_from_tradable_base) if daily_loss_from_tradable_base else Decimal("0"),
+            "profit_lock_enabled": bool(profit_lock_enabled),
+            "auto_lock_profit_pct": Decimal(auto_lock_profit_pct) if auto_lock_profit_pct else Decimal("100"),
+            "protected_profit_override_enabled": bool(protected_profit_override_enabled),
+            "last_pnl_reset_day": str(last_pnl_reset_day) if last_pnl_reset_day else "",
         }
 
     def _restore_decimals(self, obj: Any) -> Any:

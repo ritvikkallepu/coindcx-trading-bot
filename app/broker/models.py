@@ -130,6 +130,20 @@ class PaperAccountSnapshot:
     open_position_count: int
     open_notional: Decimal
     funding_paid: Decimal = Decimal("0")
+    
+    # Profit Locking Fields
+    initial_equity: Decimal = Decimal("0")
+    total_equity: Decimal = Decimal("0")
+    tradable_equity: Decimal = Decimal("0")
+    tradable_base: Decimal = Decimal("0")
+    daily_tradable_base_start: Decimal = Decimal("0")
+    locked_profit: Decimal = Decimal("0")
+    unlocked_profit: Decimal = Decimal("0")
+    session_profit: Decimal = Decimal("0")
+    daily_loss_from_tradable_base: Decimal = Decimal("0")
+    profit_lock_enabled: bool = True
+    auto_lock_profit_pct: Decimal = Decimal("100")
+    protected_profit_override_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return convert_for_json(asdict(self))

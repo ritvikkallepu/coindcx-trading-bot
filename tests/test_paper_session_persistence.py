@@ -163,6 +163,7 @@ class PaperSessionPersistenceTests(unittest.TestCase):
                 trailing_stop_enabled=True,
                 trailing_stop_activation_pct=Decimal("1.25"),
                 trailing_stop_distance_pct=Decimal("2.5"),
+                profit_lock_enabled=True,
             ),
         )
 
@@ -175,6 +176,7 @@ class PaperSessionPersistenceTests(unittest.TestCase):
         self.assertTrue(loop.broker.trailing_stop_enabled)
         self.assertEqual(loop.broker.trailing_stop_activation_pct, Decimal("1.25"))
         self.assertEqual(loop.broker.trailing_stop_distance_pct, Decimal("2.5"))
+        self.assertTrue(loop.broker.profit_lock_enabled)
 
     def test_missing_file_initializes_cleanly(self) -> None:
         if self.file_path.exists(): self.file_path.unlink()

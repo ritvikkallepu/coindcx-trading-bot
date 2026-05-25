@@ -10,6 +10,12 @@ logs/
 outputs/
 research/backtests/
 
+data/paper_state.json
+data/.paper_state.json.*.tmp
+data/paper_intrabar_audit.csv
+paper_state.db
+paper_trades.csv
+
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

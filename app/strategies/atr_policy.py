@@ -16,12 +16,14 @@ class ATRPolicy:
     atr_take_profit_enabled: bool
     atr_trailing_enabled: bool
     partial_take_profit_enabled: bool
-    stop_atr_multiple: Decimal
-    take_profit_atr_multiple: Decimal
-    trailing_atr_multiple: Decimal
-    atr_take_profit_mode: str
-    risk_multiplier: Decimal
-    reason: str
+    profit_lock_enabled: bool = False
+    breakeven_enabled: bool = False
+    stop_atr_multiple: Decimal = Decimal("0")
+    take_profit_atr_multiple: Decimal = Decimal("0")
+    trailing_atr_multiple: Decimal = Decimal("0")
+    atr_take_profit_mode: str = "none"
+    risk_multiplier: Decimal = Decimal("1")
+    reason: str = ""
 
     def to_metadata(self) -> dict[str, Any]:
         data = asdict(self)
@@ -58,16 +60,19 @@ class ATRPolicyRouter:
             scores=(ema_score, bb_score, visual_score, oi_score),
         )
 
-        if metadata.get("entry_type") == "intrabar_reversal_breakout":
+        entry_type = metadata.get("entry_type")
+        if entry_type in {"intrabar_reversal_breakout", "balanced_breakout", "pullback_continuation"}:
             is_ignition = metadata.get("breakout_variant") == "momentum_ignition"
             return ATRPolicy(
-                trade_mode="momentum_ignition" if is_ignition else "intrabar_reversal_breakout",
+                trade_mode="momentum_ignition" if is_ignition else str(entry_type),
                 atr_profile="momentum_ignition_runner" if is_ignition else "breakout_runner",
                 entry_allowed=True,
                 atr_stop_enabled=True,
                 atr_take_profit_enabled=False,
                 atr_trailing_enabled=True,
                 partial_take_profit_enabled=False,
+                profit_lock_enabled=True,
+                breakeven_enabled=True,
                 stop_atr_multiple=Decimal("1.8") if is_ignition else Decimal("2.0"),
                 take_profit_atr_multiple=Decimal("0"),
                 trailing_atr_multiple=Decimal("1.8") if is_ignition else Decimal("2.0"),

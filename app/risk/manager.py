@@ -322,6 +322,7 @@ class RiskManager:
         unit_contract_value: Decimal = Decimal("1"),
         trading_mode: str = "paper",
         live_trading_enabled: bool = False,
+        protected_profit_override_enabled: bool = False,
     ) -> RiskDecision:
         return self.evaluate(
             RiskContext(
@@ -338,6 +339,7 @@ class RiskManager:
                 unit_contract_value=unit_contract_value,
                 trading_mode=trading_mode,
                 live_trading_enabled=live_trading_enabled,
+                protected_profit_override_enabled=protected_profit_override_enabled,
             )
         )
 

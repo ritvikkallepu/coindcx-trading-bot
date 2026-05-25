@@ -25,7 +25,7 @@ class DashboardDefaults:
     pair: str = "B-SOL_USDT"
     interval: str = "1h"
     lookback: int = 1000
-    equity: Decimal = Decimal("1000")
+    equity: Decimal = Decimal("100000")
     leverage: Decimal = Decimal("3")
     risk_per_trade_pct: Decimal = Decimal("5")
     compound_risk_equity: bool = False
@@ -99,7 +99,7 @@ class DashboardDefaults:
     block_flat_ema_enabled: bool = False
     block_low_atr_enabled: bool = False
     
-    strategy: str = "bb_dynamic_grid"
+    strategy: str = "hybrid_meta_v2"
 
     def to_dict(self) -> dict[str, Any]:
         return convert_for_json(asdict(self))

@@ -49,7 +49,7 @@ class DashboardStateTests(unittest.TestCase):
         self.assertFalse(payload["bot"]["live_trading_allowed"])
         self.assertTrue(payload["safety"]["live_orders_locked"])
         self.assertEqual(payload["defaults"]["pair"], "B-SOL_USDT")
-        self.assertEqual(payload["defaults"]["strategy"], "bb_dynamic_grid")
+        self.assertEqual(payload["defaults"]["strategy"], "hybrid_meta_v2")
         self.assertEqual(payload["defaults"]["fee_gst_rate"], "0.18")
         self.assertEqual(payload["defaults"]["entry_fee_type"], "maker")
         self.assertEqual(payload["defaults"]["exit_fee_type"], "taker")
@@ -57,7 +57,7 @@ class DashboardStateTests(unittest.TestCase):
         self.assertEqual(payload["defaults"]["funding_fee_rate"], "0")
         self.assertEqual(payload["defaults"]["funding_interval_hours"], 8)
         self.assertEqual(payload["bot"]["futures_margin_currency"], "INR")
-        self.assertEqual(payload["strategy_profile"]["mode"], "Futures Grid")
+        self.assertEqual(payload["strategy_profile"]["mode"], "Score Blend V2")
 
     def test_strategy_profile_describes_adaptive_market_regime_selector(self) -> None:
         one_hour = build_strategy_profile(strategy="adaptive_hybrid", interval="1h")

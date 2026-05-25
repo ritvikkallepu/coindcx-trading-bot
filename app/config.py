@@ -90,6 +90,15 @@ class RiskSettings:
     atr_stop_multiple: Decimal = Decimal("1.5")
     atr_take_profit_multiple: Decimal = Decimal("2.4")
     atr_trailing_multiple: Decimal = Decimal("2.0")
+    # Bollinger Band hybrid trail
+    bb_trail_enabled: bool = False
+    bb_trail_buffer_multiplier: Decimal = Decimal("1.0")
+    bb_trail_activation_r: Decimal = Decimal("0.5")
+    bb_trail_stage2_r: Decimal = Decimal("0.5")
+    bb_trail_stage3_r: Decimal = Decimal("1.0")
+    bb_trail_force_close_r: Decimal = Decimal("4.0")
+    bb_trail_partial_close_at_tp: bool = True
+    bb_trail_partial_close_pct: Decimal = Decimal("0.60")
     # Management
     breakeven_enabled: bool = False
     breakeven_activation_r: Decimal = Decimal("1.0")
@@ -99,6 +108,29 @@ class RiskSettings:
     profit_lock_r: Decimal = Decimal("0.5")
     atr_trail_after_r_enabled: bool = False
     atr_trail_activation_r: Decimal = Decimal("2.0")
+    # Entry Timing and Quality
+    balanced_breakout_enabled: bool = True
+    balanced_breakout_volume_ratio_min: Decimal = Decimal("1.8")
+    balanced_breakout_body_ratio_min: Decimal = Decimal("0.60")
+    balanced_breakout_close_position_min: Decimal = Decimal("0.70")
+    balanced_breakout_max_extension_atr: Decimal = Decimal("2.0")
+    balanced_breakout_max_age_candles: int = 2
+    balanced_breakout_risk_multiplier: Decimal = Decimal("0.50")
+    false_breakout_filter_enabled: bool = True
+    false_breakout_max_wick_ratio: Decimal = Decimal("0.45")
+    false_breakout_require_close_outside_parent: bool = True
+    late_chase_block_enabled: bool = True
+    late_chase_max_consecutive_impulse_candles: int = 3
+    late_chase_volume_fade_ratio: Decimal = Decimal("0.75")
+    late_chase_max_extension_atr: Decimal = Decimal("2.2")
+    pullback_entry_enabled: bool = True
+    pullback_max_age_candles: int = 8
+    pullback_max_distance_from_ema_atr: Decimal = Decimal("0.6")
+    pullback_resume_body_ratio_min: Decimal = Decimal("0.45")
+    pullback_risk_multiplier: Decimal = Decimal("0.50")
+    signal_flip_grace_candles: int = 2
+    signal_flip_confirm_candles: int = 2
+    time_stop_extend_if_momentum_strong: bool = True
 
 
 @dataclass(frozen=True)
@@ -113,7 +145,7 @@ class Settings:
     futures_margin_currency: str = "INR"
     price_quote_currency: str = "USDT"
     quote_to_margin_rate: Decimal = Decimal("98")
-    paper_starting_equity: Decimal = Decimal("10000")
+    paper_starting_equity: Decimal = Decimal("100000")
     paper_starting_equity_currency: str = "INR"
     paper_leverage: Decimal = Decimal("1")
     paper_intrabar_enabled: bool = False
@@ -215,6 +247,20 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         atr_stop_multiple=_decimal(_get(merged, "ATR_STOP_MULTIPLE", "1.5")),
         atr_take_profit_multiple=_decimal(_get(merged, "ATR_TAKE_PROFIT_MULTIPLE", "2.4")),
         atr_trailing_multiple=_decimal(_get(merged, "ATR_TRAILING_MULTIPLE", "2.0")),
+        bb_trail_enabled=_bool(_get(merged, "BB_TRAIL_ENABLED", "false")),
+        bb_trail_buffer_multiplier=_decimal(
+            _get(merged, "BB_TRAIL_BUFFER_MULTIPLIER", "1.0")
+        ),
+        bb_trail_activation_r=_decimal(_get(merged, "BB_TRAIL_ACTIVATION_R", "0.5")),
+        bb_trail_stage2_r=_decimal(_get(merged, "BB_TRAIL_STAGE2_R", "0.5")),
+        bb_trail_stage3_r=_decimal(_get(merged, "BB_TRAIL_STAGE3_R", "1.0")),
+        bb_trail_force_close_r=_decimal(_get(merged, "BB_TRAIL_FORCE_CLOSE_R", "4.0")),
+        bb_trail_partial_close_at_tp=_bool(
+            _get(merged, "BB_TRAIL_PARTIAL_CLOSE_AT_TP", "true")
+        ),
+        bb_trail_partial_close_pct=_decimal(
+            _get(merged, "BB_TRAIL_PARTIAL_CLOSE_PCT", "0.60")
+        ),
         breakeven_enabled=_bool(_get(merged, "BREAKEVEN_ENABLED", "false")),
         breakeven_activation_r=_decimal(_get(merged, "BREAKEVEN_ACTIVATION_R", "1.0")),
         breakeven_offset_r=_decimal(_get(merged, "BREAKEVEN_OFFSET_R", "0")),
@@ -223,6 +269,28 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         profit_lock_r=_decimal(_get(merged, "PROFIT_LOCK_R", "0.5")),
         atr_trail_after_r_enabled=_bool(_get(merged, "ATR_TRAIL_AFTER_R_ENABLED", "false")),
         atr_trail_activation_r=_decimal(_get(merged, "ATR_TRAIL_ACTIVATION_R", "2.0")),
+        balanced_breakout_enabled=_bool(_get(merged, "BALANCED_BREAKOUT_ENABLED", "true")),
+        balanced_breakout_volume_ratio_min=_decimal(_get(merged, "BALANCED_BREAKOUT_VOLUME_RATIO_MIN", "1.8")),
+        balanced_breakout_body_ratio_min=_decimal(_get(merged, "BALANCED_BREAKOUT_BODY_RATIO_MIN", "0.60")),
+        balanced_breakout_close_position_min=_decimal(_get(merged, "BALANCED_BREAKOUT_CLOSE_POSITION_MIN", "0.70")),
+        balanced_breakout_max_extension_atr=_decimal(_get(merged, "BALANCED_BREAKOUT_MAX_EXTENSION_ATR", "2.0")),
+        balanced_breakout_max_age_candles=int(_get(merged, "BALANCED_BREAKOUT_MAX_AGE_CANDLES", "2")),
+        balanced_breakout_risk_multiplier=_decimal(_get(merged, "BALANCED_BREAKOUT_RISK_MULTIPLIER", "0.50")),
+        false_breakout_filter_enabled=_bool(_get(merged, "FALSE_BREAKOUT_FILTER_ENABLED", "true")),
+        false_breakout_max_wick_ratio=_decimal(_get(merged, "FALSE_BREAKOUT_MAX_WICK_RATIO", "0.45")),
+        false_breakout_require_close_outside_parent=_bool(_get(merged, "FALSE_BREAKOUT_REQUIRE_CLOSE_OUTSIDE_PARENT", "true")),
+        late_chase_block_enabled=_bool(_get(merged, "LATE_CHASE_BLOCK_ENABLED", "true")),
+        late_chase_max_consecutive_impulse_candles=int(_get(merged, "LATE_CHASE_MAX_CONSECUTIVE_IMPULSE_CANDLES", "3")),
+        late_chase_volume_fade_ratio=_decimal(_get(merged, "LATE_CHASE_VOLUME_FADE_RATIO", "0.75")),
+        late_chase_max_extension_atr=_decimal(_get(merged, "LATE_CHASE_MAX_EXTENSION_ATR", "2.2")),
+        pullback_entry_enabled=_bool(_get(merged, "PULLBACK_ENTRY_ENABLED", "true")),
+        pullback_max_age_candles=int(_get(merged, "PULLBACK_MAX_AGE_CANDLES", "8")),
+        pullback_max_distance_from_ema_atr=_decimal(_get(merged, "PULLBACK_MAX_DISTANCE_FROM_EMA_ATR", "0.6")),
+        pullback_resume_body_ratio_min=_decimal(_get(merged, "PULLBACK_RESUME_BODY_RATIO_MIN", "0.45")),
+        pullback_risk_multiplier=_decimal(_get(merged, "PULLBACK_RISK_MULTIPLIER", "0.50")),
+        signal_flip_grace_candles=int(_get(merged, "SIGNAL_FLIP_GRACE_CANDLES", "2")),
+        signal_flip_confirm_candles=int(_get(merged, "SIGNAL_FLIP_CONFIRM_CANDLES", "2")),
+        time_stop_extend_if_momentum_strong=_bool(_get(merged, "TIME_STOP_EXTEND_IF_MOMENTUM_STRONG", "true")),
     )
 
     return Settings(
@@ -240,7 +308,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         futures_margin_currency=_get(merged, "FUTURES_MARGIN_CURRENCY", "INR").upper(),
         price_quote_currency=_get(merged, "PRICE_QUOTE_CURRENCY", "USDT").upper(),
         quote_to_margin_rate=_decimal(_get(merged, "QUOTE_TO_MARGIN_RATE", "98")),
-        paper_starting_equity=_decimal(_get(merged, "PAPER_STARTING_EQUITY", "10000")),
+        paper_starting_equity=_decimal(_get(merged, "PAPER_STARTING_EQUITY", "100000")),
         paper_starting_equity_currency=_get(merged, "PAPER_STARTING_EQUITY_CURRENCY", "INR"),
         paper_leverage=_decimal(_get(merged, "PAPER_LEVERAGE", "1")),
         paper_intrabar_enabled=_bool(_get(merged, "PAPER_INTRABAR_ENABLED", "false")),

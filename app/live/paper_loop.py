@@ -9,10 +9,10 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from app.config import Settings
+from app.config import RiskSettings, Settings
 from app.data.candle_builder import CandleSeries, OHLCVCandle, interval_to_ms
 from app.data.gap_guard import CandleGapGuard
-from app.data.indicators import latest_indicator_snapshot
+from app.data.indicators import BollingerBandPoint, bollinger_bands, latest_indicator_snapshot
 from app.data.pipeline import MarketDataPipeline
 from app.exchange.coindcx_rest import CoinDCXFuturesClient
 from app.exchange.coindcx_ws import CoinDCXFuturesWebSocketClient, MarketSubscription
@@ -23,9 +23,10 @@ from app.broker.models import PaperFill, PaperOrderSide, PaperPosition, PaperExe
 from app.risk.manager import RiskManager
 from app.risk.models import OpenPosition, RiskDecision
 from app.risk.limits import is_entry_signal, is_exit_signal
+from app.risk.pair_profiles import apply_pair_profile_to_config, pair_profile_for
 from app.risk.pair_performance import pair_recent_risk_profile
 from app.strategies.base import StrategyEngine, StrategyContext, SignalAction, SignalDirection
-from app.strategies.defaults import strategy_engine_for_name
+from app.strategies.defaults import STRATEGY_CHOICES, strategy_engine_for_name
 from app.utils.json import to_jsonable
 from app.live.summary_logger import PaperTradingSummaryLogger
 
@@ -57,6 +58,21 @@ class LivePaperState:
     candles_json: str = "{}"
     last_updated: str = ""
     error: str = ""
+    entry_type_counts: dict[str, int] = field(default_factory=dict)
+    recent_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    pair_profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pair_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    
+    # Profit Locking Fields
+    initial_equity: str = "0"
+    total_equity: str = "0"
+    tradable_equity: str = "0"
+    tradable_base: str = "0"
+    locked_profit: str = "0"
+    unlocked_profit: str = "0"
+    daily_loss_from_tradable_base: str = "0"
+    profit_lock_enabled: bool = True
+    protected_profit_override_enabled: bool = False
 
 
 _state_lock = threading.Lock()
@@ -118,18 +134,32 @@ def _is_position_close_fill(fill: PaperFill) -> bool:
 def _paper_exit_reason(fill: PaperFill) -> str:
     metadata = fill.metadata if isinstance(fill.metadata, dict) else {}
     trigger_type = str(metadata.get("exit_trigger_type") or "").strip()
+    stop_type = str(metadata.get("stop_type") or "").strip().lower()
     detail = str(metadata.get("reason") or "").strip()
     detail_l = detail.lower()
 
     if trigger_type == "stop_loss":
-        if "breakeven" in detail_l:
+        if stop_type == "bb_trail" or "bollinger band hybrid trail" in detail_l:
+            return "bb_trail_stop"
+        if stop_type == "breakeven" or "breakeven" in detail_l:
             return "breakeven_stop"
-        if "profit lock" in detail_l:
+        if stop_type == "profit_lock" or "profit lock" in detail_l:
             return "profit_lock_stop"
-        if "dynamic atr" in detail_l:
+        if (
+            stop_type == "atr"
+            or (
+                _bool_metadata(metadata.get("atr_dynamic_exit_active"), False)
+                and _bool_metadata(metadata.get("atr_stop_enabled"), False)
+            )
+            or "dynamic atr" in detail_l
+        ):
             return "dynamic_atr_stop"
+        if _bool_metadata(metadata.get("trailing_stop_active"), False) or "trailing" in detail_l:
+            return "trailing_stop"
         return "stop_loss"
     if trigger_type == "take_profit":
+        if _bool_metadata(metadata.get("partial_close"), False) or detail == "bb_trail_partial_tp":
+            return "bb_trail_partial_tp"
         if "dynamic atr" in detail_l:
             return "dynamic_atr_take_profit"
         return "take_profit"
@@ -152,12 +182,15 @@ def _paper_take_profit_style_exit(exit_reason: str) -> bool:
 def _position_stop_management_active(metadata: dict[str, Any]) -> bool:
     return (
         bool(metadata.get("stop_type"))
+        or _bool_metadata(metadata.get("bb_trail_active"), False)
         or _bool_metadata(metadata.get("trailing_stop_active"), False)
         or _bool_metadata(metadata.get("atr_dynamic_exit_active"), False)
     )
 
 
 def _position_take_profit_suppressed(metadata: dict[str, Any]) -> bool:
+    if _bool_metadata(metadata.get("take_profit_suppressed_by_bb_trail"), False):
+        return True
     if _bool_metadata(metadata.get("take_profit_suppressed_by_trailing"), False):
         return True
     if _bool_metadata(metadata.get("profit_lock_enabled"), False):
@@ -172,6 +205,8 @@ def _position_take_profit_suppressed(metadata: dict[str, Any]) -> bool:
 
 def _position_stop_type(metadata: dict[str, Any]) -> str:
     raw = str(metadata.get("stop_type") or "").strip().lower()
+    if raw in {"bb_trail", "bb trail"}:
+        return "BB Trail"
     if raw in {"profit_lock", "profit lock"}:
         return "profit lock"
     if raw in {"breakeven", "break even"}:
@@ -200,11 +235,6 @@ def _quantity_unit(pair: str) -> str:
 
 def _paper_reentry_override(signal: Any, *, strict: bool) -> bool:
     metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
-    if metadata.get("momentum_ignition"):
-        return True
-    if metadata.get("entry_type") == "intrabar_reversal_breakout" and not strict:
-        return True
-
     final_score = abs(_decimal_metadata(metadata.get("final_score"), Decimal("0")))
     agreement = _decimal_metadata(
         metadata.get("agreement_ratio")
@@ -224,6 +254,10 @@ def _paper_reentry_override(signal: Any, *, strict: bool) -> bool:
             and agreement >= Decimal("0.75")
             and visual_score >= Decimal("0.15")
         )
+    if metadata.get("momentum_ignition"):
+        return True
+    if metadata.get("entry_type") == "intrabar_reversal_breakout":
+        return True
     return (
         final_score >= Decimal("0.62")
         and agreement >= Decimal("0.68")
@@ -250,11 +284,15 @@ class PaperTradingLoop:
         strategy_name: str = "adaptive_hybrid",
         state_store: PaperStateStore | None = None,
         session_store: PaperSessionStore | None = None,
+        pair_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.settings = settings
         self.logger = logging.getLogger(__name__)
         
         self.strategy_engine = strategy_engine_for_name(strategy_name)
+        self._strategy_engines_by_name: dict[str, StrategyEngine] = {
+            strategy_name: self.strategy_engine
+        }
         self.risk_manager = RiskManager(settings.risk)
         self.state_store = state_store or PaperStateStore()
         self.session_store = session_store or PaperSessionStore() # Task 1
@@ -275,6 +313,7 @@ class PaperTradingLoop:
             state_store=self.state_store,
             logger=logging.getLogger("app.broker.paper")
         )
+        self.broker.profit_lock_enabled = settings.risk.profit_lock_enabled
         
         self.summary_logger = PaperTradingSummaryLogger()
         self.client = CoinDCXFuturesClient(settings)
@@ -291,10 +330,15 @@ class PaperTradingLoop:
         self._position_entry_prices: dict[str, Decimal] = {}
         
         self._watchlist: list[str] = []
+        self._watchlist_lock = threading.RLock()
+        self._subscriptions: list[MarketSubscription] = []
         self._current_interval = "unknown"
         self._ws_client = None
         self._stop_requested = False
         self._closed_count: int = 0
+        self._entry_type_counts: dict[str, int] = {}
+        from collections import deque
+        self._recent_diagnostics: deque[dict[str, Any]] = deque(maxlen=20)
         self._entries_this_parent_candle: dict[str, int] = {}
         self._current_parent_open_ms: dict[str, int] = {}
         self._pending_stream_candles: dict[tuple[str, str], OHLCVCandle] = {}
@@ -302,8 +346,12 @@ class PaperTradingLoop:
         self._same_direction_cooldown_until_ms: dict[tuple[str, str], int] = {}
         self._same_direction_reversal_cooldown_until_ms: dict[tuple[str, str], int] = {}
         self._pair_recent_net_pnls: dict[str, list[Decimal]] = {}
+        self._pair_overrides: dict[str, dict[str, Any]] = {}
         self._global_loss_cooldown_until_ms: int = 0
         self._consecutive_losing_trades: int = 0
+        explicit_pair_overrides = pair_overrides is not None
+        if pair_overrides:
+            self.update_pair_overrides(pair_overrides, publish=False)
         
         self._init_audit_log()
 
@@ -313,6 +361,8 @@ class PaperTradingLoop:
             self.session_store.clear()
         else:
             self._load_session()
+            if explicit_pair_overrides:
+                self.update_pair_overrides(pair_overrides or {}, publish=False)
 
     def _init_audit_log(self) -> None:
         import os
@@ -328,9 +378,14 @@ class PaperTradingLoop:
                     "timestamp", "pair", "strategy_interval", "execution_interval",
                     "open", "high", "low", "close", "volume",
                     "previous_parent_high", "previous_parent_low",
-                    "breakout_candidate_side", "decision", "rejection_reason",
+                    "candidate_side", "candidate_entry_type", "decision", "rejection_reason",
+                    "volume_ratio", "body_ratio", "close_position_ratio", "wick_ratio",
+                    "fast_ema", "atr", "extension_atr", "breakout_age_candles",
+                    "consecutive_impulse_candles", "volume_fade_state",
+                    "false_breakout_filter_result", "late_chase_blocked",
+                    "higher_context_state", "risk_approved", "risk_rejection_reason",
                     "open_position_count", "same_pair_position_open",
-                    "total_open_positions", "risk_approved"
+                    "total_open_positions"
                 ])
 
     def _log_audit(self, row: list[Any]) -> None:
@@ -339,12 +394,125 @@ class PaperTradingLoop:
             writer = csv.writer(f)
             writer.writerow(row)
 
+    def _write_audit_row(
+        self, 
+        candle: OHLCVCandle, 
+        signal: StrategySignal
+    ) -> None:
+        m = signal.metadata
+        decision_obj = m.get("risk_decision")
+        
+        # Determine Decision string: entered / rejected / no_candidate
+        decision_str = "no_candidate"
+        if signal.action != SignalAction.HOLD:
+            if decision_obj and decision_obj.approved:
+                decision_str = "entered"
+            else:
+                decision_str = "rejected"
+        elif m.get("breakout_rejection"):
+            decision_str = "rejected"
+
+        rejection_reason = m.get("breakout_rejection") or ""
+        if decision_obj and not decision_obj.approved:
+            rejection_reason = f"risk_rejected: {decision_obj.reason}"
+        elif m.get("safety_rejection"):
+            rejection_reason = f"safety_rejected: {m['safety_rejection']}"
+        elif signal.action == SignalAction.HOLD:
+             rejection_reason = signal.reason
+
+        # Extract features
+        visual_metadata = m.get("visual") if isinstance(m.get("visual"), dict) else {}
+        vol_ratio = (
+            m.get("execution_volume_ratio")
+            or m.get("volume_ratio")
+            or visual_metadata.get("volume_ratio")
+            or Decimal("0")
+        )
+        body_ratio = m.get("execution_body_ratio") or m.get("body_ratio") or Decimal("0")
+        cp_ratio = m.get("execution_close_position_ratio") or m.get("close_position_ratio") or Decimal("0")
+        
+        candle_range = candle.high - candle.low
+        wick_ratio = Decimal("0")
+        if candle_range > 0:
+            if signal.direction == SignalDirection.SHORT:
+                wick_ratio = (candle.close - candle.low) / candle_range
+            else:
+                wick_ratio = (candle.high - candle.close) / candle_range
+        try:
+            bb_position = Decimal(str(m.get("bb_entry_band_position")))
+            bb_position_text = f"{bb_position:.2f}"
+        except Exception:
+            bb_position_text = "-"
+        bb_gate = "off"
+        if _bool_metadata(m.get("bb_entry_gate_enabled"), False):
+            bb_gate = "pass" if _bool_metadata(m.get("bb_entry_gate_passed"), False) else "blocked"
+
+        open_positions = self.broker.open_positions()
+        same_pair = any(p.pair == candle.pair for p in open_positions)
+        
+        # Log to Counter for late chase/false breakout blocks
+        if "false_breakout" in rejection_reason:
+            self._entry_type_counts["false_breakout_blocked"] = self._entry_type_counts.get("false_breakout_blocked", 0) + 1
+        elif "late_chase" in rejection_reason:
+            self._entry_type_counts["late_chase_blocked"] = self._entry_type_counts.get("late_chase_blocked", 0) + 1
+
+        diag = {
+            "pair": candle.pair,
+            "time": datetime.fromtimestamp(candle.close_time_ms / 1000, tz=timezone.utc).strftime("%H:%M:%S"),
+            "side": signal.direction.value if signal.direction else "none",
+            "entry_type": m.get("entry_type") or "none",
+            "profile": m.get("pair_profile_label") or m.get("pair_profile") or "",
+            "decision": decision_str,
+            "reason": rejection_reason,
+            "volume_ratio": f"{vol_ratio:.2f}",
+            "body_ratio": f"{body_ratio:.2f}",
+            "extension_atr": f"{m.get('execution_extension_atr') or m.get('extension_atr') or 0:.2f}",
+            "bb_position": bb_position_text,
+            "bb_gate": bb_gate,
+            "breakout_age": m.get("breakout_age") or 0,
+        }
+        self._recent_diagnostics.append(diag)
+
+        self._log_audit([
+            datetime.fromtimestamp(candle.close_time_ms / 1000, tz=timezone.utc).isoformat(),
+            candle.pair,
+            self.settings.strategy_interval,
+            candle.interval,
+            str(candle.open), str(candle.high), str(candle.low), str(candle.close), str(candle.volume),
+            str(m.get("previous_parent_high") or 0),
+            str(m.get("previous_parent_low") or 0),
+            signal.direction.value if signal.direction else "none",
+            m.get("entry_type") or "none",
+            decision_str,
+            rejection_reason,
+            f"{vol_ratio:.2f}",
+            f"{body_ratio:.2f}",
+            f"{cp_ratio:.2f}",
+            f"{wick_ratio:.2f}",
+            f"{m.get('ema_fast') or 0:.4f}",
+            f"{m.get('atr') or 0:.4f}",
+            f"{m.get('execution_extension_atr') or m.get('extension_atr') or 0:.2f}",
+            m.get("breakout_age") or 0,
+            0, # consecutive_impulse_candles - placeholder
+            "none", # volume_fade_state - placeholder
+            "passed" if "false_breakout" not in rejection_reason else "failed",
+            "yes" if "late_chase" in rejection_reason else "no",
+            "neutral", # higher_context_state - placeholder
+            "yes" if decision_obj and decision_obj.approved else "no",
+            decision_obj.reason if decision_obj and not decision_obj.approved else "none",
+            len(open_positions),
+            "yes" if same_pair else "no",
+            len(open_positions)
+        ])        
+
     def _positions_payload(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for p in self.broker.open_positions():
             metadata = p.metadata if isinstance(p.metadata, dict) else {}
+            mark_price = self._latest_mark_price_for_position(p.pair, p.entry_price)
             active_stop = (
-                metadata.get("atr_stop_loss")
+                metadata.get("bb_trail_stop")
+                or metadata.get("atr_stop_loss")
                 or metadata.get("last_trailing_stop")
                 or (p.stop_loss if _position_stop_management_active(metadata) else None)
             )
@@ -356,8 +524,9 @@ class PaperTradingLoop:
                     "direction": p.direction.value,
                     "quantity": str(p.quantity),
                     "entry_price": str(p.entry_price),
-                    "unrealized_pnl": str(p.unrealized_pnl(self.broker.mark_price_for(p.pair, p.entry_price))),
-                    "notional": str(p.margin_notional(self.broker.mark_price_for(p.pair, p.entry_price))),
+                    "mark_price": str(mark_price),
+                    "unrealized_pnl": str(p.unrealized_pnl(mark_price)),
+                    "notional": str(p.margin_notional(mark_price)),
                     "notional_currency": self.settings.futures_margin_currency,
                     "pnl_currency": self.settings.futures_margin_currency,
                     "price_quote_currency": self.settings.price_quote_currency,
@@ -378,9 +547,41 @@ class PaperTradingLoop:
                     "atr_dynamic_exit_active": _bool_metadata(metadata.get("atr_dynamic_exit_active"), False),
                     "profit_lock_enabled": _bool_metadata(metadata.get("profit_lock_enabled"), False),
                     "atr_trailing_enabled": _bool_metadata(metadata.get("atr_trailing_enabled"), False),
+                    "bb_trail_enabled": _bool_metadata(metadata.get("bb_trail_enabled"), False),
+                    "bb_trail_active": _bool_metadata(metadata.get("bb_trail_active"), False),
+                    "bb_trail_stage": str(metadata.get("bb_trail_stage") or ""),
+                    "bb_trail_stop": str(metadata.get("bb_trail_stop") or ""),
+                    "bb_mid": str(metadata.get("bb_mid") or ""),
+                    "bb_upper": str(metadata.get("bb_upper") or ""),
+                    "bb_lower": str(metadata.get("bb_lower") or ""),
+                    "bb_buffer_atr": str(metadata.get("bb_buffer_atr") or ""),
+                    "bb_entry_band_position": str(metadata.get("bb_entry_band_position") or ""),
+                    "bb_entry_gate_passed": _bool_metadata(metadata.get("bb_entry_gate_passed"), False),
+                    "bb_trail_partial_close_pct": str(metadata.get("bb_trail_partial_close_pct") or ""),
+                    "tp_is_partial_close": _bool_metadata(metadata.get("tp_is_partial_close"), False),
+                    "bb_partial_close_executed": _bool_metadata(metadata.get("bb_partial_close_executed"), False),
                 }
             )
         return rows
+
+    def _latest_mark_price_for_position(self, pair: str, fallback: Decimal) -> Decimal:
+        mark_price = self.broker.mark_price_for(pair)
+        if mark_price is not None:
+            return mark_price
+
+        for series_map in (self.execution_series, self.series):
+            series = series_map.get(pair)
+            latest = series.latest() if series is not None else None
+            if latest is not None:
+                return latest.close
+
+        candles = self.candle_history.get(pair) or []
+        if candles:
+            latest_close = candles[-1].get("close")
+            if latest_close is not None:
+                return Decimal(str(latest_close))
+
+        return fallback
 
     def _candle_payload(self, candle: OHLCVCandle) -> dict[str, Any]:
         return {
@@ -419,13 +620,27 @@ class PaperTradingLoop:
             del history[:-240]
 
     def _candles_payload(self) -> dict[str, Any]:
+        active_pairs = self._watchlist_snapshot()
+        open_pairs = [position.pair for position in self.broker.open_positions()]
+        payload_pairs = self._dedupe_pairs([*active_pairs, *open_pairs])
+        chart_payloads: dict[str, dict[str, Any]] = {}
+        for pair in payload_pairs:
+            candles_for_pair = self.candle_history.get(pair, [])[-120:]
+            if not candles_for_pair:
+                continue
+            chart_payloads[pair] = {
+                "pair": pair,
+                "interval": candles_for_pair[-1].get("interval", ""),
+                "candles": candles_for_pair,
+            }
+
         chart_pair = ""
         for position in self.broker.open_positions():
             if position.pair in self.candle_history:
                 chart_pair = position.pair
                 break
         if not chart_pair:
-            for pair in self._watchlist:
+            for pair in active_pairs:
                 if pair in self.candle_history:
                     chart_pair = pair
                     break
@@ -438,6 +653,7 @@ class PaperTradingLoop:
             "pair": chart_pair,
             "interval": interval,
             "candles": candles,
+            "pairs": chart_payloads,
         }
 
     def _publish_live_snapshot(
@@ -449,10 +665,13 @@ class PaperTradingLoop:
     ) -> None:
         snapshot = self.broker.snapshot()
         drawdown = self._equity_drawdown_summary(snapshot.equity)
+        watchlist = self._watchlist_snapshot()
         
         # Build scanned pairs status
         scanned: dict[str, str] = {}
-        for pair in self._watchlist:
+        pair_profiles: dict[str, dict[str, Any]] = {}
+        for pair in watchlist:
+            pair_profiles[pair] = pair_profile_for(pair).metadata()
             if pair in self.series:
                 latest = self.series[pair].latest()
                 if latest:
@@ -485,8 +704,22 @@ class PaperTradingLoop:
             "positions_json": json.dumps(to_jsonable(self._positions_payload())),
             "equity_history_json": json.dumps(to_jsonable(self.equity_history[-500:])),
             "candles_json": json.dumps(to_jsonable(self._candles_payload())),
-            "watchlist": self._watchlist,
+            "watchlist": watchlist,
             "scanned_pairs": scanned,
+            "pair_profiles": pair_profiles,
+            "pair_overrides": dict(self._pair_overrides),
+            "entry_type_counts": self._entry_type_counts,
+            "recent_diagnostics": list(self._recent_diagnostics),
+            "initial_equity": str(snapshot.initial_equity),
+            "total_equity": str(snapshot.total_equity),
+            "tradable_equity": str(snapshot.tradable_equity),
+            "tradable_base": str(snapshot.tradable_base),
+            "locked_profit": str(snapshot.locked_profit),
+            "unlocked_profit": str(snapshot.unlocked_profit),
+            "daily_drawdown": str(drawdown),
+            "daily_loss_from_tradable_base": str(snapshot.daily_loss_from_tradable_base),
+            "profit_lock_enabled": snapshot.profit_lock_enabled,
+            "protected_profit_override_enabled": snapshot.protected_profit_override_enabled,
         }
         if interval is not None:
             update["interval"] = interval
@@ -607,6 +840,10 @@ class PaperTradingLoop:
                     restored_pnls[str(pair)] = pnls
                 self._pair_recent_net_pnls = restored_pnls
 
+            raw_pair_overrides = saved.get("pair_overrides")
+            if isinstance(raw_pair_overrides, dict):
+                self.update_pair_overrides(raw_pair_overrides, publish=False)
+
             self._global_loss_cooldown_until_ms = int(
                 saved.get("global_loss_cooldown_until_ms", 0) or 0
             )
@@ -621,6 +858,7 @@ class PaperTradingLoop:
         snapshot = self.broker.snapshot()
         state = {
             "candle_count": self.candle_count,
+            "watchlist": self._watchlist_snapshot(),
             "equity_history": self.equity_history,
             "candle_history": self.candle_history,
             "position_entry_candle": self._position_entry_candle,
@@ -640,6 +878,7 @@ class PaperTradingLoop:
                 pair: [str(value) for value in values]
                 for pair, values in self._pair_recent_net_pnls.items()
             },
+            "pair_overrides": self._pair_overrides,
             "global_loss_cooldown_until_ms": self._global_loss_cooldown_until_ms,
             "consecutive_losing_trades": self._consecutive_losing_trades,
             "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -657,6 +896,541 @@ class PaperTradingLoop:
                 last_updated=datetime.now(timezone.utc).isoformat(),
             )
 
+    def _dedupe_pairs(self, pairs: list[str] | tuple[str, ...]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for pair in pairs:
+            normalized = str(pair or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    def update_pair_overrides(
+        self,
+        overrides: dict[str, dict[str, Any]] | None,
+        *,
+        publish: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        if not overrides:
+            if publish:
+                self._publish_live_snapshot(last_updated="pair settings updated")
+            return dict(self._pair_overrides)
+
+        normalized = self._normalize_pair_overrides(overrides)
+        with self._watchlist_lock:
+            for pair, settings in normalized.items():
+                if settings:
+                    self._pair_overrides[pair] = settings
+                    self._apply_pair_override_to_open_position(pair, settings)
+                else:
+                    self._pair_overrides.pop(pair, None)
+        if publish:
+            self._save_session()
+            self._publish_live_snapshot(last_updated="pair settings updated")
+        return dict(self._pair_overrides)
+
+    def _apply_pair_override_to_open_position(
+        self,
+        pair: str,
+        settings: dict[str, Any],
+    ) -> None:
+        position = self.broker.positions.get(pair)
+        if position is None:
+            return
+        metadata = dict(position.metadata)
+        if "trailing_stop_enabled" in settings:
+            metadata["trailing_stop_enabled"] = settings["trailing_stop_enabled"]
+        if "atr_dynamic_exits_enabled" in settings:
+            enabled = settings["atr_dynamic_exits_enabled"]
+            metadata["atr_dynamic_exits_enabled"] = enabled
+            metadata["atr_stop_enabled"] = enabled
+            metadata["atr_take_profit_enabled"] = enabled
+            metadata["atr_trailing_enabled"] = enabled
+        if "profit_lock_enabled" in settings:
+            metadata["profit_lock_enabled"] = settings["profit_lock_enabled"]
+        if "bb_trail_enabled" in settings:
+            metadata["bb_trail_enabled"] = settings["bb_trail_enabled"]
+        self.broker.positions[pair] = replace(position, metadata=metadata)
+        self.broker._save_state()
+
+    def update_runtime_settings(
+        self,
+        *,
+        strategy_interval: str | None = None,
+        execution_interval: str | None = None,
+        paper_intrabar_enabled: bool | None = None,
+        use_partial_parent_candle: bool | None = None,
+        max_entries_per_parent_candle: int | None = None,
+        paper_leverage: Decimal | None = None,
+        publish: bool = True,
+    ) -> dict[str, Any]:
+        updates: dict[str, Any] = {}
+        if strategy_interval:
+            updates["strategy_interval"] = strategy_interval
+        if execution_interval:
+            updates["execution_interval"] = execution_interval
+        if paper_intrabar_enabled is not None:
+            updates["paper_intrabar_enabled"] = paper_intrabar_enabled
+        if use_partial_parent_candle is not None:
+            updates["use_partial_parent_candle"] = use_partial_parent_candle
+        if max_entries_per_parent_candle is not None:
+            updates["max_entries_per_parent_candle"] = max(1, int(max_entries_per_parent_candle))
+        if paper_leverage is not None and paper_leverage > 0:
+            updates["paper_leverage"] = paper_leverage
+        if not updates:
+            return {
+                "updated": False,
+                "interval": self._current_interval,
+                "settings": {},
+            }
+
+        old_strategy_interval = self._current_interval
+        old_intrabar = self.settings.paper_intrabar_enabled
+        old_execution_interval = self.settings.execution_interval
+        self.settings = replace(self.settings, **updates)
+        new_strategy_interval = (
+            self.settings.strategy_interval
+            if self.settings.paper_intrabar_enabled
+            else updates.get("strategy_interval", self._current_interval)
+        )
+        if new_strategy_interval:
+            self._current_interval = str(new_strategy_interval)
+
+        interval_changed = (
+            self._current_interval != old_strategy_interval
+            or self.settings.paper_intrabar_enabled != old_intrabar
+            or self.settings.execution_interval != old_execution_interval
+        )
+        subscription_pairs = self._subscription_pairs_for_current_state()
+        if interval_changed:
+            with self._watchlist_lock:
+                self._subscriptions = []
+            self._replace_subscription_snapshot(subscription_pairs, self._current_interval)
+            if subscription_pairs:
+                threading.Thread(
+                    target=self._activate_watchlist_pairs_safely,
+                    args=(subscription_pairs, self._current_interval),
+                    daemon=True,
+                    name="paper-runtime-settings-update",
+                ).start()
+        elif self._ws_client is not None:
+            self._ws_client.subscribe(self._subscriptions_snapshot())
+
+        if publish:
+            self._save_session()
+            self._publish_live_snapshot(
+                interval=self._current_interval,
+                last_updated="settings updated",
+                error="",
+            )
+        return {
+            "updated": True,
+            "interval": self._current_interval,
+            "settings": updates,
+            "subscriptions_refreshed": interval_changed,
+        }
+
+    def _subscription_pairs_for_current_state(self) -> list[str]:
+        watchlist = self._watchlist_snapshot()
+        open_position_pairs = [
+            position.pair
+            for position in self.broker.open_positions()
+            if position.pair not in watchlist
+        ]
+        return self._dedupe_pairs([*watchlist, *open_position_pairs])
+
+    def _normalize_pair_overrides(
+        self,
+        overrides: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        allowed = {
+            "strategy",
+            "leverage",
+            "risk_pct",
+            "max_daily_loss_pct",
+            "max_open_positions",
+            "max_margin_usage_pct",
+            "allow_multi_pair_positions",
+            "allow_same_pair_pyramiding",
+            "trailing_stop_enabled",
+            "atr_dynamic_exits_enabled",
+            "profit_lock_enabled",
+            "bb_trail_enabled",
+            "max_entries_per_parent_candle",
+        }
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw_pair, raw_settings in overrides.items():
+            pair = str(raw_pair or "").strip()
+            if not pair or not isinstance(raw_settings, dict):
+                continue
+            clean: dict[str, Any] = {}
+            for key in allowed:
+                if key not in raw_settings:
+                    continue
+                value = raw_settings[key]
+                if value is None or value == "":
+                    continue
+                if key == "strategy":
+                    strategy = str(value).strip().lower()
+                    if strategy in STRATEGY_CHOICES and strategy != "all":
+                        clean[key] = strategy
+                    continue
+                if key in {
+                    "allow_multi_pair_positions",
+                    "allow_same_pair_pyramiding",
+                    "trailing_stop_enabled",
+                    "atr_dynamic_exits_enabled",
+                    "profit_lock_enabled",
+                    "bb_trail_enabled",
+                }:
+                    clean[key] = _bool_metadata(value)
+                    continue
+                if key in {"max_open_positions", "max_entries_per_parent_candle"}:
+                    try:
+                        clean[key] = max(1, int(value))
+                    except Exception:
+                        continue
+                    continue
+                decimal_value = _decimal_metadata(value, Decimal("-1"))
+                if decimal_value >= 0:
+                    clean[key] = decimal_value
+            normalized[pair] = clean
+        return normalized
+
+    def _pair_override(self, pair: str) -> dict[str, Any]:
+        return self._pair_overrides.get(pair, {})
+
+    def _risk_settings_for_pair(self, pair: str) -> RiskSettings:
+        override = self._pair_override(pair)
+        updates: dict[str, Any] = {}
+        if "risk_pct" in override:
+            updates["max_risk_per_trade_pct"] = override["risk_pct"]
+        if "max_daily_loss_pct" in override:
+            updates["max_daily_loss_pct"] = override["max_daily_loss_pct"]
+        if "max_open_positions" in override:
+            updates["max_open_positions"] = override["max_open_positions"]
+        if "max_margin_usage_pct" in override:
+            updates["max_margin_usage_pct"] = override["max_margin_usage_pct"]
+        if "allow_multi_pair_positions" in override:
+            updates["allow_multi_pair_positions"] = override["allow_multi_pair_positions"]
+        if "allow_same_pair_pyramiding" in override:
+            updates["allow_same_pair_pyramiding"] = override["allow_same_pair_pyramiding"]
+        if "trailing_stop_enabled" in override:
+            updates["trailing_stop_enabled"] = override["trailing_stop_enabled"]
+        if "atr_dynamic_exits_enabled" in override:
+            enabled = override["atr_dynamic_exits_enabled"]
+            updates["atr_stop_enabled"] = enabled
+            updates["atr_take_profit_enabled"] = enabled
+            updates["atr_trailing_enabled"] = enabled
+        if "profit_lock_enabled" in override:
+            updates["profit_lock_enabled"] = override["profit_lock_enabled"]
+        if "bb_trail_enabled" in override:
+            updates["bb_trail_enabled"] = override["bb_trail_enabled"]
+        return replace(self.settings.risk, **updates) if updates else self.settings.risk
+
+    def _paper_leverage_for_pair(self, pair: str) -> Decimal:
+        override = self._pair_override(pair)
+        leverage = _decimal_metadata(override.get("leverage"), self.settings.paper_leverage)
+        return leverage if leverage > 0 else self.settings.paper_leverage
+
+    def _max_entries_per_parent_candle_for_pair(self, pair: str) -> int:
+        override = self._pair_override(pair)
+        value = override.get("max_entries_per_parent_candle")
+        try:
+            return max(1, int(value))
+        except Exception:
+            return max(1, int(self.settings.max_entries_per_parent_candle))
+
+    def _strategy_name_for_pair(self, pair: str) -> str:
+        override = self._pair_override(pair)
+        strategy = str(override.get("strategy") or "").strip().lower()
+        if strategy in STRATEGY_CHOICES and strategy != "all":
+            return strategy
+        return self.strategy_engine.strategies[0].name if self.strategy_engine.strategies else "unknown"
+
+    def _strategy_engine_for_pair(self, pair: str) -> StrategyEngine:
+        strategy = self._strategy_name_for_pair(pair)
+        current_strategy = (
+            self.strategy_engine.strategies[0].name
+            if self.strategy_engine.strategies
+            else ""
+        )
+        if strategy == current_strategy or strategy not in STRATEGY_CHOICES:
+            return self.strategy_engine
+        if strategy not in self._strategy_engines_by_name:
+            self._strategy_engines_by_name[strategy] = strategy_engine_for_name(strategy)
+        return self._strategy_engines_by_name[strategy]
+
+    def _watchlist_snapshot(self) -> list[str]:
+        with self._watchlist_lock:
+            return list(self._watchlist)
+
+    def _watchlist_contains(self, pair: str) -> bool:
+        with self._watchlist_lock:
+            return pair in self._watchlist
+
+    def _pair_active_for_processing(self, pair: str) -> bool:
+        return self._watchlist_contains(pair) or pair in self.broker.positions
+
+    def _subscriptions_snapshot(self) -> list[MarketSubscription]:
+        with self._watchlist_lock:
+            return list(self._subscriptions)
+
+    def _strategy_interval_for_live_update(self) -> str:
+        if self._current_interval != "unknown":
+            return self._current_interval
+        return self.settings.strategy_interval
+
+    def _subscriptions_for_pair(
+        self,
+        pair: str,
+        strategy_interval: str,
+    ) -> list[MarketSubscription]:
+        subscriptions = [
+            MarketSubscription(futures_candle_channel(pair, strategy_interval), "candlestick")
+        ]
+        if (
+            self.settings.paper_intrabar_enabled
+            and strategy_interval != self.settings.execution_interval
+        ):
+            subscriptions.append(
+                MarketSubscription(
+                    futures_candle_channel(pair, self.settings.execution_interval),
+                    "candlestick",
+                )
+            )
+        subscriptions.extend(
+            [
+                MarketSubscription(futures_orderbook_channel(pair, 50), "depth-snapshot"),
+                MarketSubscription(futures_orderbook_channel(pair, 50), "depth-update"),
+            ]
+        )
+        return subscriptions
+
+    def _subscriptions_for_pairs(
+        self,
+        pairs: list[str],
+        strategy_interval: str,
+    ) -> list[MarketSubscription]:
+        subscriptions: list[MarketSubscription] = []
+        seen: set[MarketSubscription] = set()
+        for pair in pairs:
+            for subscription in self._subscriptions_for_pair(pair, strategy_interval):
+                if subscription in seen:
+                    continue
+                seen.add(subscription)
+                subscriptions.append(subscription)
+        return subscriptions
+
+    def _remember_subscriptions(
+        self,
+        subscriptions: list[MarketSubscription],
+    ) -> list[MarketSubscription]:
+        with self._watchlist_lock:
+            known = set(self._subscriptions)
+            added: list[MarketSubscription] = []
+            for subscription in subscriptions:
+                if subscription in known:
+                    continue
+                known.add(subscription)
+                self._subscriptions.append(subscription)
+                added.append(subscription)
+            return added
+
+    def _replace_subscription_snapshot(
+        self,
+        pairs: list[str],
+        strategy_interval: str,
+    ) -> None:
+        with self._watchlist_lock:
+            self._subscriptions = self._subscriptions_for_pairs(pairs, strategy_interval)
+
+    def _initialize_watchlist_pair(self, pair: str, strategy_interval: str) -> None:
+        strategy_series = self.series.get(pair)
+        strategy_latest = strategy_series.latest() if strategy_series is not None else None
+        if (
+            pair not in self.gap_guards
+            or strategy_series is None
+            or strategy_latest is None
+            or strategy_latest.interval != strategy_interval
+        ):
+            self.gap_guards[pair] = CandleGapGuard(strategy_interval)
+            self._warm_up(pair, strategy_interval)
+        execution_series = self.execution_series.get(pair)
+        execution_latest = execution_series.latest() if execution_series is not None else None
+        if (
+            self.settings.paper_intrabar_enabled
+            and (
+                pair not in self.execution_series
+                or execution_latest is None
+                or execution_latest.interval != self.settings.execution_interval
+            )
+        ):
+            self._warm_up_execution(pair, self.settings.execution_interval)
+        self._entries_this_parent_candle.setdefault(pair, 0)
+        self._current_parent_open_ms.setdefault(pair, 0)
+
+    def _activate_watchlist_pair(self, pair: str, strategy_interval: str) -> None:
+        self._initialize_watchlist_pair(pair, strategy_interval)
+        subscriptions = self._subscriptions_for_pair(pair, strategy_interval)
+        new_subscriptions = self._remember_subscriptions(subscriptions)
+        if self._ws_client is not None:
+            self._ws_client.subscribe(new_subscriptions or subscriptions)
+        self._save_session()
+        self._publish_live_snapshot(last_updated=datetime.now(timezone.utc).isoformat(), error="")
+
+    def _activate_watchlist_pairs_safely(
+        self,
+        pairs: list[str],
+        strategy_interval: str,
+    ) -> None:
+        for pair in pairs:
+            if self._stop_requested or not self._pair_active_for_processing(pair):
+                continue
+            try:
+                self._activate_watchlist_pair(pair, strategy_interval)
+            except Exception as exc:
+                message = f"Failed to activate {pair} dynamically: {exc}"
+                self.logger.exception(message)
+                _update_live_state(
+                    error=message,
+                    last_updated=datetime.now(timezone.utc).isoformat(),
+                )
+
+    def add_pair_to_watchlist(
+        self,
+        pair: str,
+        *,
+        background: bool = True,
+    ) -> dict[str, Any]:
+        pair = str(pair or "").strip()
+        if not pair:
+            raise ValueError("No pair provided.")
+
+        with self._watchlist_lock:
+            if pair in self._watchlist:
+                return {
+                    "added": False,
+                    "pair": pair,
+                    "watchlist": list(self._watchlist),
+                    "reason": f"{pair} already in watchlist",
+                }
+            self._watchlist.append(pair)
+            watchlist = list(self._watchlist)
+
+        strategy_interval = self._strategy_interval_for_live_update()
+        _update_live_state(
+            pair=", ".join(watchlist),
+            watchlist=watchlist,
+            last_updated=f"adding {pair}",
+            error="",
+        )
+        self._publish_live_snapshot(last_updated=f"adding {pair}")
+
+        if background:
+            threading.Thread(
+                target=self._activate_watchlist_pairs_safely,
+                args=([pair], strategy_interval),
+                daemon=True,
+                name=f"paper-watchlist-add-{pair}",
+            ).start()
+        else:
+            self._activate_watchlist_pair(pair, strategy_interval)
+
+        return {
+            "added": True,
+            "pair": pair,
+            "watchlist": watchlist,
+            "status": "warming",
+        }
+
+    def update_watchlist(
+        self,
+        pairs: list[str],
+        *,
+        background: bool = True,
+    ) -> dict[str, Any]:
+        target = self._dedupe_pairs(pairs)
+        if not target:
+            raise ValueError("At least one pair is required in the running watchlist.")
+
+        strategy_interval = self._strategy_interval_for_live_update()
+        with self._watchlist_lock:
+            previous = list(self._watchlist)
+            self._watchlist = target
+            added = [pair for pair in target if pair not in previous]
+            removed = [pair for pair in previous if pair not in target]
+
+        open_position_pairs = [
+            position.pair
+            for position in self.broker.open_positions()
+            if position.pair not in target
+        ]
+        subscription_pairs = self._dedupe_pairs([*target, *open_position_pairs])
+        needs_init = [
+            pair
+            for pair in subscription_pairs
+            if pair in added
+            or pair not in self.series
+            or (
+                self.settings.paper_intrabar_enabled
+                and pair not in self.execution_series
+            )
+        ]
+        subscribed_existing = [pair for pair in subscription_pairs if pair not in needs_init]
+        self._replace_subscription_snapshot(subscribed_existing, strategy_interval)
+
+        _update_live_state(
+            pair=", ".join(target),
+            watchlist=target,
+            last_updated="watchlist updated",
+            error="",
+        )
+        self._publish_live_snapshot(last_updated="watchlist updated")
+
+        if needs_init:
+            if background:
+                threading.Thread(
+                    target=self._activate_watchlist_pairs_safely,
+                    args=(needs_init, strategy_interval),
+                    daemon=True,
+                    name="paper-watchlist-update",
+                ).start()
+            else:
+                self._activate_watchlist_pairs_safely(needs_init, strategy_interval)
+        else:
+            self._save_session()
+
+        return {
+            "updated": True,
+            "watchlist": target,
+            "added": added,
+            "removed": removed,
+            "status": "warming" if needs_init else "active",
+        }
+
+    def remove_pair_from_watchlist(
+        self,
+        pair: str,
+        *,
+        background: bool = True,
+    ) -> dict[str, Any]:
+        pair = str(pair or "").strip()
+        current = self._watchlist_snapshot()
+        if pair not in current:
+            return {
+                "removed": False,
+                "pair": pair,
+                "watchlist": current,
+                "reason": f"{pair} is not in watchlist",
+            }
+        target = [item for item in current if item != pair]
+        result = self.update_watchlist(target, background=background)
+        result["removed_pair"] = pair
+        return result
+
     def stop(self) -> None:
         self._stop_requested = True
         if self._ws_client:
@@ -665,9 +1439,14 @@ class PaperTradingLoop:
 
     def run(self, pairs: str | list[str], interval: str) -> None:
         if isinstance(pairs, str):
-            pairs = [pairs]
+            pairs = [pair.strip() for pair in pairs.split(",") if pair.strip()]
+        pairs = self._dedupe_pairs(pairs)
+        if not pairs:
+            raise ValueError("At least one paper-trading pair is required.")
         
-        self._watchlist = pairs
+        with self._watchlist_lock:
+            self._watchlist = list(pairs)
+            self._subscriptions = []
         self._stop_requested = False
         
         # Task 9: If intrabar is enabled, interval is the strategy_interval
@@ -686,21 +1465,13 @@ class PaperTradingLoop:
         
         set_active_loop(self)
         try:
-            subscriptions = []
             for pair in pairs:
-                self.gap_guards[pair] = CandleGapGuard(strategy_interval)
-                self._warm_up(pair, strategy_interval)
+                self._initialize_watchlist_pair(pair, strategy_interval)
                 
                 if self.settings.paper_intrabar_enabled:
                     execution_interval = self.settings.execution_interval
                     self.logger.info("[%s] Intrabar execution enabled: %s -> %s", pair, strategy_interval, execution_interval)
-                    self._warm_up_execution(pair, execution_interval)
-
-                subscriptions.append(MarketSubscription(futures_candle_channel(pair, strategy_interval), "candlestick"))
-                if self.settings.paper_intrabar_enabled and strategy_interval != self.settings.execution_interval:
-                    subscriptions.append(MarketSubscription(futures_candle_channel(pair, self.settings.execution_interval), "candlestick"))
-                subscriptions.append(MarketSubscription(futures_orderbook_channel(pair, 50), "depth-snapshot"))
-                subscriptions.append(MarketSubscription(futures_orderbook_channel(pair, 50), "depth-update"))
+            self._replace_subscription_snapshot(pairs, strategy_interval)
             
             pipeline = MarketDataPipeline()
             original_handle_raw = pipeline.handle_raw
@@ -729,17 +1500,19 @@ class PaperTradingLoop:
             reconnect_attempt = 0
             while not self._stop_requested:
                 self._ws_client = CoinDCXFuturesWebSocketClient(self.settings, pipeline=pipeline)
+                subscriptions = self._subscriptions_snapshot()
+                active_pairs = self._watchlist_snapshot()
                 try:
                     if reconnect_attempt == 0:
                         self.logger.info(
                             "Starting live multi-pair paper loop for %s @ %s",
-                            pairs,
+                            active_pairs,
                             strategy_interval,
                         )
                     else:
                         self.logger.info(
                             "Reconnecting paper websocket for %s @ %s (attempt %d)",
-                            pairs,
+                            active_pairs,
                             strategy_interval,
                             reconnect_attempt + 1,
                         )
@@ -783,7 +1556,10 @@ class PaperTradingLoop:
 
                 if self._stop_requested:
                     break
-                self._replay_missed_candles_after_disconnect(pairs, strategy_interval)
+                self._replay_missed_candles_after_disconnect(
+                    self._watchlist_snapshot(),
+                    strategy_interval,
+                )
                 self._sleep_before_reconnect(delay)
             
             snapshot = self.broker.snapshot()
@@ -974,15 +1750,21 @@ class PaperTradingLoop:
                 self._ws_client.stop()
             return
 
+        self.broker.update_mark_prices({candle.pair: candle.close})
+
         is_live_execution_update = (
             allow_partial_execution
             and self.settings.paper_intrabar_enabled
             and candle.interval == self.settings.execution_interval
         )
-        if not candle.is_closed and not is_live_execution_update:
+        if not candle.is_closed and (not is_live_execution_update or self.settings.enter_on_execution_close):
+            if candle.pair in self.broker.positions:
+                self._publish_live_snapshot(last_updated=datetime.now(timezone.utc).isoformat())
             return
 
         pair = candle.pair
+        if not self._pair_active_for_processing(pair):
+            return
         if pair not in self.series:
             return
 
@@ -1003,7 +1785,6 @@ class PaperTradingLoop:
                 live_partial_update=is_live_execution_update,
             )
             
-        self.broker.update_mark_prices({candle.pair: candle.close})
         self._publish_live_snapshot(last_updated=datetime.now(timezone.utc).isoformat())
 
     def _handle_strategy_candle(self, candle: OHLCVCandle) -> None:
@@ -1022,7 +1803,8 @@ class PaperTradingLoop:
                 series.add(candle)
                 return
 
-            gap_result = self.gap_guards[pair].check(prev, candle)
+            guard = self.gap_guards.setdefault(pair, CandleGapGuard(candle.interval))
+            gap_result = guard.check(prev, candle)
             if gap_result.has_gap:
                 self.logger.warning("[%s] Gap detected! Re-fetching...", pair)
                 self._warm_up(pair, candle.interval)
@@ -1093,6 +1875,7 @@ class PaperTradingLoop:
         live_partial_update: bool = False,
     ) -> None:
         pair = candle.pair
+        pair_risk = self._risk_settings_for_pair(pair)
         main_series = self.execution_series.get(pair) if self.settings.paper_intrabar_enabled else self.series.get(pair)
         if main_series is None: return
         
@@ -1112,18 +1895,16 @@ class PaperTradingLoop:
 
         self._handle_broker_reports(self.broker.process_candle(candle), candle)
 
-        self._handle_broker_reports(self.broker.process_candle(candle), candle)
-
-
         if self.broker.starting_equity is not None and self.broker.starting_equity > 0:
             snapshot_cb = self.broker.snapshot({candle.pair: candle.close})
-            drawdown = self.broker.starting_equity - snapshot_cb.equity
-            loss_limit = self.broker.starting_equity * (
-                self.settings.risk.max_daily_loss_pct / Decimal("100")
+            # Daily loss calculated from start-of-day tradable base
+            drawdown = max(Decimal("0"), snapshot_cb.daily_tradable_base_start - snapshot_cb.tradable_equity)
+            loss_limit = snapshot_cb.initial_equity * (
+                pair_risk.max_daily_loss_pct / Decimal("100")
             )
-            if drawdown >= loss_limit:
+            if drawdown >= loss_limit and not snapshot_cb.protected_profit_override_enabled:
                 self.logger.warning(
-                    "[circuit_breaker] Daily loss limit hit: drawdown=%.2f limit=%.2f — "
+                    "[circuit_breaker] Daily loss limit hit on tradable base: drawdown=%.2f limit=%.2f — "
                     "force-closing all positions and halting.",
                     drawdown,
                     loss_limit,
@@ -1163,26 +1944,39 @@ class PaperTradingLoop:
                 self._stop_requested = True
                 return   
 
-
+        bb_band = self._get_latest_bb_band(pair=pair, candle=candle)
         self.broker.update_dynamic_atr_exits(
             candle,
             atr=atr_val,
-            stop_multiple=self.settings.risk.atr_stop_multiple,
-            take_profit_multiple=self.settings.risk.atr_take_profit_multiple,
-            trailing_multiple=self.settings.risk.atr_trailing_multiple,
-            stop_enabled=self.settings.risk.atr_stop_enabled,
-            take_profit_enabled=self.settings.risk.atr_take_profit_enabled,
-            trailing_enabled=self.settings.risk.atr_trailing_enabled,
-            take_profit_mode=self.settings.risk.atr_take_profit_mode,
-            breakeven_enabled=self.settings.risk.breakeven_enabled,
-            breakeven_activation_r=self.settings.risk.breakeven_activation_r,
-            breakeven_offset_r=self.settings.risk.breakeven_offset_r,
-            profit_lock_enabled=self.settings.risk.profit_lock_enabled,
-            profit_lock_activation_r=self.settings.risk.profit_lock_activation_r,
-            profit_lock_r=self.settings.risk.profit_lock_r,
-            atr_trail_after_r_enabled=self.settings.risk.atr_trail_after_r_enabled,
-            atr_trail_activation_r=self.settings.risk.atr_trail_activation_r,
+            stop_multiple=pair_risk.atr_stop_multiple,
+            take_profit_multiple=pair_risk.atr_take_profit_multiple,
+            trailing_multiple=pair_risk.atr_trailing_multiple,
+            stop_enabled=pair_risk.atr_stop_enabled,
+            take_profit_enabled=pair_risk.atr_take_profit_enabled,
+            trailing_enabled=pair_risk.atr_trailing_enabled,
+            take_profit_mode=pair_risk.atr_take_profit_mode,
+            breakeven_enabled=pair_risk.breakeven_enabled,
+            breakeven_activation_r=pair_risk.breakeven_activation_r,
+            breakeven_offset_r=pair_risk.breakeven_offset_r,
+            profit_lock_enabled=pair_risk.profit_lock_enabled,
+            profit_lock_activation_r=pair_risk.profit_lock_activation_r,
+            profit_lock_r=pair_risk.profit_lock_r,
+            atr_trail_after_r_enabled=pair_risk.atr_trail_after_r_enabled,
+            atr_trail_activation_r=pair_risk.atr_trail_activation_r,
+            bb_band=bb_band,
+            bb_trail_enabled=pair_risk.bb_trail_enabled,
+            bb_trail_buffer_multiplier=pair_risk.bb_trail_buffer_multiplier,
+            bb_trail_activation_r=pair_risk.bb_trail_activation_r,
+            bb_trail_stage2_r=pair_risk.bb_trail_stage2_r,
+            bb_trail_stage3_r=pair_risk.bb_trail_stage3_r,
+            bb_trail_force_close_r=pair_risk.bb_trail_force_close_r,
+            bb_trail_partial_close_at_tp=pair_risk.bb_trail_partial_close_at_tp,
+            bb_trail_partial_close_pct=pair_risk.bb_trail_partial_close_pct,
         )
+
+        pair_allows_new_entries = self._watchlist_contains(pair)
+        if not pair_allows_new_entries and pair not in self.broker.positions:
+            return
 
         context = StrategyContext(
             pair=pair,
@@ -1191,32 +1985,38 @@ class PaperTradingLoop:
             indicators=indicators,
             features=self._strategy_features(pair),
         )
-        signals = self.strategy_engine.evaluate(context)
+        signals = self._strategy_engine_for_pair(pair).evaluate(context)
         
-        # Task 4: Audit logging prep
-        breakout_rejection = "no_candidate"
-        breakout_side = None
-        
-        # Check if breakout was even attempted
+        # Task 9: Enhanced Audit Collection
+        # We find the best candidate signal (even if it's a HOLD) to represent this candle in the audit log
+        audit_signal = None
         for s in signals:
-            if s.metadata.get("intrabar_reversal_breakout"):
-                breakout_side = "long"
-                breakout_rejection = s.metadata.get("breakout_rejection", "entered")
+            if s.action != SignalAction.HOLD:
+                audit_signal = s
                 break
-            if s.metadata.get("breakout_rejection"):
-                breakout_side = "long"
-                breakout_rejection = s.metadata.get("breakout_rejection", "rejected")
-        
-        # If no breakout signal was returned, it might have been rejected inside
-        if breakout_side is None:
-            # We can check the parent metadata if we modify the strategy to return it, 
-            # or just look at what the strategy updated. 
-            # In our case, the strategy updates parent_metadata which is usually part of some signal or context.
-            # But the signals list might be empty.
-            pass
+        if audit_signal is None and signals:
+            # Prefer signals with some directional bias or rejection reason
+            for s in signals:
+                if s.metadata.get("entry_type") or s.metadata.get("breakout_rejection"):
+                    audit_signal = s
+                    break
+            if audit_signal is None:
+                audit_signal = signals[0]
+
+        for s in signals:
+            if s.action != SignalAction.HOLD:
+                self.logger.info("[%s] Signal: %s | confidence: %s | reason: %s", pair, s.action.value, s.confidence, s.reason)
+            elif "No candles available" not in s.reason and "Need at least" not in s.reason and "Waiting for indicators" not in s.reason:
+                # Log holds with high scores or specific reasons
+                score = s.metadata.get("final_score")
+                if score and abs(Decimal(str(score))) > 0.3:
+                    self.logger.info("[%s] Signal HOLD | score: %s | reason: %s", pair, score, s.reason)
 
         for signal in signals:
             if signal.action == SignalAction.HOLD:
+                continue
+
+            if is_entry_signal(signal) and not pair_allows_new_entries:
                 continue
 
             if (
@@ -1224,13 +2024,19 @@ class PaperTradingLoop:
                 and is_entry_signal(signal)
                 and self.settings.enter_on_execution_close
             ):
-                continue
+                # Check if it's a fast entry type that bypasses the execution close wait
+                is_fast_entry = signal.metadata.get("entry_type") in {"balanced_breakout", "pullback_continuation", "intrabar_reversal_breakout"}
+                if not is_fast_entry:
+                    continue
 
-            if (
-                live_partial_update
-                and is_entry_signal(signal)
-                and signal.metadata.get("entry_type") != "intrabar_reversal_breakout"
+            if is_entry_signal(signal) and not _bool_metadata(
+                signal.metadata.get("entry_allowed"),
+                True,
             ):
+                signal.metadata["safety_rejection"] = (
+                    "entry_policy_blocked: "
+                    f"{signal.metadata.get('atr_policy_reason', 'no policy reason')}"
+                )
                 continue
 
             if is_entry_signal(signal):
@@ -1239,9 +2045,8 @@ class PaperTradingLoop:
 
             safety_rejection = self._paper_entry_safety_rejection(signal, candle)
             if safety_rejection is not None:
-                if signal.metadata.get("intrabar_reversal_breakout"):
-                    breakout_rejection = safety_rejection
-                    breakout_side = "long"
+                if audit_signal and audit_signal.metadata.get("entry_type") == signal.metadata.get("entry_type"):
+                    audit_signal.metadata["safety_rejection"] = safety_rejection
                 continue
 
             if is_entry_signal(signal):
@@ -1249,7 +2054,7 @@ class PaperTradingLoop:
                 signal = self._apply_pair_recent_loss_throttle(signal)
             
             if self.settings.paper_intrabar_enabled:
-                if self._entries_this_parent_candle.get(pair, 0) >= self.settings.max_entries_per_parent_candle:
+                if self._entries_this_parent_candle.get(pair, 0) >= self._max_entries_per_parent_candle_for_pair(pair):
                     continue
 
             snapshot = self.broker.snapshot({candle.pair: candle.close})
@@ -1266,25 +2071,24 @@ class PaperTradingLoop:
                 )
                 for p in self.broker.open_positions()
             )
-            decision = self.risk_manager.evaluate_signal(
+            decision = RiskManager(pair_risk).evaluate_signal(
                 signal,
-                account_equity=self.broker.starting_equity,
-                available_equity=snapshot.equity,
-                risk_base_mode="initial_equity",
+                account_equity=snapshot.tradable_equity,
+                available_equity=snapshot.tradable_equity,
+                risk_base_mode="tradable_equity",
                 open_positions=open_positions_tuple,
-                daily_realized_pnl=self.broker.realized_pnl,
-                daily_loss_limit_equity=self.broker.starting_equity,
+                daily_realized_pnl=-snapshot.daily_loss_from_tradable_base,
+                daily_loss_limit_equity=snapshot.tradable_base,
                 trading_mode=self.settings.trading_mode,
                 live_trading_enabled=self.settings.live_trading_allowed,
-                requested_leverage=self.settings.paper_leverage,
+                requested_leverage=self._paper_leverage_for_pair(pair),
                 quote_to_margin_rate=self.settings.quote_to_margin_rate,
                 unit_contract_value=Decimal("1"),
+                protected_profit_override_enabled=snapshot.protected_profit_override_enabled,
             )
             
-            # Task 4: Audit Decision
-            if signal.metadata.get("intrabar_reversal_breakout"):
-                if not decision.approved:
-                    breakout_rejection = f"risk_rejected: {decision.reason}"
+            if audit_signal and audit_signal.timestamp_ms == signal.timestamp_ms:
+                 audit_signal.metadata["risk_decision"] = decision
 
             if decision.approved:
                 report = self.broker.execute_decision(
@@ -1300,6 +2104,9 @@ class PaperTradingLoop:
                             self._position_entry_candle[candle.pair] = self.candle_count
                             self._position_entry_prices[candle.pair] = candle.close
                         
+                        entry_type = signal.metadata.get("entry_type", "confirmed_trend")
+                        self._entry_type_counts[entry_type] = self._entry_type_counts.get(entry_type, 0) + 1
+                        
                         if self.settings.paper_intrabar_enabled:
                             self._entries_this_parent_candle[pair] = self._entries_this_parent_candle.get(pair, 0) + 1
                     elif is_exit_signal(signal) and _is_position_close_fill(report.fill):
@@ -1311,46 +2118,11 @@ class PaperTradingLoop:
                         )
                         self.summary_logger.on_trade_closed(trade_dict)
                         self._closed_count += 1
+                break
 
-        # Task 4: Finalize Audit Log for this execution candle
-        snapshot = self.broker.snapshot({candle.pair: candle.close})
-        open_positions = self.broker.open_positions()
-        same_pair = any(p.pair == candle.pair for p in open_positions)
-        
-        # If we didn't find a breakout signal, let's see if the strategy left a rejection reason in metadata
-        # We need to peek into the strategy's evaluation state if possible, but for now 
-        # let's assume if no signal, we might need to find where it failed.
-        # Actually, let's modify the strategy to ALWAYS return a "signal" with action HOLD if it was a breakout candidate but failed.
-        # Or just rely on the strategy updating some shared state.
-        
-        # Let's use a simpler approach: the strategy evaluate might have multiple signals.
-        # If no breakout signal found, check if it was explicitly rejected.
-        # We'll need another evaluate pass or the strategy needs to provide this.
-        
-        features = context.features.get("backtest_config", {})
-        prev_h = features.get("previous_parent_high", Decimal("0"))
-        prev_l = features.get("previous_parent_low", Decimal("0"))
-
-        self._log_audit([
-            datetime.now(timezone.utc).isoformat(),
-            candle.pair,
-            self.settings.strategy_interval,
-            candle.interval,
-            str(candle.open),
-            str(candle.high),
-            str(candle.low),
-            str(candle.close),
-            str(candle.volume),
-            str(prev_h),
-            str(prev_l),
-            breakout_side or "none",
-            "entered" if breakout_rejection == "entered" else "rejected" if breakout_side else "no_candidate",
-            breakout_rejection,
-            len(open_positions),
-            "yes" if same_pair else "no",
-            len(self.broker.positions),
-            "yes" if breakout_rejection == "entered" else "no"
-        ])
+        # Task 9: Finalize Audit Log for this execution candle
+        if audit_signal:
+            self._write_audit_row(candle, audit_signal)
 
         snapshot = self.broker.snapshot({candle.pair: candle.close})
         
@@ -1493,7 +2265,7 @@ class PaperTradingLoop:
         if not is_entry_signal(signal):
             return signal
         recent = self._pair_recent_net_pnls.get(signal.pair, [])
-        profile = pair_recent_risk_profile(recent, self.settings.risk)
+        profile = pair_recent_risk_profile(recent, self._risk_settings_for_pair(signal.pair))
         if profile.multiplier >= 1:
             if not profile.metadata:
                 return signal
@@ -1525,13 +2297,20 @@ class PaperTradingLoop:
             else {}
         )
         exit_reason = _paper_exit_reason(fill).lower()
+        entry_fee_source = (
+            metadata.get("entry_fee_allocated")
+            or position_metadata.get("entry_fee_allocated")
+            or position_metadata.get("entry_fees_total")
+            or position_metadata.get("entry_fee")
+        )
         entry_fee = _decimal_metadata(
-            position_metadata.get("entry_fees_total")
-            or position_metadata.get("entry_fee"),
+            entry_fee_source,
             Decimal("0"),
         )
         net_pnl = fill.realized_pnl - fill.fee - entry_fee
         self._record_pair_net_pnl(fill.pair, net_pnl)
+        if _bool_metadata(metadata.get("partial_close"), False):
+            return
         interval_ms = self._paper_safety_interval_ms()
 
         if net_pnl < 0:
@@ -1600,6 +2379,31 @@ class PaperTradingLoop:
         except Exception:
             return 60_000
 
+    def _get_latest_bb_band(
+        self,
+        pair: str,
+        candle: OHLCVCandle,
+    ) -> BollingerBandPoint | None:
+        """
+        Return the most recently computed Bollinger band for this pair.
+
+        The trail uses live candle history instead of stale entry metadata so
+        the middle-band reference can follow the trade while it is open.
+        """
+
+        if self.settings.paper_intrabar_enabled:
+            series = (
+                self._build_provisional_htf_series(pair)
+                if self.settings.use_partial_parent_candle
+                else self.series.get(pair)
+            )
+        else:
+            series = self.series.get(pair)
+        if series is None or len(series) < 20:
+            return None
+        bands = bollinger_bands(series.closes(), period=20)
+        return bands[-1] if bands else None
+
     def _strategy_features(self, pair: str) -> dict[str, Any]:
         execution_candles: list[OHLCVCandle] = []
         exec_series = self.execution_series.get(pair)
@@ -1616,14 +2420,12 @@ class PaperTradingLoop:
                 previous_parent_high = last_closed.high
                 previous_parent_low = last_closed.low
 
-        strategy_name = (
-            self.strategy_engine.strategies[0].name
-            if self.strategy_engine.strategies
-            else ""
-        )
-        features: dict[str, Any] = {
-            "backtest_config": {
-                "risk_per_trade_pct": self.settings.risk.max_risk_per_trade_pct,
+        pair_risk = self._risk_settings_for_pair(pair)
+        strategy_name = self._strategy_name_for_pair(pair)
+        profile_config, pair_profile = apply_pair_profile_to_config(
+            pair,
+            {
+                "risk_per_trade_pct": pair_risk.max_risk_per_trade_pct,
                 "trade_quality_mode": "strict",
                 "controlled_shorts_enabled": False,
                 "a_setup_score_threshold": Decimal("0.50"),
@@ -1635,17 +2437,26 @@ class PaperTradingLoop:
                 "long_entry_threshold": Decimal("0.40"),
                 "short_entry_threshold": Decimal("0.55"),
                 "short_agreement_threshold": Decimal("0.60"),
-                "trailing_stop_enabled": self.settings.risk.trailing_stop_enabled,
-                "trailing_stop_activation_pct": self.settings.risk.trailing_stop_activation_pct,
-                "trailing_stop_distance_pct": self.settings.risk.trailing_stop_distance_pct,
+                "trailing_stop_enabled": pair_risk.trailing_stop_enabled,
+                "trailing_stop_activation_pct": pair_risk.trailing_stop_activation_pct,
+                "trailing_stop_distance_pct": pair_risk.trailing_stop_distance_pct,
                 "atr_dynamic_exits_enabled": (
-                    self.settings.risk.atr_stop_enabled
-                    or self.settings.risk.atr_take_profit_enabled
-                    or self.settings.risk.atr_trailing_enabled
+                    pair_risk.atr_stop_enabled
+                    or pair_risk.atr_take_profit_enabled
+                    or pair_risk.atr_trailing_enabled
                 ),
-                "atr_stop_enabled": self.settings.risk.atr_stop_enabled,
-                "atr_take_profit_enabled": self.settings.risk.atr_take_profit_enabled,
-                "atr_trailing_enabled": self.settings.risk.atr_trailing_enabled,
+                "atr_stop_enabled": pair_risk.atr_stop_enabled,
+                "atr_take_profit_enabled": pair_risk.atr_take_profit_enabled,
+                "atr_trailing_enabled": pair_risk.atr_trailing_enabled,
+                "profit_lock_enabled": pair_risk.profit_lock_enabled,
+                "bb_trail_enabled": pair_risk.bb_trail_enabled,
+                "bb_trail_buffer_multiplier": pair_risk.bb_trail_buffer_multiplier,
+                "bb_trail_activation_r": pair_risk.bb_trail_activation_r,
+                "bb_trail_stage2_r": pair_risk.bb_trail_stage2_r,
+                "bb_trail_stage3_r": pair_risk.bb_trail_stage3_r,
+                "bb_trail_force_close_r": pair_risk.bb_trail_force_close_r,
+                "bb_trail_partial_close_at_tp": pair_risk.bb_trail_partial_close_at_tp,
+                "bb_trail_partial_close_pct": pair_risk.bb_trail_partial_close_pct,
                 "atr_entry_filter_enabled": True,
                 "atr_policy_mode": "router",
                 "intrabar_reversal_breakout_enabled": (
@@ -1669,7 +2480,35 @@ class PaperTradingLoop:
                 "reversal_breakout_profit_lock_activation_r": Decimal("1.20"),
                 "reversal_breakout_profit_lock_r": Decimal("0.35"),
                 "reversal_breakout_time_stop_candles": 8,
-            }
+                # New entry timing fields
+                "balanced_breakout_enabled": pair_risk.balanced_breakout_enabled,
+                "balanced_breakout_volume_ratio_min": pair_risk.balanced_breakout_volume_ratio_min,
+                "balanced_breakout_body_ratio_min": pair_risk.balanced_breakout_body_ratio_min,
+                "balanced_breakout_close_position_min": pair_risk.balanced_breakout_close_position_min,
+                "balanced_breakout_max_extension_atr": pair_risk.balanced_breakout_max_extension_atr,
+                "balanced_breakout_max_age_candles": pair_risk.balanced_breakout_max_age_candles,
+                "balanced_breakout_risk_multiplier": pair_risk.balanced_breakout_risk_multiplier,
+                "false_breakout_filter_enabled": pair_risk.false_breakout_filter_enabled,
+                "false_breakout_max_wick_ratio": pair_risk.false_breakout_max_wick_ratio,
+                "false_breakout_require_close_outside_parent": pair_risk.false_breakout_require_close_outside_parent,
+                "late_chase_block_enabled": pair_risk.late_chase_block_enabled,
+                "late_chase_max_consecutive_impulse_candles": pair_risk.late_chase_max_consecutive_impulse_candles,
+                "late_chase_volume_fade_ratio": pair_risk.late_chase_volume_fade_ratio,
+                "late_chase_max_extension_atr": pair_risk.late_chase_max_extension_atr,
+                "pullback_entry_enabled": pair_risk.pullback_entry_enabled,
+                "pullback_max_age_candles": pair_risk.pullback_max_age_candles,
+                "pullback_max_distance_from_ema_atr": pair_risk.pullback_max_distance_from_ema_atr,
+                "pullback_resume_body_ratio_min": pair_risk.pullback_resume_body_ratio_min,
+                "pullback_risk_multiplier": pair_risk.pullback_risk_multiplier,
+                "signal_flip_grace_candles": pair_risk.signal_flip_grace_candles,
+                "signal_flip_confirm_candles": pair_risk.signal_flip_confirm_candles,
+                "time_stop_extend_if_momentum_strong": pair_risk.time_stop_extend_if_momentum_strong,
+            },
+        )
+        features: dict[str, Any] = {
+            "backtest_config": profile_config,
+            "pair_profile": pair_profile.metadata(),
+            "pair_overrides": self._pair_override(pair),
         }
         if execution_candles:
             features["execution_candles"] = execution_candles
@@ -1751,9 +2590,14 @@ class PaperTradingLoop:
         else:
             hold = self.candle_count - entry_candle
         gross = fill.realized_pnl
+        entry_fee_source = (
+            fill_metadata.get("entry_fee_allocated")
+            or position_metadata.get("entry_fee_allocated")
+            or position_metadata.get("entry_fees_total")
+            or position_metadata.get("entry_fee")
+        )
         entry_fee = _decimal_metadata(
-            position_metadata.get("entry_fees_total")
-            or position_metadata.get("entry_fee"),
+            entry_fee_source,
             Decimal("0"),
         )
         exit_fee = fill.fee
@@ -1770,7 +2614,37 @@ class PaperTradingLoop:
             Decimal("1"),
         )
         notional = entry_price * fill.quantity * quote_to_margin_rate * unit_contract_value
+        exit_notional = fill.price * fill.quantity * quote_to_margin_rate * unit_contract_value
+        
+        required_margin = _decimal_metadata(
+            position_metadata.get("required_margin")
+            or fill_metadata.get("required_margin"),
+            Decimal("0"),
+        )
+        leverage = _decimal_metadata(
+            position_metadata.get("leverage")
+            or fill_metadata.get("leverage")
+            or (position.leverage if position is not None else None),
+            Decimal("0"),
+        )
+        if leverage <= 0 and notional > 0 and required_margin > 0:
+            leverage = notional / required_margin
+        if leverage <= 0:
+            leverage = Decimal("1")
+        if required_margin <= 0 and notional > 0:
+            required_margin = notional / leverage if leverage > 0 else notional
+        margin_used = required_margin if required_margin > 0 else Decimal("0")
+        
         net_pct = (net / notional * Decimal("100")) if notional > 0 else Decimal("0")
+        gross_roe_pct = (gross / margin_used * Decimal("100")) if margin_used > 0 else Decimal("0")
+        net_roe_pct = (net / margin_used * Decimal("100")) if margin_used > 0 else Decimal("0")
+        
+        account_equity_at_entry = _decimal_metadata(
+            position_metadata.get("account_equity_at_entry"),
+            Decimal("0"),
+        )
+        account_impact_pct = (net / account_equity_at_entry * Decimal("100")) if account_equity_at_entry > 0 else Decimal("0")
+
         legacy_currency_math = (
             position is not None
             and _decimal_metadata(position_metadata.get("quote_to_margin_rate"), quote_to_margin_rate)
@@ -1785,9 +2659,14 @@ class PaperTradingLoop:
         from app.broker.models import PaperOrderSide
         direction = "long" if fill.side == PaperOrderSide.SELL else "short"
         
-        # Cleanup entry state after mapping
-        self._position_entry_candle.pop(fill.pair, None)
-        self._position_entry_prices.pop(fill.pair, None)
+        if not _bool_metadata(fill_metadata.get("partial_close"), False):
+            self._position_entry_candle.pop(fill.pair, None)
+            self._position_entry_prices.pop(fill.pair, None)
+
+        snapshot = self.broker.snapshot({fill.pair: fill.price})
+        amount_locked = Decimal("0")
+        if net > 0 and self.broker.profit_lock_enabled:
+            amount_locked = net * (self.broker.auto_lock_profit_pct / Decimal("100"))
 
         return {
             "fill_id": str(getattr(fill, "fill_id", "") or ""),
@@ -1795,8 +2674,7 @@ class PaperTradingLoop:
             "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(fill.timestamp_ms / 1000)),
             "pair": fill.pair,
             "interval": candle.interval,
-            "strategy": self.strategy_engine.strategies[0].name
-                        if self.strategy_engine.strategies else "unknown",
+            "strategy": position.strategy_name if position is not None else self._strategy_name_for_pair(fill.pair),
             "direction": direction,
             "entry_price": str(entry_price),
             "exit_price": str(fill.price),
@@ -1817,6 +2695,10 @@ class PaperTradingLoop:
             "position_size": str(fill.quantity),
             "quantity_unit": _quantity_unit(fill.pair),
             "position_notional": str(notional),
+            "entry_notional": str(notional),
+            "exit_notional": str(exit_notional),
+            "leverage": str(leverage),
+            "margin_used": str(margin_used),
             "notional_currency": self.settings.futures_margin_currency,
             "price_quote_currency": self.settings.price_quote_currency,
             "quote_to_margin_rate": str(quote_to_margin_rate),
@@ -1826,10 +2708,10 @@ class PaperTradingLoop:
             "risk_base_mode": str(position_metadata.get("risk_base_mode") or fill_metadata.get("risk_base_mode") or ""),
             "risk_base_amount": str(position_metadata.get("risk_base_amount") or fill_metadata.get("risk_base_amount") or ""),
             "planned_risk_amount": str(position_metadata.get("planned_risk_amount") or fill_metadata.get("planned_risk_amount") or ""),
-            "required_margin": str(position_metadata.get("required_margin") or fill_metadata.get("required_margin") or ""),
-            "available_equity": str(position_metadata.get("available_equity") or fill_metadata.get("available_equity") or ""),
-            "margin_ok": str(position_metadata.get("margin_ok") or fill_metadata.get("margin_ok") or ""),
-            "account_blown": str(position_metadata.get("account_blown") or fill_metadata.get("account_blown") or ""),
+            "required_margin": str(required_margin),
+            "available_equity": str(snapshot.equity),
+            "margin_ok": str(fill_metadata.get("margin_ok", True)),
+            "account_blown": str(snapshot.equity <= 0).lower(),
             "fee_type": str(fill_metadata.get("fee_type") or ""),
             "fee_rate": str(fill_metadata.get("fee_rate") or ""),
             "fee_gst_rate": str(fill_metadata.get("fee_gst_rate") or ""),
@@ -1840,8 +2722,16 @@ class PaperTradingLoop:
             "gross_pnl": str(gross),
             "fees": str(total_fees),
             "net_pnl": str(net),
-            "net_pnl_pct": str(net_pct.quantize(Decimal("0.0001"))),
-            "equity_after": str(self.broker.snapshot({candle.pair: candle.close}).equity),
+            "net_pnl_pct": str(net_pct),
+            "gross_roe_pct": str(gross_roe_pct),
+            "net_roe_pct": str(net_roe_pct),
+            "account_equity_at_entry": str(account_equity_at_entry),
+            "account_impact_pct": str(account_impact_pct),
+            "equity_after": str(snapshot.equity),
+            "amount_locked_from_trade": str(amount_locked),
+            "tradable_equity_after_trade": str(snapshot.tradable_equity),
+            "locked_profit_after_trade": str(snapshot.locked_profit),
+            "daily_loss_after_trade": str(snapshot.daily_loss_from_tradable_base),
             "exit_reason": _paper_exit_reason(fill),
             "hold_duration_candles": hold,
             "legacy_currency_math": str(legacy_currency_math).lower(),
