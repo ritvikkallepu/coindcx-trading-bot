@@ -56,6 +56,8 @@ class DashboardStateTests(unittest.TestCase):
         self.assertEqual(payload["defaults"]["stop_slippage_pct"], "0.02")
         self.assertEqual(payload["defaults"]["funding_fee_rate"], "0")
         self.assertEqual(payload["defaults"]["funding_interval_hours"], 8)
+        self.assertTrue(payload["defaults"]["compound_risk_equity"])
+        self.assertEqual(payload["defaults"]["atr_trailing_multiple"], "1.2")
         self.assertEqual(payload["bot"]["futures_margin_currency"], "INR")
         self.assertEqual(payload["strategy_profile"]["mode"], "Score Blend V2")
 
@@ -79,6 +81,13 @@ class DashboardStateTests(unittest.TestCase):
 
         self.assertEqual(profile["mode"], "Score Blend V2")
         self.assertEqual(profile["filter"], "Entry-only visual screen")
+
+    def test_strategy_profile_describes_rsi_macd_momentum(self) -> None:
+        profile = build_strategy_profile(strategy="rsi_macd_momentum", interval="5m")
+
+        self.assertEqual(profile["mode"], "Momentum")
+        self.assertEqual(profile["primary"], "RSI 50 reclaim/loss")
+        self.assertEqual(profile["filter"], "RSI/MACD exits + hard stop")
 
     def test_dashboard_fee_pct_uses_coindcx_inr_m_rates(self) -> None:
         self.assertEqual(

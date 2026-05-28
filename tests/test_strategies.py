@@ -14,6 +14,7 @@ from app.strategies.ema_rsi_trend import EMARSICrossoverStrategy
 from app.strategies.atr_policy import ATRPolicyRouter
 from app.strategies.defaults import strategy_engine_for_name
 from app.strategies.hybrid_meta import HybridMetaStrategy, HybridMetaV2Strategy
+from app.strategies.rsi_macd_momentum import RSIMACDMomentumStrategy
 
 
 def _series_from_closes(
@@ -66,8 +67,135 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("bb_volume_reversion", names)
         self.assertIn("hybrid_meta", names)
         self.assertIn("hybrid_meta_v2", names)
+        self.assertIn("rsi_macd_momentum", names)
         self.assertIn("adaptive_hybrid", names)
         self.assertIn("bb_dynamic_grid", names)
+
+    def test_rsi_macd_strategy_is_selectable(self) -> None:
+        engine = strategy_engine_for_name("rsi_macd_momentum")
+
+        self.assertEqual(engine.strategies[0].name, "rsi_macd_momentum")
+
+    def test_rsi_macd_strategy_enters_long_and_disables_external_exits(self) -> None:
+        closes = [
+            Decimal("100"),
+            Decimal("99"),
+            Decimal("98"),
+            Decimal("97"),
+            Decimal("96"),
+            Decimal("95"),
+            Decimal("94"),
+            Decimal("95"),
+            Decimal("96"),
+            Decimal("98"),
+            Decimal("101"),
+            Decimal("104"),
+        ]
+        strategy = RSIMACDMomentumStrategy(
+            rsi_period=3,
+            macd_fast_period=2,
+            macd_slow_period=5,
+            macd_signal_period=2,
+            atr_period=3,
+            volume_period=3,
+            extension_lookback=3,
+            exhaustion_lookback=4,
+            max_extension_atr=Decimal("3"),
+            min_macd_histogram_atr=Decimal("0.001"),
+            rsi_long_max=Decimal("100"),
+            macd_cross_max_age=10,
+            rsi_cross_max_age=10,
+        )
+
+        signal = strategy.evaluate(_context(_series_from_closes(closes)))
+
+        self.assertEqual(signal.action, SignalAction.ENTER_LONG)
+        self.assertEqual(signal.direction, SignalDirection.LONG)
+        self.assertIsNone(signal.take_profit)
+        self.assertFalse(signal.metadata["atr_dynamic_exits_enabled"])
+        self.assertFalse(signal.metadata["bb_trail_enabled"])
+        self.assertTrue(signal.metadata["strategy_managed_exits"])
+
+    def test_rsi_macd_strategy_enters_short(self) -> None:
+        closes = [
+            Decimal("100"),
+            Decimal("101"),
+            Decimal("102"),
+            Decimal("103"),
+            Decimal("104"),
+            Decimal("105"),
+            Decimal("106"),
+            Decimal("105"),
+            Decimal("104"),
+            Decimal("102"),
+            Decimal("99"),
+            Decimal("96"),
+        ]
+        strategy = RSIMACDMomentumStrategy(
+            rsi_period=3,
+            macd_fast_period=2,
+            macd_slow_period=5,
+            macd_signal_period=2,
+            atr_period=3,
+            volume_period=3,
+            extension_lookback=3,
+            exhaustion_lookback=4,
+            max_extension_atr=Decimal("3"),
+            min_macd_histogram_atr=Decimal("0.001"),
+            rsi_short_min=Decimal("0"),
+            macd_cross_max_age=10,
+            rsi_cross_max_age=10,
+        )
+
+        signal = strategy.evaluate(_context(_series_from_closes(closes)))
+
+        self.assertEqual(signal.action, SignalAction.ENTER_SHORT)
+        self.assertEqual(signal.direction, SignalDirection.SHORT)
+
+    def test_rsi_macd_strategy_exits_long_on_confirmed_momentum_loss(self) -> None:
+        closes = [
+            Decimal("100"),
+            Decimal("99"),
+            Decimal("98"),
+            Decimal("97"),
+            Decimal("96"),
+            Decimal("95"),
+            Decimal("94"),
+            Decimal("95"),
+            Decimal("96"),
+            Decimal("98"),
+            Decimal("101"),
+            Decimal("104"),
+            Decimal("102"),
+            Decimal("99"),
+            Decimal("96"),
+        ]
+        series = _series_from_closes(closes)
+        open_position = {
+            "pair": "B-BTC_USDT",
+            "direction": "long",
+            "entry_price": Decimal("104"),
+            "opened_at_ms": series[-4].close_time_ms,
+            "strategy_name": "rsi_macd_momentum",
+            "metadata": {"strategy_exit_model": "rsi_macd_momentum"},
+        }
+        strategy = RSIMACDMomentumStrategy(
+            rsi_period=3,
+            macd_fast_period=2,
+            macd_slow_period=5,
+            macd_signal_period=2,
+            atr_period=3,
+            volume_period=3,
+            extension_lookback=3,
+            exhaustion_lookback=4,
+            exit_histogram_confirm_candles=1,
+            min_macd_histogram_atr=Decimal("0.001"),
+        )
+
+        signal = strategy.evaluate(_context(series, features={"open_position": open_position}))
+
+        self.assertEqual(signal.action, SignalAction.EXIT_LONG)
+        self.assertEqual(signal.metadata["exit_trigger_type"], "strategy_momentum_exit")
 
     def test_atr_policy_router_uses_runner_for_breakout_setup(self) -> None:
         policy = ATRPolicyRouter().select(

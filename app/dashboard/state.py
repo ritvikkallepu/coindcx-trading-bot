@@ -28,7 +28,7 @@ class DashboardDefaults:
     equity: Decimal = Decimal("100000")
     leverage: Decimal = Decimal("3")
     risk_per_trade_pct: Decimal = Decimal("5")
-    compound_risk_equity: bool = False
+    compound_risk_equity: bool = True
     stop_loss_pct: Decimal | None = None
     take_profit_pct: Decimal | None = None
     maker_fee_rate: Decimal = COINDCX_INR_M_MAKER_FEE_RATE
@@ -52,7 +52,7 @@ class DashboardDefaults:
     atr_period: int = 14
     atr_stop_multiple: Decimal = Decimal("1.5")
     atr_take_profit_multiple: Decimal = Decimal("3")
-    atr_trailing_multiple: Decimal = Decimal("2.0")
+    atr_trailing_multiple: Decimal = Decimal("1.2")
     atr_take_profit_mode: str = "none"
     execution_interval: str = ""
     intrabar_reentry_enabled: bool = True
@@ -288,6 +288,17 @@ def build_strategy_profile(*, strategy: str, interval: str) -> dict[str, str]:
             "primary": "EMA + BB + Visual",
             "secondary": "OI only when scored",
             "filter": "Entry-only visual screen",
+            "status": "Paper Research",
+        }
+
+    if normalized_strategy == "rsi_macd_momentum":
+        return {
+            "name": "rsi_macd_momentum",
+            "label": "RSI + MACD Momentum",
+            "mode": "Momentum",
+            "primary": "RSI 50 reclaim/loss",
+            "secondary": "MACD cross/flip",
+            "filter": "RSI/MACD exits + hard stop",
             "status": "Paper Research",
         }
 

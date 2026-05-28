@@ -322,6 +322,73 @@ class TestPaperDashboardIntegration(unittest.TestCase):
         response = self.handler._send_json.call_args.args[0]
         self.assertEqual(response["strategy"], "hybrid_meta_v2")
 
+    def test_paper_start_passes_live_dry_run_execution_mode_to_loop(self) -> None:
+        self.server.settings = Settings()
+        self.server._paper_thread = None
+
+        with (
+            patch("app.live.paper_loop.get_live_state", return_value={"running": False}),
+            patch("app.live.paper_loop.PaperTradingLoop") as loop_cls,
+            patch("threading.Thread") as thread_cls,
+        ):
+            thread_cls.return_value = MagicMock()
+
+            DashboardRequestHandler._handle_paper_start(
+                self.handler,
+                {
+                    "pair": "B-BTC_USDT",
+                    "interval": "5m",
+                    "strategy": "hybrid_meta_v2",
+                    "execution_mode": "live_dry_run",
+                },
+            )
+
+        effective_settings = loop_cls.call_args.args[0]
+        self.assertTrue(effective_settings.risk.live_risk_approval_enabled)
+        self.assertTrue(effective_settings.live_pilot_dry_run)
+        self.assertEqual(loop_cls.call_args.kwargs["execution_mode"], "live_dry_run")
+        response = self.handler._send_json.call_args.args[0]
+        self.assertEqual(response["execution_mode"], "live_dry_run")
+        self.assertTrue(response["live_dry_run"])
+
+    def test_paper_start_rejects_live_pilot_when_live_env_is_locked(self) -> None:
+        self.server.settings = Settings()
+
+        with patch("app.live.paper_loop.get_live_state", return_value={"running": False}):
+            DashboardRequestHandler._handle_paper_start(
+                self.handler,
+                {
+                    "pair": "B-BTC_USDT",
+                    "interval": "5m",
+                    "strategy": "hybrid_meta_v2",
+                    "execution_mode": "live_pilot",
+                },
+            )
+
+        response = self.handler._send_json.call_args.args[0]
+        status = self.handler._send_json.call_args.kwargs["status"]
+        self.assertIn("Live Pilot requires", response["error"])
+        self.assertEqual(status.value, 400)
+
+    def test_paper_start_rejects_invalid_execution_mode(self) -> None:
+        self.server.settings = Settings()
+
+        with patch("app.live.paper_loop.get_live_state", return_value={"running": False}):
+            DashboardRequestHandler._handle_paper_start(
+                self.handler,
+                {
+                    "pair": "B-BTC_USDT",
+                    "interval": "5m",
+                    "strategy": "hybrid_meta_v2",
+                    "execution_mode": "real_now",
+                },
+            )
+
+        response = self.handler._send_json.call_args.args[0]
+        status = self.handler._send_json.call_args.kwargs["status"]
+        self.assertIn("Unsupported execution mode", response["error"])
+        self.assertEqual(status.value, 400)
+
     def test_paper_start_passes_pair_overrides_to_loop(self) -> None:
         self.server.settings = Settings()
         self.server._paper_thread = None
@@ -517,6 +584,13 @@ class TestPaperDashboardIntegration(unittest.TestCase):
             positions_json="[{}]",
             equity_history_json="[{}]",
             candles_json='{"candles":[{}]}',
+            total_equity="-630339",
+            tradable_equity="-656756",
+            tradable_base="-642084",
+            locked_profit="26417",
+            daily_loss_from_tradable_base="738670",
+            entry_type_counts={"late_chase_blocked": 726},
+            recent_diagnostics=[{"pair": "B-BSB_USDT"}],
             error="old",
         )
 
@@ -533,6 +607,13 @@ class TestPaperDashboardIntegration(unittest.TestCase):
         self.assertEqual(state["positions_json"], "[]")
         self.assertEqual(state["equity_history_json"], "[]")
         self.assertEqual(state["candles_json"], "{}")
+        self.assertEqual(state["total_equity"], "0")
+        self.assertEqual(state["tradable_equity"], "0")
+        self.assertEqual(state["tradable_base"], "0")
+        self.assertEqual(state["locked_profit"], "0")
+        self.assertEqual(state["daily_loss_from_tradable_base"], "0")
+        self.assertEqual(state["entry_type_counts"], {})
+        self.assertEqual(state["recent_diagnostics"], [])
         self.assertEqual(state["error"], "")
 
 if __name__ == "__main__":

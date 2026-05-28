@@ -360,6 +360,278 @@ class PaperLoopIntegrationTests(unittest.TestCase):
         self.assertFalse(features["backtest_config"]["trailing_stop_enabled"])
         self.assertFalse(features["backtest_config"]["atr_dynamic_exits_enabled"])
 
+    def test_live_dry_run_mode_records_live_report_on_shadow_decision(self) -> None:
+        from app.execution.live import LiveExecutionReport
+        from app.risk.models import RiskDecision
+        from app.strategies.base import SignalAction, SignalDirection, StrategySignal
+
+        state_store = PaperStateStore(str(self.db_path))
+        session_store = PaperSessionStore(str(self.session_path))
+        settings = replace(
+            self.settings,
+            risk=replace(self.settings.risk, live_risk_approval_enabled=True),
+        )
+        self.loop = PaperTradingLoop(
+            settings,
+            strategy_name="hybrid_meta_v2",
+            state_store=state_store,
+            session_store=session_store,
+            execution_mode="live_dry_run",
+        )
+        signal = StrategySignal(
+            strategy_name="hybrid_meta_v2",
+            pair="B-BTC_USDT",
+            interval="5m",
+            action=SignalAction.ENTER_LONG,
+            direction=SignalDirection.LONG,
+            confidence=Decimal("1"),
+            reason="test",
+            timestamp_ms=1000,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("95"),
+            take_profit=Decimal("110"),
+        )
+        decision = RiskDecision(
+            approved=True,
+            reason="approved",
+            signal=signal,
+            position_size=Decimal("1"),
+            leverage=Decimal("1"),
+        )
+        fake_report = LiveExecutionReport(
+            accepted=True,
+            dry_run=True,
+            reason="dry run",
+            order_request={"pair": "B-BTC_USDT", "side": "buy"},
+            risk_decision=decision,
+            signal=signal,
+            metadata={"live_pilot": True},
+        )
+        self.loop.live_execution_engine = MagicMock()
+        self.loop.live_execution_engine.process_decision.return_value = fake_report
+
+        live_report = self.loop._execute_live_decision(decision)
+        shadow_decision = self.loop._with_live_execution_metadata(decision, live_report)
+
+        self.assertTrue(live_report.accepted)
+        self.assertTrue(shadow_decision.signal.metadata["live_pilot"])
+        self.assertTrue(shadow_decision.signal.metadata["live_dry_run"])
+        self.assertEqual(shadow_decision.signal.metadata["execution_mode"], "live_dry_run")
+        self.assertEqual(
+            shadow_decision.signal.metadata["live_order_request"]["side"],
+            "buy",
+        )
+        self.assertEqual(self.loop._live_sync_status["reason"], "dry run")
+
+    def test_publish_snapshot_includes_live_execution_fields(self) -> None:
+        state_store = PaperStateStore(str(self.db_path))
+        session_store = PaperSessionStore(str(self.session_path))
+        self.loop = PaperTradingLoop(
+            self.settings,
+            strategy_name="hybrid_meta_v2",
+            state_store=state_store,
+            session_store=session_store,
+            execution_mode="live_dry_run",
+        )
+
+        self.loop._publish_live_snapshot(interval="5m", last_updated="test")
+
+        from app.live.paper_loop import get_live_state
+        state = get_live_state()
+        self.assertEqual(state["execution_mode"], "live_dry_run")
+        self.assertTrue(state["live_dry_run"])
+        self.assertEqual(state["live_positions_json"], "[]")
+        self.assertIn("live_dry_run", state["live_sync_json"])
+
+    def test_live_shadow_exit_closes_paper_only_after_live_accepts(self) -> None:
+        from app.execution.live import LiveExecutionReport
+        from app.risk.models import RiskDecision
+        from app.strategies.base import SignalAction, SignalDirection, StrategySignal
+
+        self.loop = PaperTradingLoop(
+            self.settings,
+            strategy_name="hybrid_meta_v2",
+            state_store=PaperStateStore(str(self.db_path)),
+            session_store=PaperSessionStore(str(self.session_path)),
+            execution_mode="live_dry_run",
+        )
+        entry_signal = StrategySignal(
+            strategy_name="hybrid_meta_v2",
+            pair="B-BTC_USDT",
+            interval="5m",
+            action=SignalAction.ENTER_LONG,
+            direction=SignalDirection.LONG,
+            confidence=Decimal("1"),
+            reason="entry",
+            timestamp_ms=1000,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("95"),
+            take_profit=Decimal("101"),
+            metadata={"live_position_id": "pos-1"},
+        )
+        self.loop.broker.execute_decision(
+            RiskDecision(
+                approved=True,
+                reason="approved",
+                signal=entry_signal,
+                position_size=Decimal("1"),
+                leverage=Decimal("1"),
+            ),
+            market_price=Decimal("100"),
+            timestamp_ms=1000,
+        )
+        fake_report = LiveExecutionReport(
+            accepted=True,
+            dry_run=True,
+            reason="exit dry run",
+            order_request={"pair": "B-BTC_USDT", "action": "exit_position"},
+            signal=StrategySignal(
+                strategy_name="hybrid_meta_v2",
+                pair="B-BTC_USDT",
+                interval="5m",
+                action=SignalAction.EXIT_LONG,
+                direction=SignalDirection.LONG,
+                confidence=Decimal("1"),
+                reason="exit",
+                timestamp_ms=2000,
+            ),
+            metadata={"live_pilot": True},
+        )
+        self.loop.live_execution_engine = MagicMock()
+        self.loop.live_execution_engine.process_decision.return_value = fake_report
+
+        reports = self.loop._process_candle_for_execution_mode(
+            _candle(1, Decimal("101"), pair="B-BTC_USDT"),
+        )
+
+        self.assertEqual(len(reports), 1)
+        self.assertNotIn("B-BTC_USDT", self.loop.broker.positions)
+        self.loop.live_execution_engine.process_decision.assert_called_once()
+
+    def test_live_shadow_exit_rejection_keeps_paper_position_open(self) -> None:
+        from app.execution.live import LiveExecutionReport
+        from app.risk.models import RiskDecision
+        from app.strategies.base import SignalAction, SignalDirection, StrategySignal
+
+        self.loop = PaperTradingLoop(
+            self.settings,
+            strategy_name="hybrid_meta_v2",
+            state_store=PaperStateStore(str(self.db_path)),
+            session_store=PaperSessionStore(str(self.session_path)),
+            execution_mode="live_pilot",
+        )
+        entry_signal = StrategySignal(
+            strategy_name="hybrid_meta_v2",
+            pair="B-BTC_USDT",
+            interval="5m",
+            action=SignalAction.ENTER_LONG,
+            direction=SignalDirection.LONG,
+            confidence=Decimal("1"),
+            reason="entry",
+            timestamp_ms=1000,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("95"),
+            take_profit=Decimal("101"),
+            metadata={"live_position_id": "pos-1"},
+        )
+        self.loop.broker.execute_decision(
+            RiskDecision(
+                approved=True,
+                reason="approved",
+                signal=entry_signal,
+                position_size=Decimal("1"),
+                leverage=Decimal("1"),
+            ),
+            market_price=Decimal("100"),
+            timestamp_ms=1000,
+        )
+        self.loop.live_execution_engine = MagicMock()
+        self.loop.live_execution_engine.process_decision.return_value = LiveExecutionReport(
+            accepted=False,
+            dry_run=False,
+            reason="exchange still open",
+            signal=entry_signal,
+            metadata={"live_pilot": True},
+        )
+
+        reports = self.loop._process_candle_for_execution_mode(
+            _candle(1, Decimal("101"), pair="B-BTC_USDT"),
+        )
+
+        self.assertEqual(reports, [])
+        self.assertIn("B-BTC_USDT", self.loop.broker.positions)
+        self.assertTrue(self.loop._stop_requested)
+
+    def test_daily_loss_force_close_uses_each_positions_own_pair_price(self) -> None:
+        from app.risk.models import RiskDecision
+        from app.strategies.base import SignalAction, SignalDirection, StrategySignal
+
+        settings = replace(
+            self.settings,
+            paper_starting_equity=Decimal("100000"),
+            risk=replace(
+                self.settings.risk,
+                maker_fee_rate=Decimal("0"),
+                taker_fee_rate=Decimal("0"),
+                fee_gst_rate=Decimal("0"),
+                slippage_pct=Decimal("0"),
+                stop_slippage_pct=Decimal("0"),
+            ),
+        )
+        self.loop = PaperTradingLoop(
+            settings,
+            strategy_name="hybrid_meta_v2",
+            state_store=PaperStateStore(str(self.db_path)),
+            session_store=PaperSessionStore(str(self.session_path)),
+        )
+
+        eden_entry = StrategySignal(
+            strategy_name="hybrid_meta_v2",
+            pair="B-EDEN_USDT",
+            interval="1m",
+            action=SignalAction.ENTER_SHORT,
+            direction=SignalDirection.SHORT,
+            confidence=Decimal("1"),
+            reason="entry",
+            timestamp_ms=1000,
+            entry_price=Decimal("0.08"),
+            stop_loss=Decimal("0.09"),
+        )
+        bsb_entry = StrategySignal(
+            strategy_name="hybrid_meta_v2",
+            pair="B-BSB_USDT",
+            interval="1m",
+            action=SignalAction.ENTER_SHORT,
+            direction=SignalDirection.SHORT,
+            confidence=Decimal("1"),
+            reason="entry",
+            timestamp_ms=1000,
+            entry_price=Decimal("0.68"),
+            stop_loss=Decimal("0.72"),
+        )
+        for signal in (eden_entry, bsb_entry):
+            self.loop.broker.execute_decision(
+                RiskDecision(
+                    approved=True,
+                    reason="approved",
+                    signal=signal,
+                    position_size=Decimal("10"),
+                    leverage=Decimal("1"),
+                ),
+                market_price=signal.entry_price,
+                timestamp_ms=1000,
+            )
+        self.loop.broker.update_mark_prices({"B-EDEN_USDT": Decimal("0.075")})
+
+        reports = self.loop._force_close_all_positions(
+            _candle(2, Decimal("0.67"), pair="B-BSB_USDT", interval="1m"),
+            reason="daily_loss_circuit_breaker",
+        )
+
+        prices = {report.fill.pair: report.fill.price for report in reports if report.fill}
+        self.assertEqual(prices["B-EDEN_USDT"], Decimal("0.075"))
+        self.assertEqual(prices["B-BSB_USDT"], Decimal("0.67"))
+
 
 if __name__ == "__main__":
     unittest.main()

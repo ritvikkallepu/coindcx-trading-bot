@@ -624,15 +624,15 @@ class PaperBrokerTests(unittest.TestCase):
         )
         position = broker.open_positions()[0]
 
-        # Intrabar-aware trailing: best_price=110. stop=110-(2*2)=106.
-        self.assertEqual(position.stop_loss, Decimal("106"))
+        # Close-confirmed trailing: best_price=108. stop=108-(2*2)=104.
+        self.assertEqual(position.stop_loss, Decimal("104"))
         self.assertEqual(position.take_profit, Decimal("110"))
         self.assertTrue(position.metadata["atr_dynamic_exit_active"])
 
         reports = engine.process_candle(
             _candle(
                 open_price=Decimal("107"),
-                low=Decimal("105"),
+                low=Decimal("103"), # Hits 104 stop
                 high=Decimal("108"),
                 close=Decimal("106"),
             )
@@ -640,7 +640,7 @@ class PaperBrokerTests(unittest.TestCase):
 
         self.assertEqual(len(reports), 1)
         self.assertEqual(reports[0].reason, "Dynamic ATR stop triggered.")
-        self.assertEqual(reports[0].fill.price, Decimal("106"))  # type: ignore[union-attr]
+        self.assertEqual(reports[0].fill.price, Decimal("104"))  # type: ignore[union-attr]
 
     def test_dynamic_atr_exits_manage_position_missing_dynamic_flag(self) -> None:
         broker = PaperBroker(starting_equity=Decimal("1000"))
@@ -669,7 +669,7 @@ class PaperBrokerTests(unittest.TestCase):
         )
         position = broker.open_positions()[0]
 
-        self.assertEqual(position.stop_loss, Decimal("106"))
+        self.assertEqual(position.stop_loss, Decimal("104"))
         self.assertTrue(position.metadata["atr_dynamic_exits_enabled"])
         self.assertTrue(position.metadata["atr_dynamic_exit_active"])
 

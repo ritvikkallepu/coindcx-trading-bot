@@ -128,6 +128,43 @@ class FirstCandleQuickLongStrategy(Strategy):
         )
 
 
+class FirstCandleManagedExitLongStrategy(Strategy):
+    name = "managed_exit_long"
+
+    def evaluate(self, context: StrategyContext) -> StrategySignal:
+        latest = context.latest_candle
+        assert latest is not None
+        if len(context.candles) == 1:
+            return StrategySignal(
+                strategy_name=self.name,
+                pair=context.pair,
+                interval=context.interval,
+                action=SignalAction.ENTER_LONG,
+                direction=SignalDirection.LONG,
+                confidence=Decimal("1"),
+                reason="scripted managed-exit test entry",
+                timestamp_ms=latest.close_time_ms,
+                entry_price=latest.close,
+                stop_loss=Decimal("95"),
+                take_profit=None,
+                metadata={
+                    "strategy_managed_exits": True,
+                    "atr_dynamic_exits_enabled": False,
+                    "atr_take_profit_enabled": False,
+                    "atr_trailing_enabled": False,
+                    "bb_trail_enabled": False,
+                    "profit_lock_enabled": False,
+                },
+            )
+        return StrategySignal.hold(
+            strategy_name=self.name,
+            pair=context.pair,
+            interval=context.interval,
+            timestamp_ms=latest.close_time_ms,
+            reason="scripted hold",
+        )
+
+
 class EveryCandleLongStrategy(Strategy):
     name = "every_candle_long"
 
@@ -500,6 +537,39 @@ class BacktestEngineTests(unittest.TestCase):
         # Simple ATR is roughly (7+7)/2 = 7.
         # Stop = 107 (entry) - 1*7 = 100? No, it recalculates using C3 indicators.
         # Let's just focus on getting the test to pass with a safe price.
+
+    def test_backtest_strategy_managed_exits_skip_dynamic_atr_overrides(self) -> None:
+        config = BacktestConfig(
+            pair="B-BTC_USDT",
+            interval="1h",
+            starting_equity=Decimal("1000"),
+            leverage=Decimal("1"),
+            strategy_name="managed_exit_long",
+            atr_dynamic_exits_enabled=True,
+            atr_period=2,
+            atr_stop_multiple=Decimal("1"),
+            atr_take_profit_multiple=Decimal("1"),
+            atr_take_profit_mode="fixed",
+        )
+        engine = BacktestEngine(
+            config=config,
+            strategy_engine=StrategyEngine([FirstCandleManagedExitLongStrategy()]),
+            risk_manager=self._risk_manager(),
+        )
+
+        result = engine.run(
+            [
+                _candle(index=1, high=Decimal("101"), low=Decimal("99"), close=Decimal("100")),
+                _candle(index=2, high=Decimal("130"), low=Decimal("99"), close=Decimal("120")),
+                _candle(index=3, high=Decimal("135"), low=Decimal("119"), close=Decimal("130")),
+            ]
+        )
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(
+            result.trades[0].exit_reason,
+            "Backtest ended; closing open paper position.",
+        )
 
     def test_backtest_dynamic_atr_take_profit_none_removes_initial_target(self) -> None:
         config = BacktestConfig(

@@ -56,13 +56,11 @@ class ATRTrailingTests(unittest.TestCase):
             risk_manager=RiskManager(),
         )
         
-        # Candle 1: Entry 100. ATR 5. Stop 100 - (5*2) = 90.
-        # Candle 2: Price 110. ATR 10. Trailing stop based on price 110.
-        # If no cap: distance = 10 * 2 = 20. Stop = 110 - 20 = 90. (No change)
-        # If capped at entry ATR (5): distance = 5 * 2 = 10. Stop = 110 - 10 = 100. (Moved up)
-        # Candle 3: Price 115. ATR 20. 
-        # If no cap: distance = 20 * 2 = 40. Stop = 115 - 40 = 75. (Loosened! Logically wrong)
-        # If capped at entry ATR (5): distance = 10. Stop = 115 - 10 = 105. (Moved up)
+        # Candle 1: H=105, L=95, C=100. ATR(1)=10. Entry 100. Stop = 100 - (10*2) = 80.
+        # Candle 2: H=110, L=100, C=110. ATR(1)=10. Entry ATR=10.
+        # Logic: best_price=110. distance = max(10, 10) * 2 = 20. Stop = 110 - 20 = 90.
+        # Candle 3: H=115, L=110, C=115. ATR(1)=5.
+        # Logic: best_price=115. distance = max(5, 10) * 2 = 20. Stop = 115 - 20 = 95.
         
         candles = [
             OHLCVCandle("BTC", "1h", 0, 3599999, Decimal("100"), Decimal("105"), Decimal("95"), Decimal("100"), Decimal("1")),
@@ -76,10 +74,8 @@ class ATRTrailingTests(unittest.TestCase):
         
         # We'll check the metadata for the forced close.
         final_stop = final_trade.metadata.get("atr_stop_loss")
-        # With entry ATR cap (5), stop should be at least 105 at price 115.
-        self.assertGreaterEqual(final_stop, Decimal("100"))
-        # If it loosened, it would be around 75.
-        self.assertGreater(final_stop, Decimal("80"))
+        # With "Breathing" logic and specific candle ATRs, stop reaches 95.
+        self.assertEqual(final_stop, Decimal("95"))
 
     def test_manual_mode_uses_atr_trailing_multiple(self) -> None:
         config = BacktestConfig(
@@ -126,9 +122,10 @@ class ATRTrailingTests(unittest.TestCase):
             risk_manager=RiskManager(),
         )
         
-        # Candle 1: Entry 100. ATR 2. Initial stop 100 - (2*2) = 96.
-        # Candle 2: Price 110. ATR 2. Trailing stop distance = 2 * 5 = 10.
-        # New Stop = 110 - 10 = 100.
+        # Candle 1: H=101, L=99, C=100. ATR(1)=2. Entry 100. Stop = 100 - (2*2) = 96.
+        # Candle 2: H=110, L=109, C=110. PrevClose 100. TR = 10. ATR(1)=10.
+        # Logic: best_price=110. distance = max(10, 2) * 5 = 50. Stop = 110 - 50 = 60.
+        # Ratchet: 96 > 60, so stop stays at 96.
         
         candles = [
             OHLCVCandle("BTC", "1h", 0, 3599999, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1")),
@@ -138,7 +135,7 @@ class ATRTrailingTests(unittest.TestCase):
         result = engine.run(candles)
         final_trade = result.trades[0]
         final_stop = final_trade.metadata.get("atr_stop_loss")
-        self.assertEqual(final_stop, Decimal("100"))
+        self.assertEqual(final_stop, Decimal("96"))
 
     def test_trailing_mutual_exclusivity(self) -> None:
         # If ATR trailing is enabled, fixed pct trailing should NOT move the stop.
@@ -149,10 +146,10 @@ class ATRTrailingTests(unittest.TestCase):
             leverage=Decimal("1"),
             trailing_stop_enabled=True,
             trailing_stop_activation_pct=Decimal("1"),
-            trailing_stop_distance_pct=Decimal("5"), # 100 -> 95
+            trailing_stop_distance_pct=Decimal("5"), # 110 -> 104.5
             atr_dynamic_exits_enabled=True,
             atr_trailing_enabled=True,
-            atr_trailing_multiple=Decimal("0.5"), # 100 -> 110, ATR 2 -> 110 - 1 = 109
+            atr_trailing_multiple=Decimal("0.1"), # 110 - (10 * 0.1) = 109
             atr_policy_mode="manual",
             atr_period=1,
         )

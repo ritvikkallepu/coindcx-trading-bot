@@ -107,8 +107,11 @@ class PaperStateStore:
             return [self._serialize_decimal(i) for i in obj]
         return obj
 
-    def _deserialize_decimal(self, obj: Any) -> Any:
+    def _deserialize_decimal(self, obj: Any, *, key: str = "") -> Any:
         if isinstance(obj, str):
+            normalized_key = key.lower()
+            if any(hint in normalized_key for hint in _STRING_METADATA_KEY_HINTS):
+                return obj
             s = obj.lstrip("-")
             if s.isdigit() or ("." in s and s.replace(".", "", 1).isdigit()):
                 try:
@@ -116,9 +119,9 @@ class PaperStateStore:
                 except Exception:
                     pass
         if isinstance(obj, dict):
-            return {k: self._deserialize_decimal(v) for k, v in obj.items()}
+            return {k: self._deserialize_decimal(v, key=str(k)) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [self._deserialize_decimal(i) for i in obj]
+            return [self._deserialize_decimal(i, key=key) for i in obj]
         return obj
 
     def save(self, snapshot: dict[str, Any]) -> None:

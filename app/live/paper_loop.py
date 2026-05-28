@@ -4,7 +4,7 @@ import logging
 import threading
 import json
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -14,6 +14,7 @@ from app.data.candle_builder import CandleSeries, OHLCVCandle, interval_to_ms
 from app.data.gap_guard import CandleGapGuard
 from app.data.indicators import BollingerBandPoint, bollinger_bands, latest_indicator_snapshot
 from app.data.pipeline import MarketDataPipeline
+from app.execution.live import LiveExecutionEngine, LiveExecutionReport
 from app.exchange.coindcx_rest import CoinDCXFuturesClient
 from app.exchange.coindcx_ws import CoinDCXFuturesWebSocketClient, MarketSubscription
 from app.exchange.coindcx_channels import futures_candle_channel, futures_orderbook_channel
@@ -25,69 +26,11 @@ from app.risk.models import OpenPosition, RiskDecision
 from app.risk.limits import is_entry_signal, is_exit_signal
 from app.risk.pair_profiles import apply_pair_profile_to_config, pair_profile_for
 from app.risk.pair_performance import pair_recent_risk_profile
-from app.strategies.base import StrategyEngine, StrategyContext, SignalAction, SignalDirection
+from app.strategies.base import StrategyEngine, StrategyContext, SignalAction, SignalDirection, StrategySignal
 from app.strategies.defaults import STRATEGY_CHOICES, strategy_engine_for_name
 from app.utils.json import to_jsonable
+from app.live.state import LivePaperState, _update_live_state, get_live_state, reset_live_state
 from app.live.summary_logger import PaperTradingSummaryLogger
-
-
-@dataclass
-class LivePaperState:
-    running: bool = False
-    pair: str = ""
-    watchlist: list[str] = field(default_factory=list)
-    scanned_pairs: dict[str, str] = field(default_factory=dict)
-    interval: str = ""
-    strategy: str = ""
-    candle_count: int = 0
-    equity: str = "0"
-    starting_equity: str = "0"
-    realized_pnl: str = "0"
-    unrealized_pnl: str = "0"
-    net_realized_pnl: str = "0"
-    fees_paid: str = "0"
-    open_notional: str = "0"
-    return_abs: str = "0"
-    return_pct: str = "0"
-    max_drawdown_pct: str = "0"
-    peak_equity: str = "0"
-    open_positions: int = 0
-    total_fills: int = 0
-    positions_json: str = "[]"
-    equity_history_json: str = "[]"
-    candles_json: str = "{}"
-    last_updated: str = ""
-    error: str = ""
-    entry_type_counts: dict[str, int] = field(default_factory=dict)
-    recent_diagnostics: list[dict[str, Any]] = field(default_factory=list)
-    pair_profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
-    pair_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
-    
-    # Profit Locking Fields
-    initial_equity: str = "0"
-    total_equity: str = "0"
-    tradable_equity: str = "0"
-    tradable_base: str = "0"
-    locked_profit: str = "0"
-    unlocked_profit: str = "0"
-    daily_loss_from_tradable_base: str = "0"
-    profit_lock_enabled: bool = True
-    protected_profit_override_enabled: bool = False
-
-
-_state_lock = threading.Lock()
-_live_state = LivePaperState()
-
-
-def get_live_state() -> dict:
-    with _state_lock:
-        return asdict(_live_state)
-
-
-def _update_live_state(**kwargs) -> None:
-    with _state_lock:
-        for k, v in kwargs.items():
-            setattr(_live_state, k, v)
 
 
 def _decimal_metadata(value: Any, default: Decimal) -> Decimal:
@@ -97,6 +40,15 @@ def _decimal_metadata(value: Any, default: Decimal) -> Decimal:
         return Decimal(str(value))
     except Exception:
         return default
+
+
+def _fmt_diag_decimal(value: Any, *, places: int) -> str:
+    try:
+        decimal_value = Decimal(str(value))
+    except Exception:
+        return "-"
+    quant = Decimal("1").scaleb(-places)
+    return str(decimal_value.quantize(quant))
 
 
 def _bool_metadata(value: Any, default: bool = False) -> bool:
@@ -163,6 +115,10 @@ def _paper_exit_reason(fill: PaperFill) -> str:
         if "dynamic atr" in detail_l:
             return "dynamic_atr_take_profit"
         return "take_profit"
+    if trigger_type == "strategy_momentum_exit":
+        if "rsi/macd" in detail_l:
+            return "rsi_macd_exit"
+        return "strategy_momentum_exit"
     return trigger_type or detail or "signal"
 
 
@@ -285,9 +241,15 @@ class PaperTradingLoop:
         state_store: PaperStateStore | None = None,
         session_store: PaperSessionStore | None = None,
         pair_overrides: dict[str, dict[str, Any]] | None = None,
+        execution_mode: str = "paper",
     ) -> None:
         self.settings = settings
         self.logger = logging.getLogger(__name__)
+        normalized_execution_mode = str(execution_mode or "paper").strip().lower()
+        if normalized_execution_mode not in {"paper", "live_dry_run", "live_pilot"}:
+            raise ValueError(f"Unsupported execution mode: {execution_mode}")
+        self.execution_mode = normalized_execution_mode
+        self.live_dry_run = normalized_execution_mode != "live_pilot"
         
         self.strategy_engine = strategy_engine_for_name(strategy_name)
         self._strategy_engines_by_name: dict[str, StrategyEngine] = {
@@ -317,6 +279,15 @@ class PaperTradingLoop:
         
         self.summary_logger = PaperTradingSummaryLogger()
         self.client = CoinDCXFuturesClient(settings)
+        self.live_execution_engine: LiveExecutionEngine | None = (
+            LiveExecutionEngine(self.client, settings, dry_run=self.live_dry_run)
+            if self._live_execution_enabled
+            else None
+        )
+        self._live_execution_reports: list[dict[str, Any]] = []
+        self._live_positions: dict[str, dict[str, Any]] = {}
+        self._live_orders: list[dict[str, Any]] = []
+        self._live_sync_status: dict[str, Any] = {}
         
         # Multi-pair infrastructure
         self.series: dict[str, CandleSeries] = {}
@@ -394,6 +365,221 @@ class PaperTradingLoop:
             writer = csv.writer(f)
             writer.writerow(row)
 
+    @property
+    def _live_execution_enabled(self) -> bool:
+        return self.execution_mode in {"live_dry_run", "live_pilot"}
+
+    def _record_live_execution_report(self, report: LiveExecutionReport) -> None:
+        data = report.to_dict()
+        self._live_execution_reports.append(data)
+        if len(self._live_execution_reports) > 50:
+            del self._live_execution_reports[:-50]
+
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        sync = metadata.get("live_sync") if isinstance(metadata.get("live_sync"), dict) else {}
+        signal = data.get("signal") if isinstance(data.get("signal"), dict) else {}
+        pair = str(signal.get("pair") or "")
+
+        if sync:
+            self._live_sync_status = {
+                "accepted": report.accepted,
+                "dry_run": report.dry_run,
+                "reason": report.reason,
+                "sync": sync,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            position = sync.get("position")
+            if isinstance(position, dict) and position.get("pair"):
+                self._live_positions[str(position["pair"])] = position
+            orders = sync.get("orders")
+            if isinstance(orders, list):
+                self._live_orders = [item for item in orders if isinstance(item, dict)][-50:]
+        else:
+            self._live_sync_status = {
+                "accepted": report.accepted,
+                "dry_run": report.dry_run,
+                "reason": report.reason,
+                "pair": pair,
+                "order_request": data.get("order_request"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def _live_position_id_from_report(self, report: LiveExecutionReport) -> str:
+        metadata = report.metadata if isinstance(report.metadata, dict) else {}
+        sync = metadata.get("live_sync") if isinstance(metadata.get("live_sync"), dict) else {}
+        position = sync.get("position") if isinstance(sync.get("position"), dict) else {}
+        return str(position.get("position_id") or "").strip()
+
+    def _with_live_execution_metadata(
+        self,
+        decision: RiskDecision,
+        report: LiveExecutionReport,
+    ) -> RiskDecision:
+        live_report = report.to_dict()
+        live_metadata: dict[str, Any] = {
+            "execution_mode": self.execution_mode,
+            "live_dry_run": report.dry_run,
+            "live_pilot": True,
+            "live_execution_report": live_report,
+        }
+        position_id = self._live_position_id_from_report(report)
+        if position_id:
+            live_metadata["live_position_id"] = position_id
+        if report.order_request:
+            live_metadata["live_order_request"] = report.order_request
+
+        signal = replace(
+            decision.signal,
+            metadata={**decision.signal.metadata, **live_metadata},
+        )
+        return replace(
+            decision,
+            signal=signal,
+            metadata={**decision.metadata, **live_metadata},
+        )
+
+    def _execute_live_decision(self, decision: RiskDecision) -> LiveExecutionReport:
+        if self.live_execution_engine is None:
+            return LiveExecutionReport(
+                accepted=False,
+                dry_run=True,
+                reason="Live execution engine is not configured.",
+                risk_decision=decision,
+                signal=decision.signal,
+                metadata={"live_pilot": True},
+            )
+        report = self.live_execution_engine.process_decision(decision)
+        self._record_live_execution_report(report)
+        if not report.accepted:
+            _update_live_state(
+                error=report.reason,
+                last_updated=datetime.now(timezone.utc).isoformat(),
+            )
+            self.logger.error("[live_execution] %s", report.reason)
+            if not report.dry_run:
+                self._stop_requested = True
+        return report
+
+    def _mirror_live_shadow_exit_reports(
+        self,
+        reports: list[PaperExecutionReport],
+        candle: OHLCVCandle,
+    ) -> None:
+        if not self._live_execution_enabled:
+            return
+        for report in reports:
+            if not report.accepted or report.fill is None or report.signal is None:
+                continue
+            if not _is_position_close_fill(report.fill):
+                continue
+            signal = report.signal
+            metadata = dict(signal.metadata)
+            position_metadata = report.position.metadata if report.position is not None else {}
+            position_id = str(position_metadata.get("live_position_id") or "").strip()
+            if position_id:
+                metadata["live_position_id"] = position_id
+            exit_signal = replace(
+                signal,
+                timestamp_ms=candle.close_time_ms,
+                metadata=metadata,
+            )
+            decision = RiskDecision(
+                approved=True,
+                reason=report.reason or "paper_shadow_exit",
+                signal=exit_signal,
+                metadata={"paper_shadow_exit": True},
+            )
+            live_report = self._execute_live_decision(decision)
+            if not live_report.accepted:
+                self.logger.error(
+                    "[live_execution] Shadow exit for %s was not confirmed: %s",
+                    candle.pair,
+                    live_report.reason,
+                )
+
+    def _process_candle_for_execution_mode(
+        self,
+        candle: OHLCVCandle,
+    ) -> list[PaperExecutionReport]:
+        if not self._live_execution_enabled:
+            return self.broker.process_candle(candle)
+        return self._process_live_shadow_candle(candle)
+
+    def _process_live_shadow_candle(
+        self,
+        candle: OHLCVCandle,
+    ) -> list[PaperExecutionReport]:
+        day = datetime.fromtimestamp(
+            candle.close_time_ms / 1000,
+            tz=timezone.utc,
+        ).date().isoformat()
+        if self.broker.last_pnl_reset_day != day:
+            self.broker.daily_loss_from_tradable_base = Decimal("0")
+            self.broker.daily_tradable_base_start = self.broker.tradable_base
+            self.broker.protected_profit_override_enabled = False
+            self.broker.last_pnl_reset_day = day
+            self.broker._save_state()
+
+        position = self.broker.positions.get(candle.pair)
+        if position is None:
+            return []
+
+        trigger = self.broker._trigger_for_position(position, candle)
+        if trigger is None:
+            self.broker._update_trailing_stop(position, candle)
+            self.broker._save_state()
+            return []
+
+        if trigger.metadata.get("partial_close"):
+            message = (
+                "Live partial close is not implemented yet; keeping shadow "
+                f"position open for {position.pair}."
+            )
+            self.logger.error("[live_execution] %s", message)
+            _update_live_state(
+                error=message,
+                last_updated=datetime.now(timezone.utc).isoformat(),
+            )
+            return []
+
+        metadata = {
+            "paper_trigger": True,
+            **trigger.metadata,
+            "live_position_id": str(position.metadata.get("live_position_id") or ""),
+        }
+        signal = StrategySignal(
+            strategy_name=position.strategy_name,
+            pair=position.pair,
+            interval=candle.interval,
+            action=trigger.action,
+            direction=position.direction,
+            confidence=Decimal("1"),
+            reason=trigger.reason,
+            timestamp_ms=candle.close_time_ms,
+            entry_price=trigger.price,
+            metadata=metadata,
+        )
+        live_decision = RiskDecision(
+            approved=True,
+            reason=trigger.reason,
+            signal=signal,
+            metadata={"paper_shadow_exit": True},
+        )
+        live_report = self._execute_live_decision(live_decision)
+        if not live_report.accepted:
+            return []
+
+        shadow_decision = self._with_live_execution_metadata(live_decision, live_report)
+        report = self.broker._close_from_signal(
+            shadow_decision.signal,
+            market_price=trigger.price,
+            timestamp_ms=candle.close_time_ms,
+            risk_decision=shadow_decision,
+            reason=trigger.reason,
+        )
+        self.broker._save_state()
+        return [report]
+
     def _write_audit_row(
         self, 
         candle: OHLCVCandle, 
@@ -467,6 +653,8 @@ class PaperTradingLoop:
             "volume_ratio": f"{vol_ratio:.2f}",
             "body_ratio": f"{body_ratio:.2f}",
             "extension_atr": f"{m.get('execution_extension_atr') or m.get('extension_atr') or 0:.2f}",
+            "rsi": _fmt_diag_decimal(m.get("rsi"), places=2),
+            "macd_histogram": _fmt_diag_decimal(m.get("macd_histogram"), places=6),
             "bb_position": bb_position_text,
             "bb_gate": bb_gate,
             "breakout_age": m.get("breakout_age") or 0,
@@ -560,9 +748,27 @@ class PaperTradingLoop:
                     "bb_trail_partial_close_pct": str(metadata.get("bb_trail_partial_close_pct") or ""),
                     "tp_is_partial_close": _bool_metadata(metadata.get("tp_is_partial_close"), False),
                     "bb_partial_close_executed": _bool_metadata(metadata.get("bb_partial_close_executed"), False),
+                    "execution_mode": metadata.get("execution_mode") or self.execution_mode,
+                    "live_dry_run": _bool_metadata(metadata.get("live_dry_run"), self.live_dry_run),
+                    "live_position_id": str(metadata.get("live_position_id") or ""),
+                    "live_pilot": _bool_metadata(metadata.get("live_pilot"), False),
                 }
             )
         return rows
+
+    def _live_positions_payload(self) -> list[dict[str, Any]]:
+        return list(self._live_positions.values())
+
+    def _live_orders_payload(self) -> list[dict[str, Any]]:
+        return list(self._live_orders)
+
+    def _live_sync_payload(self) -> dict[str, Any]:
+        return {
+            **self._live_sync_status,
+            "execution_mode": self.execution_mode,
+            "live_dry_run": self.live_dry_run,
+            "recent_reports": self._live_execution_reports[-10:],
+        }
 
     def _latest_mark_price_for_position(self, pair: str, fallback: Decimal) -> Decimal:
         mark_price = self.broker.mark_price_for(pair)
@@ -582,6 +788,75 @@ class PaperTradingLoop:
                 return Decimal(str(latest_close))
 
         return fallback
+
+    def _mark_prices_for_open_positions(self, candle: OHLCVCandle) -> dict[str, Decimal]:
+        prices: dict[str, Decimal] = {}
+        for position in self.broker.open_positions():
+            if position.pair == candle.pair:
+                prices[position.pair] = candle.close
+            else:
+                prices[position.pair] = self._latest_mark_price_for_position(
+                    position.pair,
+                    position.entry_price,
+                )
+        return prices
+
+    def _force_close_price_for_position(
+        self,
+        position: PaperPosition,
+        candle: OHLCVCandle,
+    ) -> Decimal:
+        if position.pair == candle.pair:
+            return candle.close
+        return self._latest_mark_price_for_position(position.pair, position.entry_price)
+
+    def _force_close_all_positions(
+        self,
+        candle: OHLCVCandle,
+        *,
+        reason: str,
+    ) -> list[PaperExecutionReport]:
+        reports: list[PaperExecutionReport] = []
+        for pos in list(self.broker.open_positions()):
+            action = (
+                SignalAction.EXIT_LONG
+                if pos.direction == SignalDirection.LONG
+                else SignalAction.EXIT_SHORT
+            )
+            exit_price = self._force_close_price_for_position(pos, candle)
+            exit_signal = StrategySignal(
+                strategy_name=pos.strategy_name,
+                pair=pos.pair,
+                interval=candle.interval,
+                action=action,
+                confidence=Decimal("1"),
+                direction=pos.direction,
+                timestamp_ms=candle.close_time_ms,
+                entry_price=exit_price,
+                reason=reason,
+                metadata={
+                    "force_close_trigger_pair": candle.pair,
+                    "force_close_price_pair": pos.pair,
+                    "live_position_id": str(pos.metadata.get("live_position_id") or ""),
+                },
+            )
+            exit_decision = RiskDecision(
+                approved=True,
+                reason=reason,
+                signal=exit_signal,
+            )
+            if self._live_execution_enabled:
+                live_report = self._execute_live_decision(exit_decision)
+                if not live_report.accepted:
+                    continue
+                exit_decision = self._with_live_execution_metadata(exit_decision, live_report)
+            report = self.broker.execute_decision(
+                exit_decision,
+                market_price=exit_price,
+                timestamp_ms=candle.close_time_ms,
+            )
+            reports.append(report)
+        return reports
 
     def _candle_payload(self, candle: OHLCVCandle) -> dict[str, Any]:
         return {
@@ -683,6 +958,8 @@ class PaperTradingLoop:
                 scanned[pair] = "Not initialized"
 
         update: dict[str, Any] = {
+            "execution_mode": self.execution_mode,
+            "live_dry_run": self.live_dry_run,
             "candle_count": self.candle_count,
             "equity": str(snapshot.equity),
             "realized_pnl": str(self.broker.realized_pnl),
@@ -702,6 +979,9 @@ class PaperTradingLoop:
             "open_positions": len(self.broker.positions),
             "total_fills": len(self.broker.fills),
             "positions_json": json.dumps(to_jsonable(self._positions_payload())),
+            "live_positions_json": json.dumps(to_jsonable(self._live_positions_payload())),
+            "live_orders_json": json.dumps(to_jsonable(self._live_orders_payload())),
+            "live_sync_json": json.dumps(to_jsonable(self._live_sync_payload())),
             "equity_history_json": json.dumps(to_jsonable(self.equity_history[-500:])),
             "candles_json": json.dumps(to_jsonable(self._candles_payload())),
             "watchlist": watchlist,
@@ -858,6 +1138,9 @@ class PaperTradingLoop:
         snapshot = self.broker.snapshot()
         state = {
             "candle_count": self.candle_count,
+            "execution_mode": self.execution_mode,
+            "live_dry_run": self.live_dry_run,
+            "live_sync_status": self._live_sync_status,
             "watchlist": self._watchlist_snapshot(),
             "equity_history": self.equity_history,
             "candle_history": self.candle_history,
@@ -1455,6 +1738,8 @@ class PaperTradingLoop:
         
         _update_live_state(
             running=True,
+            execution_mode=self.execution_mode,
+            live_dry_run=self.live_dry_run,
             pair=", ".join(pairs),
             interval=strategy_interval,
             strategy=self.strategy_engine.strategies[0].name if self.strategy_engine.strategies else "unknown",
@@ -1893,10 +2178,11 @@ class PaperTradingLoop:
         
         atr_val = indicators.atr
 
-        self._handle_broker_reports(self.broker.process_candle(candle), candle)
+        broker_reports = self._process_candle_for_execution_mode(candle)
+        self._handle_broker_reports(broker_reports, candle)
 
         if self.broker.starting_equity is not None and self.broker.starting_equity > 0:
-            snapshot_cb = self.broker.snapshot({candle.pair: candle.close})
+            snapshot_cb = self.broker.snapshot(self._mark_prices_for_open_positions(candle))
             # Daily loss calculated from start-of-day tradable base
             drawdown = max(Decimal("0"), snapshot_cb.daily_tradable_base_start - snapshot_cb.tradable_equity)
             loss_limit = snapshot_cb.initial_equity * (
@@ -1909,29 +2195,10 @@ class PaperTradingLoop:
                     drawdown,
                     loss_limit,
                 )
-                for pos in list(self.broker.open_positions()):
-                    action = (
-                        SignalAction.EXIT_LONG
-                        if pos.direction == SignalDirection.LONG
-                        else SignalAction.EXIT_SHORT
-                    )
-                    exit_signal = StrategySignal(
-                        pair=pos.pair,
-                        action=action,
-                        direction=pos.direction,
-                        entry_price=candle.close,
-                        reason="daily_loss_circuit_breaker",
-                    )
-                    exit_decision = RiskDecision(
-                        approved=True,
-                        reason="daily_loss_circuit_breaker",
-                        signal=exit_signal,
-                    )
-                    report = self.broker.execute_decision(
-                        exit_decision,
-                        market_price=candle.close,
-                        timestamp_ms=candle.close_time_ms,
-                    )
+                for report in self._force_close_all_positions(
+                    candle,
+                    reason="daily_loss_circuit_breaker",
+                ):
                     if report.accepted and report.fill is not None:
                         self._observe_closed_fill(report.fill, candle, position=report.position)
                         trade_dict = self._map_fill_to_trade_dict(
@@ -2057,7 +2324,7 @@ class PaperTradingLoop:
                 if self._entries_this_parent_candle.get(pair, 0) >= self._max_entries_per_parent_candle_for_pair(pair):
                     continue
 
-            snapshot = self.broker.snapshot({candle.pair: candle.close})
+            snapshot = self.broker.snapshot(self._mark_prices_for_open_positions(candle))
             open_positions_tuple = tuple(
                 OpenPosition(
                     pair=p.pair,
@@ -2079,8 +2346,8 @@ class PaperTradingLoop:
                 open_positions=open_positions_tuple,
                 daily_realized_pnl=-snapshot.daily_loss_from_tradable_base,
                 daily_loss_limit_equity=snapshot.tradable_base,
-                trading_mode=self.settings.trading_mode,
-                live_trading_enabled=self.settings.live_trading_allowed,
+                trading_mode="live" if self._live_execution_enabled else self.settings.trading_mode,
+                live_trading_enabled=True if self._live_execution_enabled else self.settings.live_trading_allowed,
                 requested_leverage=self._paper_leverage_for_pair(pair),
                 quote_to_margin_rate=self.settings.quote_to_margin_rate,
                 unit_contract_value=Decimal("1"),
@@ -2091,10 +2358,30 @@ class PaperTradingLoop:
                  audit_signal.metadata["risk_decision"] = decision
 
             if decision.approved:
+                execution_decision = decision
+                if self._live_execution_enabled:
+                    live_report = self._execute_live_decision(decision)
+                    if not live_report.accepted:
+                        if audit_signal and audit_signal.timestamp_ms == signal.timestamp_ms:
+                            audit_signal.metadata["risk_decision"] = replace(
+                                decision,
+                                approved=False,
+                                reason=live_report.reason,
+                            )
+                        continue
+                    execution_decision = self._with_live_execution_metadata(decision, live_report)
+                    signal = execution_decision.signal
                 report = self.broker.execute_decision(
-                    decision, market_price=candle.close, timestamp_ms=candle.close_time_ms
+                    execution_decision, market_price=candle.close, timestamp_ms=candle.close_time_ms
                 )
                 from app.broker.models import PaperOrderSide
+                if self._live_execution_enabled and not getattr(report, "accepted", False):
+                    message = f"Live execution accepted but paper shadow rejected: {report.reason}"
+                    self.logger.error("[live_execution] %s", message)
+                    _update_live_state(
+                        error=message,
+                        last_updated=datetime.now(timezone.utc).isoformat(),
+                    )
                 if getattr(report, 'accepted', False) and report.fill is not None:
                     if is_entry_signal(signal):
                         if report.fill.side == PaperOrderSide.BUY:
@@ -2124,7 +2411,7 @@ class PaperTradingLoop:
         if audit_signal:
             self._write_audit_row(candle, audit_signal)
 
-        snapshot = self.broker.snapshot({candle.pair: candle.close})
+        snapshot = self.broker.snapshot(self._mark_prices_for_open_positions(candle))
         
         current_eq_dict = {"t": candle.close_time_ms, "equity": str(snapshot.equity)}
         if not self.equity_history or self.equity_history[-1]["equity"] != current_eq_dict["equity"]:

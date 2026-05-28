@@ -134,7 +134,12 @@ class RiskManagerTests(unittest.TestCase):
             stop_loss=Decimal("95"),
         )
         decision = _manager().evaluate_signal(
-            _entry_signal(metadata={"allow_scale_in": True}),
+            _entry_signal(
+                metadata={
+                    "allow_scale_in": True,
+                    "scale_in_reuses_position": True,
+                }
+            ),
             account_equity=Decimal("1000"),
             open_positions=[position],
             requested_leverage=Decimal("1"),
@@ -148,6 +153,33 @@ class RiskManagerTests(unittest.TestCase):
 
         self.assertTrue(decision.metadata["basket_risk_checked"])
         self.assertTrue(decision.metadata["position_size_adjusted_for_basket_risk"])
+
+    def test_rejects_scale_in_at_global_cap_without_reuse_flag(self) -> None:
+        position = OpenPosition(
+            pair="B-BTC_USDT",
+            direction=SignalDirection.LONG,
+            quantity=Decimal("1"),
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("95"),
+        )
+        manager = RiskManager(
+            RiskSettings(
+                max_risk_per_trade_pct=Decimal("1"),
+                max_daily_loss_pct=Decimal("3"),
+                max_open_positions=1,
+                max_open_positions_per_pair=2,
+                max_leverage=2,
+            )
+        )
+        decision = manager.evaluate_signal(
+            _entry_signal(metadata={"allow_scale_in": True}),
+            account_equity=Decimal("1000"),
+            open_positions=[position],
+            requested_leverage=Decimal("1"),
+        )
+
+        self.assertFalse(decision.approved)
+        self.assertIn("max_open_positions_blocked", decision.reason)
 
     def test_rejects_same_position_entry_without_scale_in_flag(self) -> None:
         position = OpenPosition(
@@ -266,8 +298,31 @@ class RiskManagerTests(unittest.TestCase):
         self.assertTrue(decision.approved)
         self.assertEqual(decision.signal.entry_price, Decimal("100.1"))
         self.assertEqual(decision.signal.stop_loss, Decimal("95.0"))
-        self.assertEqual(decision.signal.take_profit, Decimal("110.0"))
+        self.assertEqual(decision.signal.take_profit, Decimal("110.1"))
         self.assertTrue(decision.signal.metadata["price_tick_normalized"])
+
+    def test_normalizes_short_take_profit_away_from_entry(self) -> None:
+        instrument = InstrumentMetadata(
+            pair="B-BTC_USDT",
+            tick_size=Decimal("0.1"),
+        )
+        decision = _manager().evaluate_signal(
+            _entry_signal(
+                action=SignalAction.ENTER_SHORT,
+                direction=SignalDirection.SHORT,
+                entry_price=Decimal("100.03"),
+                stop_loss=Decimal("105.08"),
+                take_profit=Decimal("90.09"),
+            ),
+            account_equity=Decimal("1000"),
+            instrument=instrument,
+            requested_leverage=Decimal("1"),
+        )
+
+        self.assertTrue(decision.approved)
+        self.assertEqual(decision.signal.entry_price, Decimal("100.0"))
+        self.assertEqual(decision.signal.stop_loss, Decimal("105.1"))
+        self.assertEqual(decision.signal.take_profit, Decimal("90.0"))
 
     def test_rejects_stop_too_close_to_estimated_liquidation(self) -> None:
         manager = RiskManager(
@@ -302,7 +357,7 @@ class RiskManagerTests(unittest.TestCase):
         position = OpenPosition(
             pair="B-ETH_USDT",
             direction=SignalDirection.LONG,
-            quantity=Decimal("4"),
+            quantity=Decimal("4.5"),
             entry_price=Decimal("100"),
             stop_loss=Decimal("95"),
         )
@@ -330,7 +385,7 @@ class RiskManagerTests(unittest.TestCase):
         position = OpenPosition(
             pair="B-ETH_USDT",
             direction=SignalDirection.LONG,
-            quantity=Decimal("1"),
+            quantity=Decimal("3"),
             entry_price=Decimal("100"),
             stop_loss=Decimal("95"),
         )
@@ -343,7 +398,58 @@ class RiskManagerTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.approved)
-        self.assertIn("total risk", decision.reason)
+        self.assertIn("basket_risk_blocked", decision.reason)
+
+    def test_sizes_from_available_equity_when_it_is_lower(self) -> None:
+        manager = RiskManager(
+            RiskSettings(
+                max_risk_per_trade_pct=Decimal("1"),
+                max_daily_loss_pct=Decimal("3"),
+                max_open_positions=2,
+                max_leverage=10,
+            )
+        )
+
+        decision = manager.evaluate_signal(
+            _entry_signal(),
+            account_equity=Decimal("1000"),
+            available_equity=Decimal("500"),
+            requested_leverage=Decimal("1"),
+        )
+
+        self.assertTrue(decision.approved)
+        self.assertEqual(decision.max_loss, Decimal("5"))
+        self.assertEqual(decision.metadata["risk_base_amount"], Decimal("500"))
+        self.assertTrue(decision.metadata["risk_base_capped_by_available_equity"])
+
+    def test_correlated_same_direction_basket_reduces_risk(self) -> None:
+        manager = RiskManager(
+            RiskSettings(
+                max_risk_per_trade_pct=Decimal("2"),
+                max_daily_loss_pct=Decimal("3"),
+                max_open_positions=3,
+                max_leverage=10,
+                max_total_risk_pct=Decimal("20"),
+            )
+        )
+        position = OpenPosition(
+            pair="B-ETH_USDT",
+            direction=SignalDirection.LONG,
+            quantity=Decimal("1"),
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("95"),
+        )
+
+        decision = manager.evaluate_signal(
+            _entry_signal(),
+            account_equity=Decimal("1000"),
+            open_positions=[position],
+            requested_leverage=Decimal("1"),
+        )
+
+        self.assertTrue(decision.approved)
+        self.assertEqual(decision.metadata["basket_risk_multiplier"], Decimal("0.5"))
+        self.assertEqual(decision.metadata["risk_percent_used"], Decimal("1.00"))
 
     def test_approves_exit_signal_without_new_position_sizing(self) -> None:
         signal = StrategySignal(
@@ -367,7 +473,7 @@ class RiskManagerTests(unittest.TestCase):
         self.assertIsNone(decision.position_size)
         self.assertIsNone(decision.max_loss)
 
-    def test_rejects_live_trading_context_for_phase_six(self) -> None:
+    def test_rejects_live_trading_context_by_default(self) -> None:
         decision = _manager().evaluate(
             RiskContext(
                 signal=_entry_signal(),
@@ -378,7 +484,60 @@ class RiskManagerTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.approved)
-        self.assertIn("paper-only", decision.reason)
+        self.assertIn("Live risk approval is disabled", decision.reason)
+
+    def test_live_pilot_approval_uses_strict_caps(self) -> None:
+        manager = RiskManager(
+            RiskSettings(
+                max_risk_per_trade_pct=Decimal("0.5"),
+                max_daily_loss_pct=Decimal("2"),
+                max_open_positions=1,
+                max_leverage=3,
+                live_risk_approval_enabled=True,
+                live_max_order_notional=Decimal("1000"),
+                live_max_margin_per_order=Decimal("500"),
+            )
+        )
+
+        decision = manager.evaluate(
+            RiskContext(
+                signal=_entry_signal(),
+                account_equity=Decimal("1000"),
+                requested_leverage=Decimal("1"),
+                trading_mode="live",
+                live_trading_enabled=True,
+            )
+        )
+
+        self.assertTrue(decision.approved)
+        self.assertFalse(decision.metadata["paper_only"])
+        self.assertTrue(decision.metadata["live_pilot"])
+
+    def test_live_pilot_blocks_order_above_absolute_notional_cap(self) -> None:
+        manager = RiskManager(
+            RiskSettings(
+                max_risk_per_trade_pct=Decimal("1"),
+                max_daily_loss_pct=Decimal("2"),
+                max_open_positions=1,
+                max_leverage=3,
+                live_risk_approval_enabled=True,
+                live_max_order_notional=Decimal("100"),
+                live_max_margin_per_order=Decimal("500"),
+            )
+        )
+
+        decision = manager.evaluate(
+            RiskContext(
+                signal=_entry_signal(),
+                account_equity=Decimal("1000"),
+                requested_leverage=Decimal("1"),
+                trading_mode="live",
+                live_trading_enabled=True,
+            )
+        )
+
+        self.assertFalse(decision.approved)
+        self.assertIn("live_notional_cap_blocked", decision.reason)
 
     def test_decision_serializes_nested_decimal_values(self) -> None:
         manager = _manager()

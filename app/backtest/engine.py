@@ -339,6 +339,12 @@ class BacktestEngine:
                 series,
                 atr_period=self.config.atr_period,
             )
+            _update_dynamic_exits(
+                broker=broker,
+                candle=candle,
+                indicators=indicators,
+                config=self.config,
+            )
             context = StrategyContext(
                 pair=self.config.pair,
                 interval=self.config.interval,
@@ -461,38 +467,6 @@ class BacktestEngine:
                     )
                     halted_days.add(day)
                     break
-
-            if day not in halted_days and (
-                self.config.atr_dynamic_exits_enabled or self.config.bb_trail_enabled
-            ):
-                broker.update_dynamic_atr_exits(
-                    candle,
-                    atr=indicators.atr,
-                    stop_multiple=self.config.atr_stop_multiple,
-                    take_profit_multiple=self.config.atr_take_profit_multiple,
-                    trailing_multiple=self.config.atr_trailing_multiple,
-                    stop_enabled=self.config.atr_stop_enabled,
-                    take_profit_enabled=self.config.atr_take_profit_enabled,
-                    trailing_enabled=self.config.atr_trailing_enabled,
-                    take_profit_mode=self.config.atr_take_profit_mode,
-                    breakeven_enabled=self.config.breakeven_enabled,
-                    breakeven_activation_r=self.config.breakeven_activation_r,
-                    breakeven_offset_r=self.config.breakeven_offset_r,
-                    profit_lock_enabled=self.config.profit_lock_enabled,
-                    profit_lock_activation_r=self.config.profit_lock_activation_r,
-                    profit_lock_r=self.config.profit_lock_r,
-                    atr_trail_after_r_enabled=self.config.atr_trail_after_r_enabled,
-                    atr_trail_activation_r=self.config.atr_trail_activation_r,
-                    bb_band=indicators.bollinger,
-                    bb_trail_enabled=self.config.bb_trail_enabled,
-                    bb_trail_buffer_multiplier=self.config.bb_trail_buffer_multiplier,
-                    bb_trail_activation_r=self.config.bb_trail_activation_r,
-                    bb_trail_stage2_r=self.config.bb_trail_stage2_r,
-                    bb_trail_stage3_r=self.config.bb_trail_stage3_r,
-                    bb_trail_force_close_r=self.config.bb_trail_force_close_r,
-                    bb_trail_partial_close_at_tp=self.config.bb_trail_partial_close_at_tp,
-                    bb_trail_partial_close_pct=self.config.bb_trail_partial_close_pct,
-                )
 
             equity_curve.append(_equity_point(broker, candle))
 
@@ -678,6 +652,19 @@ class BacktestEngine:
                     )
                     halted_days.add(day)
                     break
+
+                exit_series = series.copy() if self.config.use_partial_parent_candle else series
+                if self.config.use_partial_parent_candle:
+                    exit_series.add(child)
+                _update_dynamic_exits(
+                    broker=broker,
+                    candle=child,
+                    indicators=latest_indicator_snapshot(
+                        exit_series,
+                        atr_period=self.config.atr_period,
+                    ),
+                    config=self.config,
+                )
 
                 # Task 1: Check for breakout entries in early children
                 if (
@@ -873,6 +860,12 @@ class BacktestEngine:
                     series,
                     atr_period=self.config.atr_period,
                 )
+                _update_dynamic_exits(
+                    broker=broker,
+                    candle=parent_candle,
+                    indicators=indicators,
+                    config=self.config,
+                )
                 context = StrategyContext(
                     pair=self.config.pair,
                     interval=self.config.interval,
@@ -958,36 +951,6 @@ class BacktestEngine:
                             daily_net_pnl=daily_net_pnl,
                             safety_state=safety_state,
                         )
-                if self.config.atr_dynamic_exits_enabled or self.config.bb_trail_enabled:
-                    broker.update_dynamic_atr_exits(
-                        parent_candle,
-                        atr=indicators.atr,
-                        stop_multiple=self.config.atr_stop_multiple,
-                        take_profit_multiple=self.config.atr_take_profit_multiple,
-                        trailing_multiple=self.config.atr_trailing_multiple,
-                        stop_enabled=self.config.atr_stop_enabled,
-                        take_profit_enabled=self.config.atr_take_profit_enabled,
-                        trailing_enabled=self.config.atr_trailing_enabled,
-                        take_profit_mode=self.config.atr_take_profit_mode,
-                        breakeven_enabled=self.config.breakeven_enabled,
-                        breakeven_activation_r=self.config.breakeven_activation_r,
-                        breakeven_offset_r=self.config.breakeven_offset_r,
-                        profit_lock_enabled=self.config.profit_lock_enabled,
-                        profit_lock_activation_r=self.config.profit_lock_activation_r,
-                        profit_lock_r=self.config.profit_lock_r,
-                        atr_trail_after_r_enabled=self.config.atr_trail_after_r_enabled,
-                        atr_trail_activation_r=self.config.atr_trail_activation_r,
-                        bb_band=indicators.bollinger,
-                        bb_trail_enabled=self.config.bb_trail_enabled,
-                        bb_trail_buffer_multiplier=self.config.bb_trail_buffer_multiplier,
-                        bb_trail_activation_r=self.config.bb_trail_activation_r,
-                        bb_trail_stage2_r=self.config.bb_trail_stage2_r,
-                        bb_trail_stage3_r=self.config.bb_trail_stage3_r,
-                        bb_trail_force_close_r=self.config.bb_trail_force_close_r,
-                        bb_trail_partial_close_at_tp=self.config.bb_trail_partial_close_at_tp,
-                        bb_trail_partial_close_pct=self.config.bb_trail_partial_close_pct,
-                    )
-
             equity_curve.append(_equity_point(broker, parent_candle))
 
         if pending_decisions:
@@ -1607,6 +1570,8 @@ def _apply_exit_overrides(
         return signal
     if signal.direction is None or signal.entry_price is None or signal.entry_price <= 0:
         return signal
+    if _metadata_bool(signal.metadata, "strategy_managed_exits", False):
+        return signal
     atr_settings = _atr_execution_settings(signal, config)
     if (
         config.atr_dynamic_exits_enabled
@@ -1716,6 +1681,46 @@ def _apply_exit_overrides(
             "manual_take_profit_pct": config.take_profit_pct,
             "exit_override_applied": True,
         },
+    )
+
+
+def _update_dynamic_exits(
+    *,
+    broker: PaperBroker,
+    candle: OHLCVCandle,
+    indicators: object,
+    config: BacktestConfig,
+) -> None:
+    if not (config.atr_dynamic_exits_enabled or config.bb_trail_enabled):
+        return
+
+    broker.update_dynamic_atr_exits(
+        candle,
+        atr=getattr(indicators, "atr", None),
+        stop_multiple=config.atr_stop_multiple,
+        take_profit_multiple=config.atr_take_profit_multiple,
+        trailing_multiple=config.atr_trailing_multiple,
+        stop_enabled=config.atr_stop_enabled,
+        take_profit_enabled=config.atr_take_profit_enabled,
+        trailing_enabled=config.atr_trailing_enabled,
+        take_profit_mode=config.atr_take_profit_mode,
+        breakeven_enabled=config.breakeven_enabled,
+        breakeven_activation_r=config.breakeven_activation_r,
+        breakeven_offset_r=config.breakeven_offset_r,
+        profit_lock_enabled=config.profit_lock_enabled,
+        profit_lock_activation_r=config.profit_lock_activation_r,
+        profit_lock_r=config.profit_lock_r,
+        atr_trail_after_r_enabled=config.atr_trail_after_r_enabled,
+        atr_trail_activation_r=config.atr_trail_activation_r,
+        bb_band=getattr(indicators, "bollinger", None),
+        bb_trail_enabled=config.bb_trail_enabled,
+        bb_trail_buffer_multiplier=config.bb_trail_buffer_multiplier,
+        bb_trail_activation_r=config.bb_trail_activation_r,
+        bb_trail_stage2_r=config.bb_trail_stage2_r,
+        bb_trail_stage3_r=config.bb_trail_stage3_r,
+        bb_trail_force_close_r=config.bb_trail_force_close_r,
+        bb_trail_partial_close_at_tp=config.bb_trail_partial_close_at_tp,
+        bb_trail_partial_close_pct=config.bb_trail_partial_close_pct,
     )
 
 

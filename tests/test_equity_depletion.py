@@ -181,7 +181,6 @@ class EquityDepletionTests(unittest.TestCase):
         result = engine.run(candles)
         self.assertEqual(len(result.trades), 1)
         rejections = [r for r in result.reports if not r.accepted and r.signal.action == SignalAction.ENTER_LONG]
-        print(f"DEBUG REJECTIONS: {[r.reason for r in rejections]}")
         self.assertTrue(any(("planned risk" in r.reason.lower() or "margin" in r.reason.lower()) and "exceeds available equity" in r.reason.lower() for r in rejections))
 
     def test_equity_before_after_trade_is_recorded_correctly(self) -> None:

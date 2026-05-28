@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Mapping
@@ -44,6 +44,10 @@ def _redact(secret: str | None) -> str:
     return f"{secret[:4]}...{secret[-4:]}"
 
 
+def parse_csv_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 # These are conservative paper-trading defaults.
 # They should be overridden via .env for live trading.
 @dataclass(frozen=True)
@@ -67,6 +71,20 @@ class RiskSettings:
     min_entry_volume_ratio: Decimal = Decimal("0.50")
     max_entry_spread_pct: Decimal = Decimal("0.30")
     min_entry_side_depth_margin: Decimal = Decimal("0")
+    
+    # Live safety caps
+    live_risk_approval_enabled: bool = False
+    live_max_order_notional: Decimal = Decimal("1000")
+    live_max_margin_per_order: Decimal = Decimal("500")
+    live_max_daily_loss_inr: Decimal = Decimal("1000")
+    live_max_orders_per_day: int = 3
+    live_require_stop_loss: bool = True
+    live_require_exchange_stop_sync: bool = True
+    live_kill_switch: bool = False
+    live_close_on_kill_switch: bool = False
+    live_cancel_orders_on_kill_switch: bool = True
+    live_min_confidence: Decimal = Decimal("0.60")
+    
     pair_loss_throttle_enabled: bool = True
     pair_loss_lookback: int = 4
     pair_loss_limit: int = 2
@@ -89,7 +107,7 @@ class RiskSettings:
     atr_take_profit_mode: str = "fixed"
     atr_stop_multiple: Decimal = Decimal("1.5")
     atr_take_profit_multiple: Decimal = Decimal("2.4")
-    atr_trailing_multiple: Decimal = Decimal("2.0")
+    atr_trailing_multiple: Decimal = Decimal("1.2")
     # Bollinger Band hybrid trail
     bb_trail_enabled: bool = False
     bb_trail_buffer_multiplier: Decimal = Decimal("1.0")
@@ -103,9 +121,9 @@ class RiskSettings:
     breakeven_enabled: bool = False
     breakeven_activation_r: Decimal = Decimal("1.0")
     breakeven_offset_r: Decimal = Decimal("0")
-    profit_lock_enabled: bool = False
-    profit_lock_activation_r: Decimal = Decimal("1.5")
-    profit_lock_r: Decimal = Decimal("0.5")
+    profit_lock_enabled: bool = True
+    profit_lock_activation_r: Decimal = Decimal("1.2")
+    profit_lock_r: Decimal = Decimal("0.25")
     atr_trail_after_r_enabled: bool = False
     atr_trail_activation_r: Decimal = Decimal("2.0")
     # Entry Timing and Quality
@@ -149,6 +167,16 @@ class Settings:
     paper_starting_equity_currency: str = "INR"
     paper_leverage: Decimal = Decimal("1")
     paper_intrabar_enabled: bool = False
+    live_confirm_i_understand_risk: str = "NO"
+    live_pilot_dry_run: bool = True
+    live_max_signal_age_seconds: int = 60
+    live_position_margin_type: str = "isolated"
+    live_allowed_pairs: list[str] = field(default_factory=lambda: ["B-BTC_USDT"])
+    live_allowed_strategies: list[str] = field(
+        default_factory=lambda: ["hybrid_meta_v2", "rsi_macd_momentum"]
+    )
+    live_reconcile_seconds: int = 30
+    live_rest_poll_seconds: int = 10
     strategy_interval: str = "15m"
     execution_interval: str = "1m"
     use_partial_parent_candle: bool = False
@@ -188,6 +216,13 @@ class Settings:
 
 def load_settings(env_file: str | Path = ".env") -> Settings:
     dotenv_values = _read_dotenv(Path(env_file))
+    
+    # Check for personal secret overrides
+    secret_file = Path(".env.local.secret")
+    if secret_file.exists() and str(env_file) == ".env":
+        secret_values = _read_dotenv(secret_file)
+        dotenv_values = {**dotenv_values, **secret_values}
+        
     merged = {**dotenv_values, **os.environ}
 
     risk = RiskSettings(
@@ -216,6 +251,31 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         min_entry_side_depth_margin=_decimal(
             _get(merged, "MIN_ENTRY_SIDE_DEPTH_MARGIN", "0")
         ),
+        live_risk_approval_enabled=_bool(
+            _get(merged, "LIVE_RISK_APPROVAL_ENABLED", "false")
+        ),
+        live_max_order_notional=_decimal(
+            _get(merged, "LIVE_MAX_ORDER_NOTIONAL", "1000")
+        ),
+        live_max_margin_per_order=_decimal(
+            _get(merged, "LIVE_MAX_MARGIN_PER_ORDER", "500")
+        ),
+        live_max_daily_loss_inr=_decimal(
+            _get(merged, "LIVE_MAX_DAILY_LOSS_INR", "1000")
+        ),
+        live_max_orders_per_day=int(_get(merged, "LIVE_MAX_ORDERS_PER_DAY", "3")),
+        live_require_stop_loss=_bool(_get(merged, "LIVE_REQUIRE_STOP_LOSS", "true")),
+        live_require_exchange_stop_sync=_bool(
+            _get(merged, "LIVE_REQUIRE_EXCHANGE_STOP_SYNC", "true")
+        ),
+        live_kill_switch=_bool(_get(merged, "LIVE_KILL_SWITCH", "false")),
+        live_close_on_kill_switch=_bool(
+            _get(merged, "LIVE_CLOSE_ON_KILL_SWITCH", "false")
+        ),
+        live_cancel_orders_on_kill_switch=_bool(
+            _get(merged, "LIVE_CANCEL_ORDERS_ON_KILL_SWITCH", "true")
+        ),
+        live_min_confidence=_decimal(_get(merged, "LIVE_MIN_CONFIDENCE", "0.60")),
         pair_loss_throttle_enabled=_bool(
             _get(merged, "PAIR_LOSS_THROTTLE_ENABLED", "true")
         ),
@@ -246,7 +306,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         atr_take_profit_mode=_get(merged, "ATR_TAKE_PROFIT_MODE", "fixed"),
         atr_stop_multiple=_decimal(_get(merged, "ATR_STOP_MULTIPLE", "1.5")),
         atr_take_profit_multiple=_decimal(_get(merged, "ATR_TAKE_PROFIT_MULTIPLE", "2.4")),
-        atr_trailing_multiple=_decimal(_get(merged, "ATR_TRAILING_MULTIPLE", "2.0")),
+        atr_trailing_multiple=_decimal(_get(merged, "ATR_TRAILING_MULTIPLE", "1.2")),
         bb_trail_enabled=_bool(_get(merged, "BB_TRAIL_ENABLED", "false")),
         bb_trail_buffer_multiplier=_decimal(
             _get(merged, "BB_TRAIL_BUFFER_MULTIPLIER", "1.0")
@@ -264,9 +324,9 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         breakeven_enabled=_bool(_get(merged, "BREAKEVEN_ENABLED", "false")),
         breakeven_activation_r=_decimal(_get(merged, "BREAKEVEN_ACTIVATION_R", "1.0")),
         breakeven_offset_r=_decimal(_get(merged, "BREAKEVEN_OFFSET_R", "0")),
-        profit_lock_enabled=_bool(_get(merged, "PROFIT_LOCK_ENABLED", "false")),
-        profit_lock_activation_r=_decimal(_get(merged, "PROFIT_LOCK_ACTIVATION_R", "1.5")),
-        profit_lock_r=_decimal(_get(merged, "PROFIT_LOCK_R", "0.5")),
+        profit_lock_enabled=_bool(_get(merged, "PROFIT_LOCK_ENABLED", "true")),
+        profit_lock_activation_r=_decimal(_get(merged, "PROFIT_LOCK_ACTIVATION_R", "1.2")),
+        profit_lock_r=_decimal(_get(merged, "PROFIT_LOCK_R", "0.25")),
         atr_trail_after_r_enabled=_bool(_get(merged, "ATR_TRAIL_AFTER_R_ENABLED", "false")),
         atr_trail_activation_r=_decimal(_get(merged, "ATR_TRAIL_ACTIVATION_R", "2.0")),
         balanced_breakout_enabled=_bool(_get(merged, "BALANCED_BREAKOUT_ENABLED", "true")),
@@ -312,6 +372,21 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         paper_starting_equity_currency=_get(merged, "PAPER_STARTING_EQUITY_CURRENCY", "INR"),
         paper_leverage=_decimal(_get(merged, "PAPER_LEVERAGE", "1")),
         paper_intrabar_enabled=_bool(_get(merged, "PAPER_INTRABAR_ENABLED", "false")),
+        live_confirm_i_understand_risk=_get(
+            merged, "LIVE_CONFIRM_I_UNDERSTAND_RISK", "NO"
+        ),
+        live_pilot_dry_run=_bool(_get(merged, "LIVE_PILOT_DRY_RUN", "true")),
+        live_position_margin_type=_get(
+            merged, "LIVE_POSITION_MARGIN_TYPE", "isolated"
+        ).lower(),
+        live_allowed_pairs=parse_csv_list(
+            _get(merged, "LIVE_ALLOWED_PAIRS", "B-BTC_USDT")
+        ),
+        live_allowed_strategies=parse_csv_list(
+            _get(merged, "LIVE_ALLOWED_STRATEGIES", "hybrid_meta_v2,rsi_macd_momentum")
+        ),
+        live_reconcile_seconds=int(_get(merged, "LIVE_RECONCILE_SECONDS", "30")),
+        live_rest_poll_seconds=int(_get(merged, "LIVE_REST_POLL_SECONDS", "10")),
         strategy_interval=_get(merged, "STRATEGY_INTERVAL", "15m"),
         execution_interval=_get(merged, "EXECUTION_INTERVAL", "1m"),
         use_partial_parent_candle=_bool(_get(merged, "USE_PARTIAL_PARENT_CANDLE", "false")),
@@ -330,3 +405,21 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         log_dir=_get(merged, "LOG_DIR", "logs"),
         risk=risk,
     )
+
+    # Final Safety Validation
+    if settings.trading_mode == "live" and settings.live_trading_enabled:
+        if settings.live_pilot_dry_run:
+             # Dry run in live mode is okay, but let's warn if it's not expected
+             pass
+        else:
+            # REAL LIVE TRADING
+            if settings.live_confirm_i_understand_risk != "YES":
+                raise ValueError(
+                    "REAL LIVE TRADING BLOCKED: LIVE_CONFIRM_I_UNDERSTAND_RISK must be set to 'YES' in .env"
+                )
+            if not settings.coindcx_api_key or not settings.coindcx_api_secret:
+                 raise ValueError(
+                    "REAL LIVE TRADING BLOCKED: COINDCX_API_KEY and COINDCX_API_SECRET are required."
+                )
+    
+    return settings

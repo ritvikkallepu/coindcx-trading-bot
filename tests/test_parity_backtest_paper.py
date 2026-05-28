@@ -202,9 +202,6 @@ class ParityBacktestPaperTests(unittest.TestCase):
                 loop._on_candle(c)
                 
             # 4. Compare
-            print(f"Backtest trades: {len(bt_result.trades)}")
-            print(f"Paper fills: {len(loop.broker.fills)}")
-            
             # Ensure at least one trade executed
             self.assertGreater(len(bt_result.trades), 0)
             self.assertEqual(len(bt_result.trades), len(loop.broker.fills) // 2)

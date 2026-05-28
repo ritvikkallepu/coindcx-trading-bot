@@ -48,10 +48,11 @@ class RiskManager:
             else context.account_equity
         )
 
-        if context.live_trading_allowed:
+        if context.live_trading_allowed and not self.settings.live_risk_approval_enabled:
             return self._reject(
                 signal,
-                "Risk approval is paper-only; live execution is not enabled in this bot yet.",
+                "Live risk approval is disabled. Set LIVE_RISK_APPROVAL_ENABLED=true "
+                "only for a capped live pilot.",
             )
 
         if is_exit_signal(signal):
@@ -80,6 +81,8 @@ class RiskManager:
             )
 
         # Multi-position checks
+        is_scale_in = False
+        scale_in_reuses_position = False
         if isinstance(context.open_positions, int):
             total_open = max(0, context.open_positions)
             pair_open = 0 # Assume different pair if only count is provided
@@ -88,24 +91,25 @@ class RiskManager:
             total_open = len([p for p in open_positions if p.is_open])
             pair_positions = [p for p in open_positions if p.is_open and p.pair == signal.pair]
             pair_open = len(pair_positions)
+            is_scale_in = pair_open > 0 and _is_approved_scale_in(context)
+            scale_in_reuses_position = is_scale_in and _scale_in_reuses_existing_position(signal)
 
         # 1. Per-pair limit (Check FIRST for specific reason)
         if pair_open > 0:
-            is_scale_in = _is_approved_scale_in(context)
             if not self.settings.allow_same_pair_pyramiding and not is_scale_in:
                 return self._reject(
                     signal,
                     f"same_pair_position_blocked: {signal.pair} already has an open position"
                 )
 
-            if pair_open >= self.settings.max_open_positions_per_pair and not is_scale_in:
+            if pair_open >= self.settings.max_open_positions_per_pair and not scale_in_reuses_position:
                 return self._reject(
                     signal,
                     f"max_open_positions_per_pair_blocked: {pair_open}/{self.settings.max_open_positions_per_pair} for {signal.pair}"
                 )
 
         # 2. Global limit
-        if total_open >= self.settings.max_open_positions and pair_open == 0:
+        if total_open >= self.settings.max_open_positions and not scale_in_reuses_position:
             return self._reject(
                 signal,
                 f"max_open_positions_blocked: {total_open}/{self.settings.max_open_positions}",
@@ -141,6 +145,12 @@ class RiskManager:
         validation_error = validate_entry_signal(signal)
         if validation_error:
             return self._reject(signal, validation_error)
+        if (
+            context.live_trading_allowed
+            and self.settings.live_require_stop_loss
+            and signal.stop_loss is None
+        ):
+            return self._reject(signal, "Live pilot requires every entry to include a stop loss.")
 
         safety = assess_entry_safety(signal, self.settings)
         if safety.metadata:
@@ -160,10 +170,20 @@ class RiskManager:
                 f"Requested leverage exceeds allowed limit: {requested_leverage} > {configured_allowed_leverage}.",
             )
 
+        risk_base_equity = _risk_sizing_base_equity(
+            account_equity=context.account_equity,
+            available_equity=available_equity,
+            risk_base_mode=context.risk_base_mode,
+        )
+        risk_context = replace(
+            context,
+            account_equity=risk_base_equity,
+            available_equity=available_equity,
+        )
         basket_metadata: dict[str, object] = {}
         try:
             basket_metadata = _validate_risk_basket(
-                context=context,
+                context=risk_context,
                 settings=self.settings,
             )
         except ValueError as exc:
@@ -186,9 +206,9 @@ class RiskManager:
         )
 
         sizing = _calculate_position_size(
-            context=context,
+            context=risk_context,
             settings=self.settings,
-            account_equity=context.account_equity,
+            account_equity=risk_base_equity,
             leverage=requested_leverage,
             risk_multiplier=effective_risk_multiplier,
         )
@@ -208,6 +228,15 @@ class RiskManager:
         except ValueError as exc:
             return self._reject(signal, str(exc))
 
+        if context.live_trading_allowed:
+            live_cap_error = _validate_live_pilot_caps(
+                settings=self.settings,
+                sizing=sizing,
+                leverage=requested_leverage,
+            )
+            if live_cap_error is not None:
+                return self._reject(signal, live_cap_error)
+
         instrument_error = self._validate_instrument_minimums(
             context=context,
             position_size=sizing.position_size,
@@ -219,7 +248,7 @@ class RiskManager:
         exposure_metadata: dict[str, object] = {}
         try:
             exposure_metadata = _validate_total_exposure(
-                context=context,
+                context=risk_context,
                 settings=self.settings,
                 sizing=sizing,
             )
@@ -230,7 +259,7 @@ class RiskManager:
         total_risk_metadata: dict[str, object] = {}
         try:
             total_risk_metadata = _validate_projected_risk(
-                context=context,
+                context=risk_context,
                 settings=self.settings,
                 sizing=sizing,
             )
@@ -245,20 +274,19 @@ class RiskManager:
         if liquidation_error:
             return self._reject(signal, liquidation_error)
 
-        # Mark if we adjusted for basket risk
-        is_adjusted = (pair_open > 0)
+        is_adjusted = pair_open > 0 or basket_risk_multiplier < Decimal("1")
 
         metadata = {
             "risk_budget": sizing.risk_budget,
             "max_risk_per_trade_pct": self.settings.max_risk_per_trade_pct,
             "effective_risk_per_trade_pct": (
-                (sizing.max_loss / context.account_equity * Decimal("100"))
-                if context.account_equity > 0
+                (sizing.max_loss / risk_base_equity * Decimal("100"))
+                if risk_base_equity > 0
                 else Decimal("0")
             ),
             "risk_percent_used": (
-                (sizing.max_loss / context.account_equity * Decimal("100"))
-                if context.account_equity > 0
+                (sizing.max_loss / risk_base_equity * Decimal("100"))
+                if risk_base_equity > 0
                 else Decimal("0")
             ),
             "risk_multiplier": effective_risk_multiplier,
@@ -267,7 +295,10 @@ class RiskManager:
                 or bool(signal.metadata.get("risk_multiplier_applies"))
             ),
             "risk_base_mode": context.risk_base_mode,
-            "risk_base_amount": context.account_equity,
+            "risk_base_amount": risk_base_equity,
+            "account_equity_for_limits": context.account_equity,
+            "available_equity_for_sizing": available_equity,
+            "risk_base_capped_by_available_equity": risk_base_equity < context.account_equity,
             "planned_risk_amount": sizing.risk_budget,
             "equity_before_trade": available_equity,
             "max_daily_loss_pct": self.settings.max_daily_loss_pct,
@@ -277,7 +308,11 @@ class RiskManager:
             "configured_max_leverage": self.settings.max_leverage,
             "allowed_leverage": configured_allowed_leverage,
             "capped_by_leverage": sizing.capped_by_leverage,
-            "paper_only": True,
+            "paper_only": not context.live_trading_allowed,
+            "live_pilot": context.live_trading_allowed,
+            "live_risk_approval_enabled": self.settings.live_risk_approval_enabled,
+            "live_max_order_notional": self.settings.live_max_order_notional,
+            "live_max_margin_per_order": self.settings.live_max_margin_per_order,
             "basket_risk_checked": True,
             "position_size_adjusted_for_basket_risk": is_adjusted,
             "quote_to_margin_rate": context.quote_to_margin_rate,
@@ -426,10 +461,62 @@ def _validate_risk_basket(
     context: RiskContext,
     settings: RiskSettings,
 ) -> dict[str, object]:
-    # Placeholder for future correlated risk basket logic
+    if isinstance(context.open_positions, int) or context.signal.direction is None:
+        return {
+            "basket_risk_checked": True,
+            "basket_risk_multiplier": Decimal("1"),
+            "basket_correlated_position_count": 0,
+            "basket_same_direction_position_count": 0,
+        }
+
+    signal_basket = _risk_basket_key(context.signal.pair)
+    same_direction_positions: list[OpenPosition] = []
+    for position in context.open_positions:
+        if not position.is_open or position.pair == context.signal.pair:
+            continue
+        if _risk_basket_key(position.pair) != signal_basket:
+            continue
+        if _direction_value(position.direction) == context.signal.direction.value:
+            same_direction_positions.append(position)
+
+    open_risk = sum(
+        _position_risk_proxy(position) for position in same_direction_positions
+    )
+    basket_limit = (
+        context.account_equity * (settings.max_total_risk_pct / Decimal("100"))
+        if settings.max_total_risk_pct > 0
+        else Decimal("0")
+    )
+
+    limit_multiplier = Decimal("1")
+    if basket_limit > 0:
+        remaining_risk = basket_limit - open_risk
+        if remaining_risk <= 0:
+            raise ValueError(
+                "basket_risk_blocked: correlated same-direction risk "
+                f"{open_risk:.2f} already meets/exceeds limit {basket_limit:.2f}."
+            )
+        configured_entry_budget = context.account_equity * (
+            settings.max_risk_per_trade_pct / Decimal("100")
+        )
+        if configured_entry_budget > 0:
+            limit_multiplier = min(Decimal("1"), remaining_risk / configured_entry_budget)
+
+    crowding_multiplier = (
+        Decimal("1") / Decimal(len(same_direction_positions) + 1)
+        if same_direction_positions
+        else Decimal("1")
+    )
+    basket_multiplier = min(Decimal("1"), limit_multiplier, crowding_multiplier)
+
     return {
         "basket_risk_checked": True,
-        "basket_risk_multiplier": Decimal("1"),
+        "basket_risk_multiplier": basket_multiplier,
+        "basket_key": signal_basket,
+        "basket_correlated_position_count": len(same_direction_positions),
+        "basket_same_direction_position_count": len(same_direction_positions),
+        "basket_open_risk": open_risk,
+        "basket_risk_limit": basket_limit,
     }
 
 
@@ -444,6 +531,39 @@ def _risk_multiplier(value: object) -> Decimal:
     if multiplier <= 0:
         raise ValueError("Risk multiplier must be positive.")
     return min(multiplier, Decimal("1"))
+
+
+def _risk_sizing_base_equity(
+    *,
+    account_equity: Decimal,
+    available_equity: Decimal,
+    risk_base_mode: str,
+) -> Decimal:
+    if risk_base_mode not in {"current", "current_equity", "tradable_equity", "available_equity"}:
+        return account_equity
+    if available_equity <= 0:
+        return account_equity
+    return min(account_equity, available_equity)
+
+
+def _direction_value(direction: object) -> str:
+    if hasattr(direction, "value"):
+        return str(direction.value)
+    return str(direction)
+
+
+def _risk_basket_key(pair: str) -> str:
+    normalized = str(pair or "").strip().upper()
+    if normalized.startswith("B-"):
+        normalized = normalized[2:]
+    quote = normalized.split("_", 1)[1] if "_" in normalized else ""
+    return f"crypto:{quote or 'unknown'}"
+
+
+def _position_risk_proxy(position: OpenPosition) -> Decimal:
+    if position.loss_at_stop is not None:
+        return position.loss_at_stop
+    return Decimal("0")
 
 
 def _validate_margin_sufficiency(
@@ -557,6 +677,35 @@ def _validate_projected_risk(
     return {"total_projected_risk": total_risk}
 
 
+def _validate_live_pilot_caps(
+    *,
+    settings: RiskSettings,
+    sizing: PositionSizingResult,
+    leverage: Decimal,
+) -> str | None:
+    if settings.live_max_order_notional <= 0:
+        return "LIVE_MAX_ORDER_NOTIONAL must be positive for live pilot approval."
+    if settings.live_max_margin_per_order <= 0:
+        return "LIVE_MAX_MARGIN_PER_ORDER must be positive for live pilot approval."
+    if leverage <= 0:
+        return "Requested leverage must be positive."
+
+    required_margin = sizing.notional / leverage
+    if sizing.notional > settings.live_max_order_notional:
+        return (
+            "live_notional_cap_blocked: order notional "
+            f"{sizing.notional:.2f} exceeds live cap "
+            f"{settings.live_max_order_notional:.2f}."
+        )
+    if required_margin > settings.live_max_margin_per_order:
+        return (
+            "live_margin_cap_blocked: required margin "
+            f"{required_margin:.2f} exceeds live cap "
+            f"{settings.live_max_margin_per_order:.2f}."
+        )
+    return None
+
+
 def _existing_required_margin(open_positions: OpenPositions) -> Decimal:
     if isinstance(open_positions, int):
         return Decimal("0")
@@ -608,3 +757,12 @@ def _is_approved_scale_in(context: RiskContext) -> bool:
         and position.pair == signal.pair
         and direction == signal_direction
     )
+
+
+def _scale_in_reuses_existing_position(signal: StrategySignal) -> bool:
+    value = signal.metadata.get("scale_in_reuses_position")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False

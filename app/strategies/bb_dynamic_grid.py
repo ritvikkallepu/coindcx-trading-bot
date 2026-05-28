@@ -278,6 +278,7 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
         entry_metadata = {
             **metadata,
             "allow_scale_in": allow_scale_in,
+            "scale_in_reuses_position": allow_scale_in,
             "grid_entries": next_entry_count,
             "max_grid_entries": self.max_grid_entries,
             "last_grid_entry_price": latest.close,

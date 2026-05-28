@@ -24,14 +24,14 @@ class EMARSICrossoverStrategy(Strategy):
     fast_period: int = 9
     slow_period: int = 21
     rsi_period: int = 14
-    long_rsi_min: Decimal = Decimal("50")
+    long_rsi_min: Decimal = Decimal("65")
     long_rsi_max: Decimal = Decimal("72")
-    short_rsi_min: Decimal = Decimal("28")
+    short_rsi_min: Decimal = Decimal("20")
     short_rsi_max: Decimal = Decimal("50")
     atr_period: int = 14
     stop_atr_multiple: Decimal = Decimal("1.5")
     take_profit_atr_multiple: Decimal = Decimal("3")
-    atr_trailing_multiple: Decimal = Decimal("2")
+    atr_trailing_multiple: Decimal = Decimal("1.2")
     fallback_stop_pct: Decimal = Decimal("0.01")
     fallback_take_profit_pct: Decimal = Decimal("0.02")
 
@@ -198,4 +198,3 @@ class EMARSICrossoverStrategy(Strategy):
             reason=reason,
             metadata=metadata,
         )
-

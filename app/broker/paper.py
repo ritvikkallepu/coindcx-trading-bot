@@ -516,9 +516,18 @@ class PaperBroker:
         ):
             return
 
-        # Entry ATR Cap: trailing_distance = min(current_atr, entry_atr) * trailing_multiple
+        # Capture entry ATR and best price once
+        if "atr_entry_atr" not in position.metadata and atr is not None:
+             position.metadata["atr_entry_atr"] = atr
+        if "atr_best_price" not in position.metadata:
+             position.metadata["atr_best_price"] = position.entry_price
+
+        # Volatility Buffer: Use the larger of entry ATR or current ATR for trailing distance.
+        # This ensures the stop stays wide enough to allow the trade to "breathe" 
+        # even if volatility expands or contracts. The price-level ratchet below
+        # prevents the stop from ever loosening in absolute terms.
         entry_atr = _decimal_metadata(position.metadata, "atr_entry_atr", atr)
-        trailing_effective_atr = min(atr, entry_atr) if entry_atr > 0 else atr
+        trailing_effective_atr = max(atr, entry_atr) if entry_atr > 0 else (atr if atr is not None else Decimal("0"))
         
         stop_distance = atr * stop_multiple
         trailing_distance = trailing_effective_atr * trailing_multiple
@@ -597,11 +606,13 @@ class PaperBroker:
         if atr_trail_after_r_enabled:
             actual_trailing_enabled = (current_r >= atr_trail_activation_r)
 
+        # Confirmation-based Trailing: Use candle.close for ratchet instead of wicks (high/low).
+        # This prevents minor intraday wicks from tightening the stop prematurely.
         if position.direction == SignalDirection.LONG:
             if actual_trailing_enabled:
                 best_price = max(
                     _decimal_metadata(position.metadata, "atr_best_price", position.entry_price),
-                    candle.high,
+                    candle.close,
                     position.entry_price,
                 )
             else:
@@ -639,7 +650,7 @@ class PaperBroker:
             if actual_trailing_enabled:
                 best_price = min(
                     _decimal_metadata(position.metadata, "atr_best_price", position.entry_price),
-                    candle.low,
+                    candle.close,
                     position.entry_price,
                 )
             else:
@@ -2143,13 +2154,14 @@ class PaperBroker:
         )
         if not trailing_stop_enabled:
             return
-        # If this position has ATR trailing enabled (via metadata or fallback), it takes 
+        # If this position has ATR trailing enabled (via metadata or fallback), it takes
         # precedence over the fixed percentage trailing stop.
         if (
             _bool_metadata(position.metadata, "atr_trailing_enabled", False)
             and _bool_metadata(position.metadata, "atr_dynamic_exits_enabled", False)
         ):
             return
+
         if position.stop_loss is None or candle.close <= 0:
             return
 

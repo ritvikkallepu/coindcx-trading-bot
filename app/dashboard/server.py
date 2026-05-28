@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import files
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -404,6 +406,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if parsed.path in {"/", "/index.html"}:
             self._send_html(DASHBOARD_HTML)
             return
+        if parsed.path.startswith("/static/"):
+            self._send_static_asset(parsed.path.removeprefix("/static/"))
+            return
         if parsed.path == "/api/health":
             self._send_json({"ok": True})
             return
@@ -429,6 +434,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if active_loop is not None and not state.get("running"):
                 state = dict(state)
                 state["running"] = True
+                execution_mode = getattr(active_loop, "execution_mode", "paper")
+                live_dry_run = getattr(active_loop, "live_dry_run", True)
+                state["execution_mode"] = execution_mode if isinstance(execution_mode, str) else "paper"
+                state["live_dry_run"] = live_dry_run if isinstance(live_dry_run, bool) else True
                 watchlist = []
                 snapshot_fn = getattr(active_loop, "_watchlist_snapshot", None)
                 if callable(snapshot_fn):
@@ -526,6 +535,24 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         settings = self.server.settings
+        execution_mode = str(params.get("execution_mode") or "paper").strip().lower()
+        if execution_mode not in {"paper", "live_dry_run", "live_pilot"}:
+            self._send_json(
+                {"error": f"Unsupported execution mode: {execution_mode}"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if execution_mode == "live_pilot" and not settings.live_trading_allowed:
+            self._send_json(
+                {
+                    "error": (
+                        "Live Pilot requires TRADING_MODE=live and "
+                        "LIVE_TRADING_ENABLED=true. Use Live Dry Run first."
+                    )
+                },
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
         from decimal import Decimal, InvalidOperation
         starting_equity = settings.paper_starting_equity
         if params.get("starting_equity"):
@@ -612,6 +639,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             atr_trailing_enabled=atr_exits_enabled,
             profit_lock_enabled=profit_lock_enabled,
             bb_trail_enabled=bb_trail_enabled,
+            live_risk_approval_enabled=(
+                execution_mode != "paper" or settings.risk.live_risk_approval_enabled
+            ),
         )
 
         # Build a modified settings
@@ -625,6 +655,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             execution_interval=execution_interval,
             use_partial_parent_candle=use_partial_parent_candle,
             max_entries_per_parent_candle=max_entries_per_parent_candle,
+            live_pilot_dry_run=(
+                execution_mode != "live_pilot"
+                if execution_mode != "paper"
+                else settings.live_pilot_dry_run
+            ),
             risk=new_risk
         )
 
@@ -633,6 +668,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             effective_settings,
             strategy_name=strategy,
             pair_overrides=pair_overrides,
+            execution_mode=execution_mode,
         )
         
         with self.server._paper_lock:
@@ -660,6 +696,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             "interval": interval,
             "strategy": strategy,
             "pair_overrides": pair_overrides,
+            "execution_mode": execution_mode,
+            "live_dry_run": execution_mode != "live_pilot",
         })
 
     def _handle_paper_stop(self) -> None:
@@ -793,7 +831,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self._send_json(result)
 
     def _handle_paper_reset(self) -> None:
-        from app.live.paper_loop import get_active_loop, set_active_loop, _update_live_state
+        from app.live.paper_loop import get_active_loop, reset_live_state, set_active_loop
         from app.persistence.paper_state import PaperStateStore, PaperSessionStore
         import os
         
@@ -815,35 +853,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if os.path.exists("paper_trades.csv"):
             os.remove("paper_trades.csv")
             
-        # Reset live state
-        _update_live_state(
-            running=False,
-            pair="",
-            watchlist=[],
-            scanned_pairs={},
-            interval="",
-            strategy="",
-            candle_count=0,
-            equity="0",
-            starting_equity="0",
-            realized_pnl="0",
-            unrealized_pnl="0",
-            net_realized_pnl="0",
-            fees_paid="0",
-            open_notional="0",
-            return_abs="0",
-            return_pct="0",
-            max_drawdown_pct="0",
-            peak_equity="0",
-            open_positions=0,
-            total_fills=0,
-            positions_json="[]",
-            equity_history_json="[]",
-            candles_json="{}",
-            pair_profiles={},
-            pair_overrides={},
-            last_updated=None,
-            error="",
+        # Reset every dashboard runtime field so stale values from prior sessions
+        # cannot survive when new fields are added to LivePaperState.
+        reset_live_state(
+            execution_mode="paper",
+            live_dry_run=True,
         )
         
         self._send_json({"reset": True})
@@ -1034,6 +1048,28 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         encoded = html.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_static_asset(self, asset_name: str) -> None:
+        allowed = {"dashboard.css", "dashboard.js"}
+        if asset_name not in allowed:
+            self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+            return
+        try:
+            encoded = (
+                files("app.dashboard.static")
+                .joinpath(asset_name)
+                .read_bytes()
+            )
+        except FileNotFoundError:
+            self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+            return
+        content_type = mimetypes.guess_type(asset_name)[0] or "application/octet-stream"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()

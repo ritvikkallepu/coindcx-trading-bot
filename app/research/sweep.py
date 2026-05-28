@@ -35,6 +35,7 @@ from app.strategies.bb_dynamic_grid import BollingerDynamicFuturesGridStrategy
 from app.strategies.bb_volume_reversion import BollingerVolumeMeanReversionStrategy
 from app.strategies.ema_rsi_trend import EMARSICrossoverStrategy
 from app.strategies.hybrid_meta import HybridMetaStrategy, HybridMetaV2Strategy
+from app.strategies.rsi_macd_momentum import RSIMACDMomentumStrategy
 
 
 DEFAULT_SWEEP_PAIRS = (
@@ -92,7 +93,7 @@ class SweepConfig:
     quote_to_margin_rate: Decimal = Decimal("98")
     unit_contract_value: Decimal = Decimal("1")
     risk_per_trade_pct: Decimal | None = None
-    compound_risk_equity: bool = False
+    compound_risk_equity: bool = True
     stop_loss_pct: Decimal | None = None
     take_profit_pct: Decimal | None = None
     maker_fee_rate: Decimal = COINDCX_INR_M_MAKER_FEE_RATE
@@ -255,6 +256,11 @@ def default_strategy_variants() -> tuple[StrategyVariant, ...]:
             factory=lambda: EMARSICrossoverStrategy(),
         ),
         StrategyVariant(
+            name="rsi_macd_momentum",
+            family="rsi_macd_momentum",
+            factory=lambda: RSIMACDMomentumStrategy(),
+        ),
+        StrategyVariant(
             name="ema_fast",
             family="ema_rsi_trend",
             factory=lambda: EMARSICrossoverStrategy(
@@ -327,6 +333,7 @@ def strategy_variants_for_names(names: Iterable[str]) -> tuple[StrategyVariant, 
         "adaptive": "adaptive_default",
         "hybrid": "hybrid_meta",
         "weighted_hybrid_v2": "hybrid_meta_v2",
+        "rsi_macd": "rsi_macd_momentum",
     }
     selected: list[StrategyVariant] = []
     for name in requested:

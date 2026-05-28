@@ -50,9 +50,9 @@ class HybridMetaStrategy(Strategy):
     min_volume_ratio: Decimal = Decimal("0.60")
     max_spike_atr_multiple: Decimal = Decimal("3.5")
     
-    stop_atr_multiple: Decimal = Decimal("1.35")
-    take_profit_atr_multiple: Decimal = Decimal("2.4")
-    atr_trailing_multiple: Decimal = Decimal("2.0")
+    stop_atr_multiple: Decimal = Decimal("2.0")
+    take_profit_atr_multiple: Decimal = Decimal("2.8")
+    atr_trailing_multiple: Decimal = Decimal("2.2")
     
     fallback_stop_pct: Decimal = Decimal("0.012")
     fallback_take_profit_pct: Decimal = Decimal("0.024")
@@ -863,8 +863,8 @@ class HybridMetaV2Strategy(HybridMetaStrategy):
     exit_threshold: Decimal = Decimal("0.42")
     min_volume_ratio: Decimal = Decimal("0.60")
     max_spike_atr_multiple: Decimal = Decimal("3.0")
-    stop_atr_multiple: Decimal = Decimal("1.5")
-    take_profit_atr_multiple: Decimal = Decimal("2.6")
+    stop_atr_multiple: Decimal = Decimal("2.0")
+    take_profit_atr_multiple: Decimal = Decimal("2.8")
     allow_short_without_open_interest: bool = True
 
 
@@ -1027,16 +1027,3 @@ def _latest_decimal(values: list[Decimal | None], default: Decimal) -> Decimal:
     return default
 
 
-@dataclass(frozen=True)
-class HybridMetaV2Strategy(HybridMetaStrategy):
-    name: str = "hybrid_meta_v2"
-    bb_weight: Decimal = Decimal("0.20")
-    visual_weight: Decimal = Decimal("0.25")
-    hybrid_bollinger_score_enabled: bool = False
-    entry_threshold: Decimal = Decimal("0.45")
-    exit_threshold: Decimal = Decimal("0.42")
-    min_volume_ratio: Decimal = Decimal("0.60")
-    max_spike_atr_multiple: Decimal = Decimal("3.0")
-    stop_atr_multiple: Decimal = Decimal("1.5")
-    take_profit_atr_multiple: Decimal = Decimal("2.6")
-    allow_short_without_open_interest: bool = True

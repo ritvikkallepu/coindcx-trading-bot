@@ -14,6 +14,12 @@ class MainBacktestWiringTests(unittest.TestCase):
         args = build_parser().parse_args(["dashboard"])
 
         self.assertEqual(args.strategy, "hybrid_meta_v2")
+        self.assertTrue(args.compound_risk_equity)
+
+    def test_backtest_parser_uses_paper_like_risk_sizing_by_default(self) -> None:
+        args = build_parser().parse_args(["backtest"])
+
+        self.assertTrue(args.compound_risk_equity)
 
     @patch("app.main.record_backtest_result", return_value={})
     @patch("app.main._print_json")

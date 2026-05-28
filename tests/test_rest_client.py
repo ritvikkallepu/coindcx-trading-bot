@@ -122,6 +122,24 @@ class CoinDCXFuturesClientTests(unittest.TestCase):
         self.assertEqual(body["page"], 2)
         self.assertEqual(body["size"], 25)
 
+    def test_list_positions_can_filter_by_pairs_or_position_ids(self) -> None:
+        settings = Settings(coindcx_api_key="key", coindcx_api_secret="secret")
+        transport = FakeTransport(HTTPResponse(200, "[]", {}))
+        client = CoinDCXFuturesClient(
+            settings,
+            transport=transport,
+            rate_limiter=NoSleepLimiter(),
+            clock_ms=lambda: 1700000000000,
+        )
+
+        client.list_positions(
+            pairs=["B-BTC_USDT", "B-ETH_USDT"],
+            position_ids=["pos-1"],
+        )
+        body = json.loads(transport.calls[0]["data"].decode("utf-8"))  # type: ignore[union-attr]
+        self.assertEqual(body["pairs"], "B-BTC_USDT,B-ETH_USDT")
+        self.assertEqual(body["position_ids"], "pos-1")
+
     def test_live_order_is_blocked_by_default(self) -> None:
         settings = Settings(
             trading_mode="paper",
@@ -168,6 +186,56 @@ class CoinDCXFuturesClientTests(unittest.TestCase):
         )
 
         self.assertEqual(client.place_order(order), [{"id": "order-1"}])
+
+    def test_cancel_all_open_orders_uses_inr_margin_currency(self) -> None:
+        settings = Settings(
+            trading_mode="live",
+            live_trading_enabled=True,
+            coindcx_api_key="key",
+            coindcx_api_secret="secret",
+            futures_margin_currency="INR",
+        )
+        transport = FakeTransport(HTTPResponse(200, '{"message":"success"}', {}))
+        client = CoinDCXFuturesClient(
+            settings,
+            transport=transport,
+            rate_limiter=NoSleepLimiter(),
+            clock_ms=lambda: 1700000000000,
+        )
+
+        self.assertEqual(client.cancel_all_open_orders(), {"message": "success"})
+        body = json.loads(transport.calls[0]["data"].decode("utf-8"))  # type: ignore[union-attr]
+        self.assertEqual(body["margin_currency_short_name"], ["INR"])
+
+    def test_create_position_tpsl_uses_market_stop_payloads(self) -> None:
+        settings = Settings(
+            trading_mode="live",
+            live_trading_enabled=True,
+            coindcx_api_key="key",
+            coindcx_api_secret="secret",
+        )
+        transport = FakeTransport(HTTPResponse(200, '{"success":true}', {}))
+        client = CoinDCXFuturesClient(
+            settings,
+            transport=transport,
+            rate_limiter=NoSleepLimiter(),
+            clock_ms=lambda: 1700000000000,
+        )
+
+        self.assertEqual(
+            client.create_position_tpsl(
+                position_id="pos-1",
+                take_profit_stop_price=Decimal("110"),
+                stop_loss_stop_price=Decimal("95"),
+            ),
+            {"success": True},
+        )
+        body = json.loads(transport.calls[0]["data"].decode("utf-8"))  # type: ignore[union-attr]
+        self.assertEqual(body["id"], "pos-1")
+        self.assertEqual(body["take_profit"]["order_type"], "take_profit_market")
+        self.assertEqual(body["take_profit"]["stop_price"], "110")
+        self.assertEqual(body["stop_loss"]["order_type"], "stop_market")
+        self.assertEqual(body["stop_loss"]["stop_price"], "95")
 
     def test_network_errors_are_retried(self) -> None:
         settings = Settings(api_max_retries=1, api_retry_base_delay_seconds=0)

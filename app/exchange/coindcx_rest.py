@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -200,6 +201,8 @@ class CoinDCXFuturesClient:
         page: int = 1,
         size: int = 100,
         margin_currencies: list[str] | None = None,
+        pairs: list[str] | None = None,
+        position_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         body = {
             "page": page,
@@ -207,6 +210,10 @@ class CoinDCXFuturesClient:
             "margin_currency_short_name": margin_currencies
             or [self.settings.futures_margin_currency],
         }
+        if pairs:
+            body["pairs"] = ",".join(pairs)
+        if position_ids:
+            body["position_ids"] = ",".join(position_ids)
         return self._request_json(
             "POST",
             self.settings.coindcx_api_base_url,
@@ -232,6 +239,72 @@ class CoinDCXFuturesClient:
             self.settings.coindcx_api_base_url,
             "/exchange/v1/derivatives/futures/orders/cancel",
             body={"id": order_id},
+            auth=True,
+        )
+
+    def cancel_all_open_orders(
+        self,
+        *,
+        margin_currencies: list[str] | None = None,
+    ) -> dict[str, Any]:
+        self._require_live_trading("cancel all futures open orders")
+        return self._request_json(
+            "POST",
+            self.settings.coindcx_api_base_url,
+            "/exchange/v1/derivatives/futures/positions/cancel_all_open_orders",
+            body={
+                "margin_currency_short_name": margin_currencies
+                or [self.settings.futures_margin_currency]
+            },
+            auth=True,
+        )
+
+    def cancel_all_open_orders_for_position(self, position_id: str) -> dict[str, Any]:
+        self._require_live_trading("cancel futures open orders for a position")
+        return self._request_json(
+            "POST",
+            self.settings.coindcx_api_base_url,
+            "/exchange/v1/derivatives/futures/positions/cancel_all_open_orders_for_position",
+            body={"id": position_id},
+            auth=True,
+        )
+
+    def exit_position(self, position_id: str) -> dict[str, Any]:
+        self._require_live_trading("exit a futures position")
+        return self._request_json(
+            "POST",
+            self.settings.coindcx_api_base_url,
+            "/exchange/v1/derivatives/futures/positions/exit",
+            body={"id": position_id},
+            auth=True,
+        )
+
+    def create_position_tpsl(
+        self,
+        *,
+        position_id: str,
+        take_profit_stop_price: Decimal | int | float | str | None = None,
+        stop_loss_stop_price: Decimal | int | float | str | None = None,
+    ) -> dict[str, Any]:
+        self._require_live_trading("create futures take-profit/stop-loss orders")
+        body: dict[str, Any] = {"id": position_id}
+        if take_profit_stop_price is not None:
+            body["take_profit"] = {
+                "stop_price": str(take_profit_stop_price),
+                "order_type": "take_profit_market",
+            }
+        if stop_loss_stop_price is not None:
+            body["stop_loss"] = {
+                "stop_price": str(stop_loss_stop_price),
+                "order_type": "stop_market",
+            }
+        if "take_profit" not in body and "stop_loss" not in body:
+            raise ValueError("At least one take-profit or stop-loss price is required.")
+        return self._request_json(
+            "POST",
+            self.settings.coindcx_api_base_url,
+            "/exchange/v1/derivatives/futures/positions/create_tpsl",
+            body=body,
             auth=True,
         )
 

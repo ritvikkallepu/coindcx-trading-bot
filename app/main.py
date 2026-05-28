@@ -7,6 +7,10 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from unittest.mock import patch, PropertyMock, MagicMock
+import time
+
+logger = logging.getLogger(__name__)
 
 from app.backtest.data_loader import (
     REST_RESOLUTION_BY_INTERVAL,
@@ -29,6 +33,12 @@ from app.data.open_interest import (
 from app.data.pipeline import MarketDataPipeline
 from app.data.replay import ReplayMarketDataSource
 from app.execution.engine import PaperExecutionEngine
+from app.execution.live import (
+    ORDER_SYNC_STATUSES,
+    LiveExecutionEngine,
+    LiveOrderSnapshot,
+    LivePositionSnapshot,
+)
 from app.exchange.coindcx_rest import CoinDCXFuturesClient
 from app.exchange.coindcx_ws import (
     CoinDCXFuturesWebSocketClient,
@@ -73,6 +83,7 @@ from app.strategies.defaults import (
 from app.utils.logging import configure_logging
 from app.utils.time import utc_timestamp_ms
 
+logger = logging.getLogger(__name__)
 
 ATR_TAKE_PROFIT_MODES = ("fixed", "entry_atr", "ratchet", "trailing_atr", "none")
 OPEN_INTEREST_STRATEGIES = {"hybrid_meta", "hybrid_meta_v2", "adaptive_hybrid"}
@@ -468,6 +479,279 @@ def strategy_smoke(*, pair: str, interval: str, lookback: int) -> None:
     )
 
 
+def live_run_command(
+    *,
+    pair: str | None,
+    pairs_csv: str | None,
+    interval: str,
+    strategy_name: str,
+    equity: Decimal,
+    leverage: Decimal,
+) -> None:
+    settings = load_settings()
+    configure_logging(settings)
+
+    if not pair and not pairs_csv:
+        raise SystemExit("Error: Either --pair or --pairs must be provided.")
+
+    if pair and pairs_csv:
+        raise SystemExit("Error: Use either --pair or --pairs, not both.")
+
+    all_pairs: list[str] = []
+    if pair:
+        if "," in pair:
+            raise SystemExit("Error: --pair does not allow multiple values. Use --pairs for multiple pairs, or pass only one --pair.")
+        all_pairs = [pair.strip()]
+    else:
+        all_pairs = [p.strip() for p in (pairs_csv or "").split(",") if p.strip()]
+
+    if not all_pairs:
+        raise SystemExit("Error: No valid pairs identified.")
+
+    from app.live.live_loop import LiveTradingLoop
+    loop = LiveTradingLoop(
+        settings=settings,
+        strategy_name=strategy_name,
+        pairs=all_pairs,
+        interval=interval,
+        starting_equity=equity,
+        leverage=leverage
+    )
+
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        logger.info("Live run interrupted by user.")
+    finally:
+        loop.stop()
+
+def dry_run_exit_test_command(
+    *,
+    direction: str,
+    equity: Decimal,
+) -> None:
+    from app.live.live_loop import LiveTradingLoop, OHLCVCandle
+    from app.strategies.base import SignalDirection
+    import tempfile
+    from pathlib import Path
+    
+    settings = load_settings()
+    # Force dry-run
+    with patch.object(settings.__class__, 'live_pilot_dry_run', new_callable=PropertyMock) as mock_dry:
+        mock_limit = patch.object(settings.risk.__class__, 'atr_trailing_multiple', new_callable=PropertyMock(return_value=Decimal("1.5")))
+        mock_dry.return_value = True
+        mock_limit.start()
+        
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            loop = LiveTradingLoop(
+                settings=settings,
+                pairs=["B-TEST_USDT"],
+                interval="5m",
+                starting_equity=equity
+            )
+            loop.state_path = Path(tmp_dir) / "test_state.json"
+            
+            # Setup initial state
+            entry = Decimal("100")
+            initial_r = Decimal("1.5")
+            is_long = direction.upper() == "LONG"
+            stop = entry - initial_r if is_long else entry + initial_r
+            
+            loop.local_state["positions"]["B-TEST_USDT"] = {
+                "id": "test_pos",
+                "pair": "B-TEST_USDT",
+                "direction": direction.lower(),
+                "active_pos": "1" if is_long else "-1",
+                "avg_price": str(entry),
+                "leverage": "1",
+                "stop_loss_trigger": str(stop),
+                "source": "dry_run",
+                "status": "active"
+            }
+            loop.local_state["position_metadata"]["B-TEST_USDT"] = {
+                "initial_stop_loss": str(stop),
+                "initial_entry_price": str(entry),
+                "initial_r": str(initial_r),
+                "peak_price": str(entry),
+                "max_r_hit": "0"
+            }
+            
+            # Mock ATR to 1.0 for simple trailing math
+            with patch("app.live.live_loop.latest_indicator_snapshot") as mock_inds:
+                mock_inds.return_value = {"atr": Decimal("1.0")}
+                
+                print(f"\n--- DRY-RUN EXIT SIMULATION: {direction} ---")
+                print(f"{'Step':<10} | {'Price':<8} | {'Max R':<8} | {'Old Stop':<8} | {'New Stop':<8} | {'Reason':<25} | {'Status'}")
+                print("-" * 100)
+                
+                # Sequence of price targets in R
+                targets = [0.5, 0.8, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0]
+                
+                for r in targets:
+                    old_stop = Decimal(loop.local_state["positions"]["B-TEST_USDT"]["stop_loss_trigger"])
+                    
+                    # Target Price calculation
+                    price = entry + (initial_r * Decimal(str(r))) if is_long else entry - (initial_r * Decimal(str(r)))
+                    
+                    # Create synthetic candle reaching this price
+                    candle = OHLCVCandle(
+                        pair="B-TEST_USDT",
+                        interval="1m",
+                        open=price, high=price, low=price, close=price,
+                        volume=Decimal("1"), open_time_ms=int(time.time()*1000), close_time_ms=int(time.time()*1000)+59999,
+                        is_closed=True
+                    )
+                    
+                    loop._on_candle(candle)
+                    
+                    pos = loop.local_state["positions"].get("B-TEST_USDT")
+                    if not pos:
+                        break
+                        
+                    new_stop = Decimal(pos["stop_loss_trigger"])
+                    max_r = loop.local_state["position_metadata"]["B-TEST_USDT"]["max_r_hit"]
+                    
+                    reason = "No change"
+                    if new_stop != old_stop:
+                        if float(r) >= 2.0: reason = "ATR Trailing"
+                        elif float(r) >= 1.8: reason = "Strong Profit Lock (+0.75R)"
+                        elif float(r) >= 1.2: reason = "Profit Lock (+0.25R)"
+                        elif float(r) >= 0.8: reason = "Breakeven (+0.05R)"
+                    
+                    print(f"{f'+{r}R':<10} | {price:<8.2f} | {max_r:<8} | {old_stop:<8.2f} | {new_stop:<8.2f} | {reason:<25} | {pos['status']}")
+
+                # Finally, trigger STOP
+                if loop.local_state["positions"].get("B-TEST_USDT"):
+                    current_stop = Decimal(loop.local_state["positions"]["B-TEST_USDT"]["stop_loss_trigger"])
+                    # Reversal price
+                    trigger_price = current_stop - Decimal("0.01") if is_long else current_stop + Decimal("0.01")
+                    
+                    print(f"{'REVERSAL':<10} | {trigger_price:<8.2f} | {'-':<8} | {current_stop:<8.2f} | {'-':<8} | {'Triggering Stop...':<25} | Active")
+                    
+                    stop_candle = OHLCVCandle(
+                        pair="B-TEST_USDT",
+                        interval="1m",
+                        open=current_stop, high=max(current_stop, trigger_price), 
+                        low=min(current_stop, trigger_price), close=trigger_price,
+                        volume=Decimal("1"), open_time_ms=int(time.time()*1000), close_time_ms=int(time.time()*1000)+59999,
+                        is_closed=True
+                    )
+                    
+                    loop._on_candle(stop_candle)
+                    
+                    status = "CLOSED" if "B-TEST_USDT" not in loop.local_state["positions"] else "STILL OPEN"
+                    pnl = loop.local_state.get("locked_profit", "0")
+                    print(f"{'EXIT':<10} | {'-':<8} | {'-':<8} | {'-':<8} | {'-':<8} | {f'Final PnL: {pnl}':<25} | {status}")
+                
+                print("-" * 100)
+        mock_limit.stop()
+
+def live_status_command(
+    *,
+    pairs: list[str],
+    include_orders: bool,
+) -> None:
+    settings = load_settings()
+    configure_logging(settings)
+    client = CoinDCXFuturesClient(settings)
+    
+    from app.execution.live import LiveExchangeSynchronizer
+    sync = LiveExchangeSynchronizer(client, settings)
+    
+    report: dict[str, Any] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "trading_mode": settings.trading_mode,
+        "live_trading_enabled": settings.live_trading_allowed,
+        "dry_run": settings.live_pilot_dry_run,
+        "kill_switch": settings.risk.live_kill_switch,
+        "positions": [],
+    }
+    
+    for pair in pairs:
+        pos = sync.fetch_position(pair)
+        pos_data = pos.to_dict() if pos else {"pair": pair, "quantity": 0}
+        
+        if include_orders:
+            # For simplicity, list all open orders for this account
+            orders = []
+            try:
+                orders.extend(client.list_orders(
+                    status="open",
+                    side="buy",
+                    margin_currencies=[settings.futures_margin_currency]
+                ))
+                orders.extend(client.list_orders(
+                    status="open",
+                    side="sell",
+                    margin_currencies=[settings.futures_margin_currency]
+                ))
+            except Exception as e:
+                pos_data["open_orders_error"] = str(e)
+            # Filter by pair locally
+            pos_data["open_orders"] = [o for o in orders if o.get("pair") == pair]
+
+        report["positions"].append(pos_data)
+        
+    _print_json(report)
+
+
+def live_kill_switch_command(enable: bool) -> None:
+    settings = load_settings()
+    configure_logging(settings)
+    
+    # In a real system, this might update a database or a shared config file.
+    # For now, we'll log what it would do and implement the logic in the loop.
+    action = "ENABLING" if enable else "DISABLING"
+    print(f"!!! {action} LIVE KILL SWITCH !!!")
+    print("Note: This currently requires updating LIVE_KILL_SWITCH in your .env file")
+    print("or using the dashboard if implemented there.")
+
+
+def live_flatten_command(pair: str, confirm: str) -> None:
+    if confirm != "YES":
+        print("FLATTEN CANCELLED: You must provide --confirm-flatten YES")
+        return
+        
+    settings = load_settings()
+    configure_logging(settings)
+    client = CoinDCXFuturesClient(settings)
+    
+    from app.execution.live import LiveExchangeSynchronizer
+    sync = LiveExchangeSynchronizer(client, settings)
+    
+    pos = sync.fetch_position(pair)
+    if not pos or not pos.is_open:
+        print(f"No open position found for {pair}")
+        return
+        
+    print(f"Flattening {pair} position {pos.position_id} qty={pos.quantity}...")
+    client.exit_position(pos.position_id)
+    client.cancel_all_open_orders_for_position(pos.position_id)
+    print("Flatten request submitted.")
+
+
+def live_cancel_orders_command(pair: str, confirm: str) -> None:
+    if confirm != "YES":
+        print("CANCEL CANCELLED: You must provide --confirm-cancel YES")
+        return
+        
+    settings = load_settings()
+    configure_logging(settings)
+    client = CoinDCXFuturesClient(settings)
+    
+    # Fetch orders to find position_id if needed, or just cancel by pair if API supports.
+    # CoinDCX usually requires position_id or order_id.
+    from app.execution.live import LiveExchangeSynchronizer
+    sync = LiveExchangeSynchronizer(client, settings)
+    pos = sync.fetch_position(pair)
+    
+    if pos:
+        print(f"Cancelling all open orders for {pair} (position {pos.position_id})...")
+        client.cancel_all_open_orders_for_position(pos.position_id)
+    else:
+        print(f"No active position found for {pair}. Cannot determine orders to cancel via position_id.")
+
+
 def risk_smoke(
     *,
     pair: str,
@@ -704,6 +988,174 @@ def paper_execution_smoke(
             ],
             "orders": [order.to_dict() for order in broker.orders],
             "fills": [fill.to_dict() for fill in broker.fills],
+        }
+    )
+
+
+def live_pilot_smoke(
+    *,
+    pair: str,
+    interval: str,
+    lookback: int,
+    account_equity: Decimal,
+    leverage: Decimal,
+    strategy_name: str,
+    demo_entry: bool,
+    demo_stop_pct: Decimal,
+    demo_take_profit_pct: Decimal,
+    send_live_order: bool,
+) -> None:
+    settings = load_settings()
+    configure_logging(settings)
+    if interval not in REST_RESOLUTION_BY_INTERVAL:
+        raise SystemExit(
+            f"Unsupported REST smoke interval {interval}. "
+            f"Choose one of: {sorted(REST_RESOLUTION_BY_INTERVAL)}"
+        )
+
+    client = CoinDCXFuturesClient(settings)
+    now = datetime.now(timezone.utc)
+    lookback_seconds = int((interval_to_ms(interval) * lookback) / 1000)
+    candles_response = client.get_candles(
+        pair=pair,
+        from_ts=int((now - timedelta(seconds=lookback_seconds)).timestamp()),
+        to_ts=int(now.timestamp()),
+        resolution=REST_RESOLUTION_BY_INTERVAL[interval],
+    )
+    rows = (
+        candles_response.get("data", [])
+        if isinstance(candles_response, dict)
+        else candles_response
+    )
+    series = rest_rows_to_series(pair=pair, interval=interval, rows=rows, maxlen=lookback)
+    latest = series.latest()
+    if latest is None:
+        raise SystemExit("No candles loaded; cannot run live pilot smoke.")
+
+    indicators = latest_indicator_snapshot(series)
+    context = StrategyContext(
+        pair=pair,
+        interval=interval,
+        candles=series,
+        indicators=indicators,
+    )
+    signals = strategy_engine_for_name(strategy_name).evaluate(context)
+    if demo_entry:
+        signals.append(
+            _demo_entry_signal(
+                pair=pair,
+                interval=interval,
+                price=latest.close,
+                timestamp_ms=latest.close_time_ms,
+                stop_pct=demo_stop_pct,
+                take_profit_pct=demo_take_profit_pct,
+            )
+        )
+
+    instrument = _instrument_metadata(
+        client,
+        pair=pair,
+        margin_currency=settings.futures_margin_currency,
+    )
+    risk_manager = RiskManager(settings.risk)
+    engine = LiveExecutionEngine(client, settings, dry_run=not send_live_order)
+
+    results = []
+    sent_live_order = False
+    for signal in signals:
+        if signal.action == SignalAction.HOLD:
+            continue
+        decision = risk_manager.evaluate_signal(
+            signal,
+            account_equity=account_equity,
+            available_equity=account_equity,
+            daily_realized_pnl=Decimal("0"),
+            open_positions=0,
+            instrument=instrument,
+            requested_leverage=leverage,
+            quote_to_margin_rate=settings.quote_to_margin_rate,
+            unit_contract_value=Decimal("1"),
+            trading_mode="live",
+            live_trading_enabled=True,
+        )
+        report = engine.process_decision(decision)
+        results.append(
+            {
+                "signal": signal.to_dict(),
+                "risk_decision": decision.to_dict(),
+                "live_execution_report": report.to_dict(),
+            }
+        )
+        if send_live_order and report.accepted:
+            sent_live_order = True
+            break
+
+    _print_json(
+        {
+            "pair": pair,
+            "interval": interval,
+            "candles_loaded": len(series),
+            "latest_close": latest.close,
+            "strategy": strategy_name,
+            "demo_entry": demo_entry,
+            "send_live_order": send_live_order,
+            "live_trading_allowed_by_env": settings.live_trading_allowed,
+            "live_risk_approval_enabled": settings.risk.live_risk_approval_enabled,
+            "live_pilot_dry_run": not send_live_order,
+            "sent_live_order": sent_live_order,
+            "pilot_caps": {
+                "max_order_notional": settings.risk.live_max_order_notional,
+                "max_margin_per_order": settings.risk.live_max_margin_per_order,
+                "require_stop_loss": settings.risk.live_require_stop_loss,
+                "position_margin_type": settings.live_position_margin_type,
+            },
+            "results": results,
+        }
+    )
+
+
+def live_sync_smoke(*, pairs: str, include_orders: bool) -> None:
+    settings = load_settings()
+    configure_logging(settings)
+    settings.require_private_credentials()
+    client = CoinDCXFuturesClient(settings)
+    parsed_pairs = [item.strip() for item in pairs.split(",") if item.strip()]
+    position_rows = client.list_positions(
+        page=1,
+        size=100,
+        margin_currencies=[settings.futures_margin_currency],
+        pairs=parsed_pairs or None,
+    )
+    positions = [LivePositionSnapshot.from_mapping(row) for row in position_rows]
+
+    orders: list[LiveOrderSnapshot] = []
+    if include_orders:
+        for side in ("buy", "sell"):
+            order_rows = client.list_orders(
+                status=ORDER_SYNC_STATUSES,
+                side=side,
+                page=1,
+                size=100,
+                margin_currencies=[settings.futures_margin_currency],
+            )
+            for row in order_rows:
+                snapshot = LiveOrderSnapshot.from_mapping(row)
+                if parsed_pairs and snapshot.pair not in parsed_pairs:
+                    continue
+                orders.append(snapshot)
+
+    open_positions = [position for position in positions if position.is_open]
+    missing_stop = [
+        position.pair for position in open_positions if not position.has_stop_loss
+    ]
+    _print_json(
+        {
+            "margin_currency": settings.futures_margin_currency,
+            "pairs": parsed_pairs,
+            "open_position_count": len(open_positions),
+            "missing_stop_loss_pairs": missing_stop,
+            "positions": [position.to_dict() for position in positions],
+            "orders": [order.to_dict() for order in orders],
         }
     )
 
@@ -1361,6 +1813,93 @@ def build_parser() -> argparse.ArgumentParser:
         default=Decimal("2"),
     )
 
+    live_parser = subparsers.add_parser(
+        "live-pilot-smoke",
+        help="Build a capped live pilot order from strategy/risk; dry-run unless --send-live-order is set",
+    )
+    live_parser.add_argument("--pair", default="B-BTC_USDT")
+    live_parser.add_argument("--interval", default="1h")
+    live_parser.add_argument("--lookback", type=int, default=120)
+    live_parser.add_argument("--equity", type=_decimal_arg, default=None)
+    live_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("1"))
+    live_parser.add_argument(
+        "--strategy",
+        choices=STRATEGY_CHOICES,
+        default="hybrid_meta_v2",
+    )
+    live_parser.add_argument(
+        "--demo-entry",
+        action="store_true",
+        help="Append a synthetic long entry so the live order builder is visible.",
+    )
+    live_parser.add_argument("--demo-stop-pct", type=_decimal_arg, default=Decimal("1"))
+    live_parser.add_argument(
+        "--demo-take-profit-pct",
+        type=_decimal_arg,
+        default=Decimal("2"),
+    )
+    live_parser.add_argument(
+        "--send-live-order",
+        action="store_true",
+        help="Actually submit the first approved order. Requires live env flags and credentials.",
+    )
+
+    live_sync_parser = subparsers.add_parser(
+        "live-sync-smoke",
+        help="Read live futures positions/orders and normalize the exchange state",
+    )
+    live_sync_parser.add_argument(
+        "--pairs",
+        default="",
+        help="Optional comma-separated futures pairs to inspect.",
+    )
+    live_sync_parser.add_argument(
+        "--include-orders",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    live_run_parser = subparsers.add_parser(
+        "live-run", help="Start real-time live trading loop"
+    )
+    live_run_parser.add_argument("--pair", help="Single pair to trade, e.g. B-BTC_USDT")
+    live_run_parser.add_argument("--pairs", help="Comma-separated pairs to trade, e.g. B-BTC_USDT,B-ETH_USDT")
+    live_run_parser.add_argument("--interval", default="5m", help="Strategy interval, e.g. 5m, 1h")
+    live_run_parser.add_argument("--strategy", default="hybrid_meta_v2", choices=STRATEGY_CHOICES)
+    live_run_parser.add_argument("--equity", type=_decimal_arg, required=True, help="Starting equity for sizing")
+    live_run_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("1"), help="Leverage to use")
+
+    exit_test_parser = subparsers.add_parser(
+        "dry-run-exit-test", help="Verify dry-run exit logic with synthetic candles"
+    )
+    exit_test_parser.add_argument("--direction", required=True, choices=["LONG", "SHORT"])
+    exit_test_parser.add_argument("--equity", type=_decimal_arg, default=Decimal("100000"))
+
+    live_status_parser = subparsers.add_parser(
+        "live-status", help="Show exchange positions and local live state"
+    )
+    live_status_parser.add_argument("--pairs", default="B-BTC_USDT", help="CSV pairs")
+    live_status_parser.add_argument("--include-orders", action="store_true")
+
+    kill_switch_parser = subparsers.add_parser(
+        "live-kill-switch", help="Enable or disable live entry kill switch"
+    )
+    kill_group = kill_switch_parser.add_mutually_exclusive_group(required=True)
+    kill_group.add_argument("--enable", action="store_true")
+    kill_group.add_argument("--disable", action="store_true")
+
+    flatten_parser = subparsers.add_parser(
+        "live-flatten", help="Flatten live position and cancel orders"
+    )
+    flatten_parser.add_argument("--pair", required=True)
+    flatten_parser.add_argument("--confirm-flatten", required=True, help="Must be YES")
+
+    cancel_parser = subparsers.add_parser(
+        "live-cancel-orders", help="Cancel open orders for a live position"
+    )
+    cancel_parser.add_argument("--pair", required=True)
+    cancel_parser.add_argument("--confirm-cancel", required=True, help="Must be YES")
+
     backtest_parser = subparsers.add_parser(
         "backtest",
         help="Run a paper-only historical backtest through strategy, risk, and execution",
@@ -1379,8 +1918,8 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_parser.add_argument(
         "--compound-risk-equity",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use current account equity for risk sizing. Default is fixed initial equity.",
+        default=True,
+        help="Use current tradable equity for risk sizing, matching paper trading. Use --no-compound-risk-equity for fixed initial equity.",
     )
     backtest_parser.add_argument(
         "--stop-loss-pct",
@@ -1685,8 +2224,8 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_parser.add_argument(
         "--compound-risk-equity",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use current account equity for risk sizing. Default is fixed initial equity.",
+        default=True,
+        help="Use current tradable equity for risk sizing, matching paper trading. Use --no-compound-risk-equity for fixed initial equity.",
     )
     sweep_parser.add_argument(
         "--stop-loss-pct",
@@ -1992,8 +2531,8 @@ def build_parser() -> argparse.ArgumentParser:
     quick_parser.add_argument(
         "--compound-risk-equity",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use current equity for sizing. Default keeps risk based on initial equity.",
+        default=True,
+        help="Use current tradable equity for risk sizing, matching paper trading. Use --no-compound-risk-equity for fixed initial equity.",
     )
     quick_parser.add_argument("--stop-loss-pct", type=_decimal_arg, default=None)
     quick_parser.add_argument("--take-profit-pct", type=_decimal_arg, default=None)
@@ -2056,7 +2595,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser.add_argument(
         "--compound-risk-equity",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
     dashboard_parser.add_argument("--stop-loss-pct", type=_decimal_arg, default=None)
     dashboard_parser.add_argument("--take-profit-pct", type=_decimal_arg, default=None)
@@ -2321,7 +2860,51 @@ def main() -> None:
             demo_stop_pct=args.demo_stop_pct,
             demo_take_profit_pct=args.demo_take_profit_pct,
         )
+    elif args.command == "live-pilot-smoke":
+        live_pilot_smoke(
+            pair=args.pair,
+            interval=args.interval,
+            lookback=args.lookback,
+            account_equity=args.equity if args.equity is not None else settings.paper_starting_equity,
+            leverage=args.leverage,
+            strategy_name=args.strategy,
+            demo_entry=args.demo_entry,
+            demo_stop_pct=args.demo_stop_pct,
+            demo_take_profit_pct=args.demo_take_profit_pct,
+            send_live_order=args.send_live_order,
+        )
+    elif args.command == "live-sync-smoke":
+        live_sync_smoke(
+            pairs=args.pairs,
+            include_orders=args.include_orders,
+        )
+    elif args.command == "live-run":
+        live_run_command(
+            pair=args.pair,
+            pairs_csv=args.pairs,
+            interval=args.interval,
+            strategy_name=args.strategy,
+            equity=args.equity,
+            leverage=args.leverage
+        )
+    elif args.command == "dry-run-exit-test":
+        dry_run_exit_test_command(
+            direction=args.direction,
+            equity=args.equity
+        )
+    elif args.command == "live-status":
+        live_status_command(
+            pairs=args.pairs.split(","),
+            include_orders=args.include_orders
+        )
+    elif args.command == "live-kill-switch":
+        live_kill_switch_command(enable=args.enable)
+    elif args.command == "live-flatten":
+        live_flatten_command(pair=args.pair, confirm=args.confirm_flatten)
+    elif args.command == "live-cancel-orders":
+        live_cancel_orders_command(pair=args.pair, confirm=args.confirm_cancel)
     elif args.command == "backtest":
+
         maker_fee_rate, taker_fee_rate = _fee_rates_from_args(
             maker_fee_rate=args.maker_fee_rate,
             maker_fee_pct=args.maker_fee_pct,

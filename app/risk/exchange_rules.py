@@ -26,11 +26,11 @@ def normalize_signal_prices_to_tick(
     if signal.direction == SignalDirection.LONG:
         entry_price = _round_price(signal.entry_price, tick_size, "up")
         stop_loss = _round_price(signal.stop_loss, tick_size, "down")
-        take_profit = _round_price(signal.take_profit, tick_size, "down")
+        take_profit = _round_price(signal.take_profit, tick_size, "up")
     elif signal.direction == SignalDirection.SHORT:
         entry_price = _round_price(signal.entry_price, tick_size, "down")
         stop_loss = _round_price(signal.stop_loss, tick_size, "up")
-        take_profit = _round_price(signal.take_profit, tick_size, "up")
+        take_profit = _round_price(signal.take_profit, tick_size, "down")
 
     for field_name, before, after in (
         ("entry_price", signal.entry_price, entry_price),

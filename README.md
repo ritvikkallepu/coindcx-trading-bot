@@ -300,21 +300,37 @@ Phase 9 execution is still paper-only. The dynamic futures grid is also paper/ba
 
 Do not enable live trading until the paper broker, strategy engine, risk manager, execution engine, dashboard, alerts, and reconciliation are tested. Live mutations require both `TRADING_MODE=live` and `LIVE_TRADING_ENABLED=true`.
 
-## Before Phase 10
+## Live Deployment Guide
 
-Before moving on to persistence, alerts, or live execution work, keep live trading disabled and run:
+The bot implements a strict, staged rollout process to ensure live trading is not enabled recklessly. Follow these steps carefully:
 
-```powershell
-python -m unittest discover -s tests
-python -m app.main risk-smoke --pair B-BTC_USDT --interval 1h --lookback 120 --equity 1000 --leverage 1
-python -m app.main paper-execution-smoke --pair B-BTC_USDT --interval 1h --lookback 120 --equity 1000 --leverage 1 --demo-entry
-python -m app.main backtest --pair B-BTC_USDT --interval 1h --lookback 500 --equity 1000 --leverage 1
-python -m app.main dashboard --host 127.0.0.1 --port 8000
-```
+1. **Configure Environment**
+   - Copy `.env.example` to `.env`.
+   - Provide your `COINDCX_API_KEY` and `COINDCX_API_SECRET`.
 
-Review the dashboard and decide the Phase 10 priority:
+2. **Verify Integrity**
+   - Run the test suite: `python -m unittest discover -s tests`
+   - Check redacted config: `python -m app.main config-check`
+   - Run API connection smoke test: `python -m app.main auth-smoke`
 
-- SQLite persistence for paper/backtest runs
-- Telegram alerts for fills, errors, and daily summaries
-- A long-running paper trading loop
-- Live execution design with reconciliation and kill-switches
+3. **Stage 1: Paper Trading (Simulation)**
+   - Start the dashboard (`python -m app.main dashboard`) or run from CLI (`python -m app.main paper`).
+   - Monitor the bot's decisions over a 24-hour period.
+
+4. **Stage 2: Live Dry-Run**
+   - In `.env`, set `TRADING_MODE=live`, `LIVE_TRADING_ENABLED=true`, and `LIVE_PILOT_DRY_RUN=true`.
+   - Run: `python -m app.main live-run --pair B-BTC_USDT --equity 100000 --leverage 3`
+   - The bot will fetch real live state but *only log* the orders it would place.
+
+5. **Stage 3: Tiny Capital Pilot**
+   - Set `LIVE_PILOT_DRY_RUN=false` and confirm risk awareness: `LIVE_CONFIRM_I_UNDERSTAND_RISK=YES`.
+   - Set strict safety caps in `.env`: `LIVE_MAX_ORDER_NOTIONAL=500` (e.g., ₹500 max order).
+   - Start the live loop and monitor the first 2-3 live entries/exits to verify fees and slippage on the exchange.
+
+6. **Live Controls & Safety**
+   - **Check Status**: `python -m app.main live-status`
+   - **Kill Switch (Block Entries)**: `python -m app.main live-kill-switch --enable`
+   - **Panic Flatten**: `python -m app.main live-flatten --pair B-BTC_USDT --confirm-flatten YES`
+
+*Review `LIVE_TRADING_CHECKLIST.md` before deploying real capital.*
+

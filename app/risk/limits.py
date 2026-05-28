@@ -31,8 +31,19 @@ def daily_loss_limit_reached(context: RiskContext, settings: RiskSettings) -> bo
         return False
     if context.daily_realized_pnl >= 0:
         return False
+    
+    # 1. Percentage-based limit
     base_equity = context.daily_loss_limit_equity or context.account_equity
-    return abs(context.daily_realized_pnl) >= daily_loss_limit_amount(base_equity, settings)
+    pct_limit = daily_loss_limit_amount(base_equity, settings)
+    if abs(context.daily_realized_pnl) >= pct_limit:
+         return True
+         
+    # 2. Live absolute INR limit
+    if context.trading_mode == "live":
+        if abs(context.daily_realized_pnl) >= settings.live_max_daily_loss_inr:
+            return True
+            
+    return False
 
 
 def allowed_leverage(context: RiskContext, settings: RiskSettings) -> Decimal:

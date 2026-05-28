@@ -28,7 +28,7 @@ class BacktestConfig:
     unit_contract_value: Decimal = Decimal("1")
     requested_candles: int | None = None
     risk_per_trade_pct: Decimal | None = None
-    compound_risk_equity: bool = False
+    compound_risk_equity: bool = True
     trade_quality_mode: str = "strict"
     controlled_shorts_enabled: bool = False
     a_setup_score_threshold: Decimal = Decimal("0.50")
@@ -63,7 +63,7 @@ class BacktestConfig:
     atr_period: int = 14
     atr_stop_multiple: Decimal = Decimal("1.5")
     atr_take_profit_multiple: Decimal = Decimal("3")
-    atr_trailing_multiple: Decimal = Decimal("2.0")
+    atr_trailing_multiple: Decimal = Decimal("1.2")
     atr_take_profit_mode: str = "none"
     bb_trail_enabled: bool = False
     bb_trail_buffer_multiplier: Decimal = Decimal("1.0")
