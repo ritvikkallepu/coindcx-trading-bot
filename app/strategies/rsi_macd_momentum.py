@@ -454,9 +454,31 @@ class RSIMACDMomentumStrategy(Strategy):
             action = SignalAction.ENTER_SHORT
             stop_loss = latest.close + stop_distance
 
+        rsi_value = metadata.get("rsi", Decimal("50"))
         confidence = Decimal("0.58") + (
-            abs(metadata.get("rsi", Decimal("50")) - Decimal("50")) / Decimal("100")
+            abs(rsi_value - Decimal("50")) / Decimal("100")
         )
+        
+        # Respect global config overrides
+        config = context.features.get("backtest_config")
+        config = config if isinstance(config, dict) else {}
+        
+        entry_metadata = {
+            **metadata,
+            "strategy_managed_exits": True,
+            "strategy_exit_model": self.name,
+            "emergency_stop_model": "static_atr",
+            "stop_atr_multiple": self.stop_atr_multiple,
+            "take_profit_priority": "strategy_exit",
+            "atr_dynamic_exits_enabled": _bool_value(config.get("atr_dynamic_exits_enabled"), False),
+            "atr_stop_enabled": _bool_value(config.get("atr_stop_enabled"), False),
+            "atr_take_profit_enabled": _bool_value(config.get("atr_take_profit_enabled"), False),
+            "atr_trailing_enabled": _bool_value(config.get("atr_trailing_enabled"), False),
+            "profit_lock_enabled": _bool_value(config.get("profit_lock_enabled"), False),
+            "bb_trail_enabled": _bool_value(config.get("bb_trail_enabled"), False),
+            "trailing_stop_enabled": _bool_value(config.get("trailing_stop_enabled"), True),
+        }
+
         return StrategySignal(
             strategy_name=self.name,
             pair=context.pair,
@@ -469,21 +491,7 @@ class RSIMACDMomentumStrategy(Strategy):
             entry_price=latest.close,
             stop_loss=stop_loss,
             take_profit=None,
-            metadata={
-                **metadata,
-                "strategy_managed_exits": True,
-                "strategy_exit_model": self.name,
-                "emergency_stop_model": "static_atr",
-                "stop_atr_multiple": self.stop_atr_multiple,
-                "take_profit_priority": "strategy_exit",
-                "atr_dynamic_exits_enabled": False,
-                "atr_stop_enabled": False,
-                "atr_take_profit_enabled": False,
-                "atr_trailing_enabled": False,
-                "profit_lock_enabled": False,
-                "bb_trail_enabled": False,
-                "trailing_stop_enabled": False,
-            },
+            metadata=entry_metadata,
         )
 
     def _base_metadata(
@@ -648,3 +656,16 @@ def _combine_hold_reason(long_block: str, short_block: str) -> str:
     if long_block == short_block:
         return long_block
     return f"No RSI/MACD setup. Long: {long_block} Short: {short_block}"
+
+
+def _bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default

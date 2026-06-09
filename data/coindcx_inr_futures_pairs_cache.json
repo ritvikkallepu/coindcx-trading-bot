@@ -1,5 +1,5 @@
 {
-  "timestamp": 1779920587.5036237,
+  "timestamp": 1781018279.8123102,
   "data": {
     "market": "futures",
     "margin": "INR",
@@ -410,6 +410,12 @@
       {
         "pair": "B-BCH_USDT",
         "display_name": "BCH-USDT",
+        "margin_currency": "INR",
+        "active": true
+      },
+      {
+        "pair": "B-BEAT_USDT",
+        "display_name": "BEAT-USDT",
         "margin_currency": "INR",
         "active": true
       },
@@ -1320,6 +1326,12 @@
         "active": true
       },
       {
+        "pair": "B-LAB_USDT",
+        "display_name": "LAB-USDT",
+        "margin_currency": "INR",
+        "active": true
+      },
+      {
         "pair": "B-LAYER_USDT",
         "display_name": "LAYER-USDT",
         "margin_currency": "INR",
@@ -2034,6 +2046,12 @@
         "active": true
       },
       {
+        "pair": "B-SIREN_USDT",
+        "display_name": "SIREN-USDT",
+        "margin_currency": "INR",
+        "active": true
+      },
+      {
         "pair": "B-SKL_USDT",
         "display_name": "SKL-USDT",
         "margin_currency": "INR",
@@ -2048,6 +2066,12 @@
       {
         "pair": "B-SKY_USDT",
         "display_name": "SKY-USDT",
+        "margin_currency": "INR",
+        "active": true
+      },
+      {
+        "pair": "B-SLX_USDT",
+        "display_name": "SLX-USDT",
         "margin_currency": "INR",
         "active": true
       },

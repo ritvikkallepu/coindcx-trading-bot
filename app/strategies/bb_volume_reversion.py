@@ -127,12 +127,31 @@ class BollingerVolumeMeanReversionStrategy(Strategy):
         squeeze_rank = metadata.get("squeeze_rank") or Decimal("1")
         confidence = Decimal("0.6") + ((Decimal("1") - squeeze_rank) * Decimal("0.25"))
 
+        # Respect global config overrides
+        config = context.features.get("backtest_config")
+        config = config if isinstance(config, dict) else {}
+
         metadata = {
             "stop_atr_multiple": self.stop_atr_multiple,
             "atr_trailing_multiple": self.atr_trailing_multiple,
             "trailing_atr_multiple": self.atr_trailing_multiple,
             **metadata,
         }
+
+        for key in (
+            "trailing_stop_enabled",
+            "trailing_stop_activation_pct",
+            "trailing_stop_distance_pct",
+            "atr_stop_enabled",
+            "atr_take_profit_enabled",
+            "atr_trailing_enabled",
+            "profit_lock_enabled",
+            "bb_trail_enabled",
+        ):
+            if key in config:
+                metadata[key] = config[key]
+        if "atr_dynamic_exits_enabled" in config:
+            metadata["atr_dynamic_exits_enabled"] = _bool_value(config.get("atr_dynamic_exits_enabled"), True)
 
         return StrategySignal(
             strategy_name=self.name,
@@ -164,6 +183,19 @@ class BollingerVolumeMeanReversionStrategy(Strategy):
             reason=reason,
             metadata=metadata,
         )
+
+
+def _bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _rank_fraction(values: list[Decimal], current: Decimal) -> Decimal:

@@ -458,7 +458,7 @@ class BollingerDynamicFuturesGridStrategy(Strategy):
             "max_grid_entries": self.max_grid_entries,
             "trailing_stop_enabled": _bool_value(
                 config.get("trailing_stop_enabled"),
-                False,
+                True,
             ),
             "trail_activation_pct": activation_pct,
             "trail_distance_pct": distance_pct,

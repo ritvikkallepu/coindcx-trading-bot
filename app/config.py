@@ -114,7 +114,7 @@ class RiskSettings:
     pair_loss_risk_multiplier: Decimal = Decimal("0.50")
     pair_loss_severe_limit: int = 3
     pair_loss_severe_risk_multiplier: Decimal = Decimal("0.25")
-    trailing_stop_enabled: bool = False
+    trailing_stop_enabled: bool = True
     trailing_stop_activation_pct: Decimal = Decimal("1")
     trailing_stop_distance_pct: Decimal = Decimal("2")
     # Fees and Slippage
@@ -124,9 +124,9 @@ class RiskSettings:
     slippage_pct: Decimal = Decimal("0.05")
     stop_slippage_pct: Decimal = Decimal("0.1")
     # ATR Policy
-    atr_stop_enabled: bool = True
-    atr_take_profit_enabled: bool = True
-    atr_trailing_enabled: bool = True
+    atr_stop_enabled: bool = False
+    atr_take_profit_enabled: bool = False
+    atr_trailing_enabled: bool = False
     atr_take_profit_mode: str = "fixed"
     atr_stop_multiple: Decimal = Decimal("1.5")
     atr_take_profit_multiple: Decimal = Decimal("2.4")

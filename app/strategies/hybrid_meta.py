@@ -687,6 +687,9 @@ class HybridMetaStrategy(Strategy):
             "trailing_stop_enabled",
             "trailing_stop_activation_pct",
             "trailing_stop_distance_pct",
+            "atr_stop_enabled",
+            "atr_take_profit_enabled",
+            "atr_trailing_enabled",
             "profit_lock_enabled",
             "bb_trail_enabled",
             "bb_trail_buffer_multiplier",
@@ -707,6 +710,13 @@ class HybridMetaStrategy(Strategy):
                 policy_metadata["atr_stop_enabled"] = False
                 policy_metadata["atr_take_profit_enabled"] = False
                 policy_metadata["atr_trailing_enabled"] = False
+        else:
+            # Sync aggregate flag with overridden components
+            policy_metadata["atr_dynamic_exits_enabled"] = (
+                policy_metadata.get("atr_stop_enabled", False)
+                or policy_metadata.get("atr_take_profit_enabled", False)
+                or policy_metadata.get("atr_trailing_enabled", False)
+            )
         profile_multiplier = _decimal_from_metadata(
             config.get("profile_risk_multiplier"),
             Decimal("1"),
