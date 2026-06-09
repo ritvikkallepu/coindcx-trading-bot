@@ -24,6 +24,10 @@
       atr_mode: document.getElementById('atr_mode'),
       atr_stop_multiple: document.getElementById('atr_stop_multiple'),
       atr_trailing_multiple: document.getElementById('atr_trailing_multiple'),
+      execution_interval: document.getElementById('execution_interval'),
+      intrabar_reentry_enabled: document.getElementById('intrabar_reentry_enabled'),
+      max_reentries_per_candle: document.getElementById('max_reentries_per_candle'),
+      reentry_cooldown_candles: document.getElementById('reentry_cooldown_candles'),
       runButton: document.getElementById('runButton'),
       message: document.getElementById('message'),
       statusRows: document.getElementById('statusRows'),
@@ -717,9 +721,16 @@
         trailing_stop_activation_pct: initialConfig.trailing_stop_activation_pct,
         trailing_stop_distance_pct: initialConfig.trailing_stop_distance_pct,
         atr_stop_multiple: defaults.atr_stop_multiple,
-        atr_trailing_multiple: defaults.atr_trailing_multiple
+        atr_trailing_multiple: defaults.atr_trailing_multiple,
+        execution_interval: defaults.execution_interval,
+        intrabar_reentry_enabled: defaults.intrabar_reentry_enabled,
+        max_reentries_per_candle: defaults.max_reentries_per_candle,
+        reentry_cooldown_candles: defaults.reentry_cooldown_candles
       }).forEach(([key, value]) => {
-        if (value !== undefined && ids[key]) ids[key].value = value;
+        if (value !== undefined && ids[key]) {
+          if (ids[key].type === 'checkbox') ids[key].checked = Boolean(value);
+          else ids[key].value = value;
+        }
       });
       
       // Handle pair separately to use display name if available
@@ -817,6 +828,10 @@
         atr_entry_filter_enabled: true,
         atr_stop_multiple: ids.atr_stop_multiple.value,
         atr_trailing_multiple: ids.atr_trailing_multiple.value,
+        execution_interval: ids.execution_interval.value,
+        intrabar_reentry_enabled: ids.intrabar_reentry_enabled.checked,
+        max_reentries_per_candle: ids.max_reentries_per_candle.value,
+        reentry_cooldown_candles: ids.reentry_cooldown_candles.value,
         recent_count: 12
       };
     }
