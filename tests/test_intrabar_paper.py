@@ -103,6 +103,46 @@ class IntrabarPaperLoopTests(unittest.TestCase):
         self.assertEqual(position.metadata["entry_execution_candle_open_time_ms"], exec_candle.open_time_ms)
         self.assertEqual(position.metadata["entry_execution_candle_low"], exec_candle.low)
 
+    def test_pair_exit_flags_override_broker_defaults_on_entry(self) -> None:
+        pair = "B-BTC_USDT"
+        self.loop.series = {pair: CandleSeries()}
+        for i in range(10):
+            self.loop.series[pair].add(_candle("15m", i * 900000, pair=pair))
+        self.loop.execution_series = {pair: CandleSeries()}
+        for i in range(150):
+            self.loop.execution_series[pair].add(_candle("1m", i * 60000, pair=pair))
+        self.loop._current_parent_open_ms = {pair: 9 * 900000}
+        self.loop._entries_this_parent_candle = {pair: 0}
+        self.loop.broker.trailing_stop_enabled = True
+        self.loop.update_pair_overrides(
+            {
+                pair: {
+                    "trailing_stop_enabled": False,
+                    "atr_dynamic_exits_enabled": False,
+                    "bb_trail_enabled": False,
+                    "profit_lock_enabled": False,
+                }
+            },
+            publish=False,
+        )
+
+        exec_candle = _candle("1m", 10 * 900000, Decimal("105"), pair=pair)
+        signal = StrategySignal(
+            strategy_name="S", pair=pair, interval="15m",
+            action=SignalAction.ENTER_LONG, direction=SignalDirection.LONG,
+            confidence=Decimal("1"), reason="test", timestamp_ms=exec_candle.close_time_ms,
+            entry_price=Decimal("105"), stop_loss=Decimal("100")
+        )
+        self.loop.strategy_engine.evaluate.return_value = [signal]
+
+        self.loop._on_candle(exec_candle)
+
+        position = self.loop.broker.open_positions()[0]
+        self.assertFalse(position.metadata["trailing_stop_enabled"])
+        self.assertFalse(position.metadata["atr_dynamic_exits_enabled"])
+        self.assertFalse(position.metadata["atr_stop_enabled"])
+        self.assertFalse(position.metadata["bb_trail_enabled"])
+
     def test_positions_payload_includes_trailing_audit_fields(self) -> None:
         pair = "B-BTC_USDT"
         self.loop.broker.positions[pair] = PaperPosition(
@@ -521,6 +561,111 @@ class IntrabarPaperLoopTests(unittest.TestCase):
         self.assertEqual(provisional.high, Decimal("103"))
         self.assertEqual(provisional.interval, "15m")
         self.assertEqual(provisional.open_time_ms, 900000)
+
+    def test_partial_parent_completion_ratio_tracks_elapsed_parent_time(self) -> None:
+        pair = "B-BTC_USDT"
+        self.loop.settings = replace(self.loop.settings, use_partial_parent_candle=True)
+        self.loop.execution_series = {pair: CandleSeries()}
+        self.loop.execution_series[pair].add(_candle("1m", 900000, Decimal("101"), pair=pair))
+        self.loop.execution_series[pair].add(_candle("1m", 960000, Decimal("102"), pair=pair))
+
+        self.assertEqual(self.loop._parent_completion_ratio(pair), Decimal("2") / Decimal("15"))
+
+    def test_recent_diagnostics_replace_same_pair_same_candle(self) -> None:
+        pair = "B-BTC_USDT"
+        candle = _candle("1m", 60_000, Decimal("105"), pair=pair)
+        first = StrategySignal.hold(
+            strategy_name="fib_ma_pullback",
+            pair=pair,
+            interval="15m",
+            timestamp_ms=candle.close_time_ms,
+            reason="Volume ratio below fib pullback threshold: 0.15 < 0.45.",
+            metadata={
+                "entry_type": "fib_ma_pullback",
+                "volume_ratio": Decimal("0.15"),
+                "body_ratio": Decimal("0.10"),
+            },
+        )
+        second = StrategySignal.hold(
+            strategy_name="fib_ma_pullback",
+            pair=pair,
+            interval="15m",
+            timestamp_ms=candle.close_time_ms,
+            reason="Volume ratio below fib pullback threshold: 0.25 < 0.45.",
+            metadata={
+                "entry_type": "fib_ma_pullback",
+                "volume_ratio": Decimal("0.25"),
+                "body_ratio": Decimal("0.20"),
+            },
+        )
+
+        self.loop._write_audit_row(candle, first)
+        self.loop._write_audit_row(candle, second)
+
+        self.assertEqual(len(self.loop._recent_diagnostics), 1)
+        row = self.loop._recent_diagnostics[0]
+        self.assertEqual(row["volume_ratio"], "0.25")
+        self.assertEqual(row["timestamp_ms"], candle.close_time_ms)
+        self.assertIn("T", row["candle_time"])
+
+    def test_fib_entries_only_evaluate_once_per_closed_parent_candle(self) -> None:
+        pair = "B-BTC_USDT"
+        self.loop._pair_overrides = {pair: {"strategy": "fib_ma_pullback"}}
+        self.loop.series = {pair: CandleSeries()}
+        self.loop.series[pair].add(_candle("15m", 0, Decimal("100"), pair=pair))
+
+        stale_exec = _candle("1m", 1_800_000, Decimal("101"), pair=pair)
+        self.assertFalse(self.loop._should_evaluate_entries_on_candle(pair, stale_exec))
+
+        parent = _candle("15m", 1_800_000, Decimal("102"), pair=pair)
+        self.loop.series[pair].add(parent)
+        first_exec_after_parent_close = _candle("1m", 2_700_000, Decimal("103"), pair=pair)
+        second_exec_after_parent_close = _candle("1m", 2_760_000, Decimal("104"), pair=pair)
+
+        self.assertTrue(
+            self.loop._should_evaluate_entries_on_candle(pair, first_exec_after_parent_close)
+        )
+        self.assertFalse(
+            self.loop._should_evaluate_entries_on_candle(pair, second_exec_after_parent_close)
+        )
+
+    def test_fib_one_hour_five_minute_allows_execution_trigger_evaluation(self) -> None:
+        pair = "B-BTC_USDT"
+        self.loop.settings = replace(
+            self.loop.settings,
+            strategy_interval="1h",
+            execution_interval="5m",
+        )
+        self.loop._pair_overrides = {pair: {"strategy": "fib_ma_pullback"}}
+        self.loop.series = {pair: CandleSeries()}
+        self.loop.series[pair].add(_candle("1h", 0, Decimal("100"), pair=pair))
+
+        first_exec = _candle("5m", 3_600_000, Decimal("101"), pair=pair)
+        second_exec = _candle("5m", 3_900_000, Decimal("102"), pair=pair)
+
+        self.assertTrue(self.loop._should_evaluate_entries_on_candle(pair, first_exec))
+        self.assertTrue(self.loop._should_evaluate_entries_on_candle(pair, second_exec))
+        self.assertFalse(self.loop._strategy_uses_closed_parent_entries_only(pair))
+
+    def test_published_snapshot_reports_intrabar_interval_and_hides_stale_overrides(self) -> None:
+        from app.live.state import get_live_state, reset_live_state
+
+        pair = "B-BTC_USDT"
+        reset_live_state()
+        self.loop._watchlist = [pair]
+        self.loop._pair_overrides = {
+            pair: {"strategy": "fib_ma_pullback"},
+            "B-STALE_USDT": {"strategy": "hybrid_meta_v2"},
+        }
+
+        self.loop._publish_live_snapshot(interval="15m/1m", last_updated="test")
+
+        state = get_live_state()
+        self.assertEqual(state["interval"], "15m/1m")
+        self.assertEqual(state["strategy_interval"], "15m")
+        self.assertEqual(state["execution_interval"], "1m")
+        self.assertIn(pair, state["pair_overrides"])
+        self.assertNotIn("B-STALE_USDT", state["pair_overrides"])
 
 
 if __name__ == "__main__":

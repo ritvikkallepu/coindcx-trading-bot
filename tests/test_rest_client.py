@@ -140,6 +140,32 @@ class CoinDCXFuturesClientTests(unittest.TestCase):
         self.assertEqual(body["pairs"], "B-BTC_USDT,B-ETH_USDT")
         self.assertEqual(body["position_ids"], "pos-1")
 
+    def test_list_position_transactions_uses_stage_and_margin_currency(self) -> None:
+        settings = Settings(
+            coindcx_api_key="key",
+            coindcx_api_secret="secret",
+            futures_margin_currency="INR",
+        )
+        transport = FakeTransport(HTTPResponse(200, "[]", {}))
+        client = CoinDCXFuturesClient(
+            settings,
+            transport=transport,
+            rate_limiter=NoSleepLimiter(),
+            clock_ms=lambda: 1700000000000,
+        )
+
+        client.list_position_transactions(stage="tpsl_exit", page=2, size=25)
+        call = transport.calls[0]
+        body = json.loads(call["data"].decode("utf-8"))  # type: ignore[union-attr]
+        self.assertIn(
+            "/exchange/v1/derivatives/futures/positions/transactions",
+            str(call["url"]),
+        )
+        self.assertEqual(body["stage"], "tpsl_exit")
+        self.assertEqual(body["page"], 2)
+        self.assertEqual(body["size"], 25)
+        self.assertEqual(body["margin_currency_short_name"], ["INR"])
+
     def test_live_order_is_blocked_by_default(self) -> None:
         settings = Settings(
             trading_mode="paper",

@@ -5,6 +5,7 @@ from app.strategies.base import StrategyEngine
 from app.strategies.bb_dynamic_grid import BollingerDynamicFuturesGridStrategy
 from app.strategies.bb_volume_reversion import BollingerVolumeMeanReversionStrategy
 from app.strategies.ema_rsi_trend import EMARSICrossoverStrategy
+from app.strategies.fib_ma_pullback import FibMAPullbackStrategy
 from app.strategies.hybrid_meta import HybridMetaStrategy, HybridMetaV2Strategy
 from app.strategies.rsi_macd_momentum import RSIMACDMomentumStrategy
 
@@ -16,6 +17,7 @@ STRATEGY_CHOICES = (
     "hybrid_meta",
     "hybrid_meta_v2",
     "rsi_macd_momentum",
+    "fib_ma_pullback",
     "adaptive_hybrid",
     "bb_dynamic_grid",
 )
@@ -38,6 +40,7 @@ def all_strategy_engine() -> StrategyEngine:
             HybridMetaStrategy(),
             HybridMetaV2Strategy(),
             RSIMACDMomentumStrategy(),
+            FibMAPullbackStrategy(),
             AdaptiveHybridStrategy(),
             BollingerDynamicFuturesGridStrategy(),
         ]
@@ -58,6 +61,8 @@ def strategy_engine_for_name(name: str) -> StrategyEngine:
         return StrategyEngine([HybridMetaV2Strategy()])
     if normalized in {"rsi_macd_momentum", "rsi_macd"}:
         return StrategyEngine([RSIMACDMomentumStrategy()])
+    if normalized in {"fib_ma_pullback", "fib_ma"}:
+        return StrategyEngine([FibMAPullbackStrategy()])
     if normalized == "adaptive_hybrid":
         return StrategyEngine([AdaptiveHybridStrategy()])
     if normalized == "bb_dynamic_grid":

@@ -222,6 +222,31 @@ class CoinDCXFuturesClient:
             auth=True,
         )
 
+    def list_position_transactions(
+        self,
+        *,
+        stage: str,
+        page: int = 1,
+        size: int = 100,
+        margin_currencies: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return futures position transactions in the margin currency."""
+
+        body = {
+            "stage": stage,
+            "page": page,
+            "size": size,
+            "margin_currency_short_name": margin_currencies
+            or [self.settings.futures_margin_currency],
+        }
+        return self._request_json(
+            "POST",
+            self.settings.coindcx_api_base_url,
+            "/exchange/v1/derivatives/futures/positions/transactions",
+            body=body,
+            auth=True,
+        )
+
     def place_order(self, order: FuturesOrderRequest) -> list[dict[str, Any]]:
         self._require_live_trading("place futures orders")
         return self._request_json(

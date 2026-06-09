@@ -812,7 +812,7 @@ class StrategyTests(unittest.TestCase):
                 high=Decimal("105.2"),
                 low=Decimal("100.8"),
                 close=Decimal("105"),
-                volume=Decimal("600"),
+                volume=Decimal("350"),
             ),
         ]
 
@@ -824,6 +824,10 @@ class StrategyTests(unittest.TestCase):
                     "backtest_config": {
                         "intrabar_reversal_breakout_enabled": True,
                         "previous_parent_high": Decimal("100"),
+                        "reversal_breakout_ignition_volume_ratio": Decimal("3.0"),
+                        "reversal_breakout_ignition_body_ratio": Decimal("0.70"),
+                        "reversal_breakout_ignition_close_position_ratio": Decimal("0.75"),
+                        "reversal_breakout_ignition_max_extension_atr": Decimal("5.0"),
                     },
                 },
             )

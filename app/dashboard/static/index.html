@@ -13,13 +13,14 @@
         <div class="mark">CX</div>
         <div>
           <h1>CoinDCX Futures</h1>
-          <p class="subtle">Paper control dashboard</p>
+          <p class="subtle">Trading control dashboard</p>
         </div>
       </div>
 
       <div class="modeTabs">
         <button id="tabBacktest" class="modeTab active" type="button">Backtest</button>
         <button id="tabPaper" class="modeTab" type="button">Paper Trading</button>
+        <button id="tabLive" class="modeTab" type="button">Live Monitor</button>
       </div>
 
       <div id="backtestControls">
@@ -56,6 +57,7 @@
                 <option value="adaptive_hybrid">Adaptive Hybrid</option>
                 <option value="hybrid_meta_v2">Weighted Hybrid V2</option>
                 <option value="rsi_macd_momentum">RSI + MACD Momentum</option>
+                <option value="fib_ma_pullback">Fib MA Pullback</option>
                 <option value="hybrid_meta">Weighted Hybrid</option>
                 <option value="ema_rsi_trend">EMA-RSI Trend</option>
                 <option value="bb_volume_reversion">BB Reversion</option>
@@ -254,6 +256,7 @@
               <select id="p_strategy">
                 <option value="hybrid_meta_v2" selected>Weighted Hybrid V2</option>
                 <option value="rsi_macd_momentum">RSI + MACD Momentum</option>
+                <option value="fib_ma_pullback">Fib MA Pullback</option>
                 <option value="adaptive_hybrid">Adaptive Hybrid</option>
                 <option value="bb_dynamic_grid">Futures Grid</option>
                 <option value="hybrid_meta">Weighted Hybrid</option>
@@ -296,7 +299,7 @@
             <label>Max Daily Loss %
               <input id="p_max_daily_loss_pct" type="number" min="0.1" step="0.1" value="3" />
             </label>
-            <label>Max Open Pos
+            <label>Max Same-Pair Pos
               <input id="p_max_open" type="number" min="1" max="10" value="3" />
             </label>
           </div>
@@ -520,7 +523,9 @@
                   <th>#</th>
                   <th>Time</th>
                   <th>Pair</th>
+                  <th>Strategy</th>
                   <th>Dir</th>
+                  <th>Lev</th>
                   <th>Entry</th>
                   <th>Exit</th>
                   <th>Qty</th>
@@ -809,11 +814,12 @@
                   <th>Net ROE %</th>
                   <th>Account Impact %</th>
                   <th>Hold</th>
+                  <th>Trail</th>
                   <th>Reason</th>
                 </tr>
               </thead>
               <tbody id="pmTradeRows">
-                <tr><td colspan="18">No closed trades yet</td></tr>
+                <tr><td colspan="21">No closed trades yet</td></tr>
               </tbody>
             </table>
           </div>
@@ -821,10 +827,158 @@
 
         <div id="pmError" class="message error" style="margin-top:12px"></div>
       </div>
+
+    <div id="liveMain" style="display:none">
+      <div class="topbar">
+        <div class="title">
+          <h2>Live Monitor</h2>
+          <p class="subtle" id="liveLoopMeta">Loading...</p>
+        </div>
+        <div class="chips" id="liveTopChips">
+          <span class="chip warn" id="liveModeBadge">Checking Mode...</span>
+        </div>
+      </div>
+      
+      <div id="liveSafetyBanner" class="message" style="margin-bottom: 12px; display: none;"></div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+        <div class="panel">
+          <div class="panelHeader">
+            <h3>Kill Switch</h3>
+            <span class="chip" id="ksStatusChip">Checking...</span>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <div class="miniStat"><span>Close on Kill Switch</span><strong id="ksClose">False</strong></div>
+            <div class="miniStat"><span>Cancel Orders on Kill Switch</span><strong id="ksCancel">False</strong></div>
+            <div class="split" style="margin-top: 10px;">
+              <button class="capitalBtn danger" onclick="enableLiveKillSwitch()">ENABLE KILL SWITCH</button>
+              <button class="capitalBtn unlock" onclick="disableLiveKillSwitch()">Disable</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panelHeader">
+            <h3>Risk & Accounting</h3>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <div class="split">
+              <div class="miniStat"><span>Portfolio Equity</span><strong id="livePortfolioEq">-</strong></div>
+              <div class="miniStat"><span>Wallet Balance</span><strong id="liveWalletBalance">-</strong></div>
+              <div class="miniStat"><span>Allocated Capital</span><strong id="liveAllocatedCapital">-</strong></div>
+              <div class="miniStat"><span>Tradable Base</span><strong id="liveTradableBase">-</strong></div>
+            </div>
+            <div class="split">
+              <div class="miniStat"><span>Exchange Free Collateral</span><strong id="liveFreeCollateral">-</strong></div>
+              <div class="miniStat"><span>Usable Capital Now</span><strong id="liveUsableCapital">-</strong></div>
+              <div class="miniStat"><span>Max Allocated Notional</span><strong id="liveMaxNotional">-</strong></div>
+              <div class="miniStat"><span>Locked Profit</span><strong id="liveLockedProfit" style="color:var(--amber)">-</strong></div>
+            </div>
+            <div class="split">
+              <div class="miniStat"><span>Open Unrealized PnL</span><strong id="livePortfolioUPnL">-</strong></div>
+              <div class="miniStat"><span>Daily Loss Limit</span><strong id="liveDailyLimit">-</strong></div>
+              <div class="miniStat"><span>Daily Loss Used</span><strong id="liveDailyLossUsed">-</strong></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <details class="paperDrawer">
+        <summary><span>Live Configuration (Redacted)</span></summary>
+        <div class="paperDrawerBody">
+          <pre id="liveConfigDisplay" style="font-size: 11px; color: var(--muted);"></pre>
+        </div>
+      </details>
+      
+      <section class="panel" style="margin-top:12px">
+        <div class="panelHeader">
+          <h3>Active Pairs & Websocket Health</h3>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Pair</th>
+                <th>WS Health</th>
+                <th>REST Fallback</th>
+                <th>Last WS Event</th>
+                <th>Last Strat Candle</th>
+                <th>Skip/Dup Count</th>
+              </tr>
+            </thead>
+            <tbody id="livePairsTableBody">
+              <tr><td colspan="6">No pairs loaded</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" style="margin-top:12px">
+        <div class="panelHeader">
+          <h3>Open Positions & Stop-Loss Safety</h3>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Pair</th>
+                <th>Source</th>
+                <th>Status</th>
+                <th>Dir</th>
+                <th>Qty</th>
+                <th>Entry</th>
+                <th>Lev</th>
+                <th>Stop Loss</th>
+                <th>Take Profit</th>
+                <th>Max R</th>
+                <th>Stop Tracking</th>
+              </tr>
+            </thead>
+            <tbody id="livePositionsTableBody">
+              <tr><td colspan="11">No positions loaded</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" style="margin-top:12px">
+        <div class="panelHeader">
+          <h3>Signals & Decisions Audit</h3>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Pair</th>
+                <th>Action</th>
+                <th>Conf</th>
+                <th>Reason</th>
+                <th>Relation</th>
+                <th>Rejection/Block Details</th>
+              </tr>
+            </thead>
+            <tbody id="liveSignalsTableBody">
+              <tr><td colspan="7">No signals loaded</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      
+      <section class="panel" style="margin-top:12px">
+        <div class="panelHeader">
+          <h3>Alerts & Diagnostics</h3>
+        </div>
+        <div class="tableWrap" style="max-height:200px">
+          <pre id="liveAlertsDisplay" style="font-size: 11px; margin: 0; color: var(--muted);"></pre>
+        </div>
+      </section>
+    </div>
+
     </main>
   </div>
 
-  <script src="/static/dashboard.js?v=2"></script>
+  <script src="/static/dashboard.js?v=5"></script>
 </body>
 </html>
 

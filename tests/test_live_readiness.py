@@ -98,10 +98,15 @@ class LiveReadinessTests(unittest.TestCase):
             build_live_entry_order(_decision(_signal(stop_loss=None)))
 
     def test_profit_lock_accounting_win(self) -> None:
-        loop = LiveTradingLoop(Settings())
+        settings = Settings()
+        from dataclasses import replace
+        settings = replace(settings, risk=replace(settings.risk, compound_profits=False))
+        
+        loop = LiveTradingLoop(settings)
         loop.starting_equity = Decimal("100000")
         loop.local_state["tradable_base"] = "100000"
         loop.local_state["locked_profit"] = "0"
+        loop.local_state["daily_loss_from_tradable_base"] = "0"
         
         # Simulate +15,000 profit
         loop._update_accounting_balances(Decimal("15000"))
@@ -113,6 +118,7 @@ class LiveReadinessTests(unittest.TestCase):
         loop = LiveTradingLoop(Settings())
         loop.local_state["tradable_base"] = "100000"
         loop.local_state["locked_profit"] = "15000"
+        loop.local_state["daily_loss_from_tradable_base"] = "0"
         
         # Simulate -5,000 loss
         loop._update_accounting_balances(Decimal("-5000"))
@@ -125,6 +131,10 @@ class LiveReadinessTests(unittest.TestCase):
         # Phase 5 logic in _apply_profit_protection
         settings = Settings(live_pilot_dry_run=False, live_trading_enabled=True)
         loop = LiveTradingLoop(settings)
+        # Ensure clean state for test
+        loop.kill_switch_active = False
+        loop.local_state["kill_switch_active"] = False
+        
         loop.local_state["positions"][loop.pairs[0]] = {
             "active_pos": "1",
             "avg_price": "100",
@@ -158,11 +168,18 @@ class LiveReadinessTests(unittest.TestCase):
 
     def test_reconcile_blocks_entries_if_stop_loss_missing(self) -> None:
         settings = Settings(live_trading_enabled=True, trading_mode="live")
-        loop = LiveTradingLoop(settings)
+        loop = LiveTradingLoop(settings, starting_equity=Decimal("2000"))
         
         # Mock exchange having a position without SL
         mock_pos = MagicMock(is_open=True, has_stop_loss=False, pair=loop.pairs[0])
-        mock_pos.to_dict.return_value = {"pair": loop.pairs[0], "active_pos": "1"}
+        # To simulate a BOT-OWNED position, it MUST be in local_state already
+        loop.local_state["positions"][loop.pairs[0]] = {
+            "pair": loop.pairs[0],
+            "active_pos": "1",
+            "source": "exchange",
+            "manual_entry": False
+        }
+        mock_pos.to_dict.return_value = loop.local_state["positions"][loop.pairs[0]]
         
         with patch.object(loop.execution_engine.sync, 'fetch_position', return_value=mock_pos):
              loop.reconcile()

@@ -13,6 +13,7 @@ Before setting `LIVE_TRADING_ENABLED=true` and `LIVE_CONFIRM_I_UNDERSTAND_RISK=Y
 - [ ] **Max Order Notional**: `LIVE_MAX_ORDER_NOTIONAL` is set to an absolute maximum value in INR that you are comfortable risking per single order.
 - [ ] **Max Margin Per Order**: `LIVE_MAX_MARGIN_PER_ORDER` is set correctly.
 - [ ] **Max Daily Loss**: `LIVE_MAX_DAILY_LOSS_INR` is set to a strict INR amount. If the bot loses this amount in a single UTC day, the kill switch will activate.
+- [ ] **LIVE_RISK_APPROVAL_ENABLED**: Set to true only AFTER `LIVE_MAX_ORDER_NOTIONAL` and `LIVE_MAX_MARGIN_PER_ORDER` are configured to safe values.
 - [ ] **Position Sizing**: `MAX_RISK_PER_TRADE_PCT` is set conservatively (e.g., `1.0` or `2.0`).
 
 ## Phase 3: Staged Rollout
@@ -25,6 +26,7 @@ Before setting `LIVE_TRADING_ENABLED=true` and `LIVE_CONFIRM_I_UNDERSTAND_RISK=Y
 - [ ] **Kill Switch Knowledge**: I know how to use the CLI (`python -m app.main live-kill-switch --enable`) or the dashboard to immediately halt trading.
 - [ ] **Flatten Command**: I know how to manually close a position and cancel orders using `python -m app.main live-flatten --pair B-BTC_USDT --confirm-flatten YES`.
 - [ ] **Stop-Loss Enforcement**: `LIVE_REQUIRE_STOP_LOSS=true` is enabled to ensure no "naked" positions are opened.
+- [ ] **LIVE_CLOSE_ON_KILL_SWITCH**: Decided and set deliberately. Recommended: true unless you intend to manage open positions manually after a kill switch event.
 - [ ] **Dashboard Monitoring**: The dashboard is running and I can see the "LIVE SAFETY GATES" panel.
 
 ---

@@ -73,6 +73,7 @@ class BacktestConfig:
     bb_trail_force_close_r: Decimal = Decimal("4.0")
     bb_trail_partial_close_at_tp: bool = True
     bb_trail_partial_close_pct: Decimal = Decimal("0.60")
+    bb_trail_observe_only: bool = True
     execution_interval: str | None = None
     paper_intrabar_enabled: bool = False
     strategy_interval: str | None = None

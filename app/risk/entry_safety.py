@@ -139,6 +139,74 @@ def assess_entry_safety(
                 metadata,
             )
 
+    # 4. Short Strictness Filter
+    if settings.short_strictness_enabled and signal.action == SignalAction.ENTER_SHORT:
+        short_safety = _assess_short_strictness(signal, settings)
+        if not short_safety.approved:
+            return short_safety
+
+    return EntrySafetyAssessment(True, metadata=metadata)
+
+
+def _assess_short_strictness(
+    signal: StrategySignal,
+    settings: RiskSettings,
+) -> EntrySafetyAssessment:
+    metadata: dict[str, object] = {}
+    failed_filters = []
+
+    # A. Confidence Bonus
+    required_conf = settings.live_min_confidence + settings.short_confidence_bonus
+    metadata["short_required_confidence"] = required_conf
+    metadata["actual_confidence"] = signal.confidence
+    if signal.confidence < required_conf:
+        failed_filters.append(f"confidence {signal.confidence:.2f} < {required_conf:.2f}")
+
+    # B. Agreement Bonus
+    # Use 0.66 as baseline if not explicitly in metadata
+    base_agreement = _first_decimal(signal.metadata, "base_agreement_threshold") or Decimal("0.66")
+    required_agreement = base_agreement + settings.short_min_agreement_bonus
+    actual_agreement = _first_decimal(signal.metadata, "agreement_ratio", "short_agreement_ratio") or Decimal("0")
+    
+    metadata["short_required_agreement"] = required_agreement
+    metadata["actual_agreement"] = actual_agreement
+    
+    if actual_agreement < required_agreement:
+        failed_filters.append(f"agreement {actual_agreement:.2f} < {required_agreement:.2f}")
+
+    # Indicators for trend/price
+    ema_score = _first_decimal(signal.metadata, "ema_score")
+    
+    # C. Trend Confirmation
+    if settings.short_require_trend_confirmation and ema_score is not None:
+        if ema_score > Decimal("-0.30"): # Require at least mild bearish trend
+            failed_filters.append("bearish trend confirmation missing")
+
+    # D. Price Below EMA
+    if settings.short_require_price_below_ema and ema_score is not None:
+        if ema_score > 0: # ema_score > 0 means price above EMA
+            failed_filters.append("price not below EMA")
+
+    # E. Bearish Structure
+    if settings.short_require_bearish_structure:
+        struct_score = _first_decimal(signal.metadata, "structure_score")
+        if struct_score is not None and struct_score > Decimal("-0.20"):
+            failed_filters.append("bearish structure too weak")
+
+    # F. Volume Confirmation
+    if settings.short_require_volume_confirmation:
+        vol_ratio = _entry_volume_ratio(signal.metadata)
+        if vol_ratio is not None and vol_ratio < Decimal("1.2"): # Require some expansion for shorts
+            failed_filters.append("volume confirmation too weak")
+
+    if failed_filters:
+        metadata["failed_short_filters"] = failed_filters
+        return EntrySafetyAssessment(
+            False,
+            f"Rejected SHORT: {'; '.join(failed_filters)}",
+            metadata
+        )
+
     return EntrySafetyAssessment(True, metadata=metadata)
 
 

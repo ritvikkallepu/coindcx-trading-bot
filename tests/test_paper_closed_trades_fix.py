@@ -142,7 +142,7 @@ class PaperClosedTradesFixTests(unittest.TestCase):
             self.assertGreater(Decimal(trade["position_notional"]), Decimal("0"))
             self.assertEqual(trade["notional_currency"], "INR")
             self.assertEqual(trade["price_quote_currency"], "USDT")
-            self.assertEqual(trade["quote_to_margin_rate"], "98")
+            self.assertEqual(trade["quote_to_margin_rate"], "102")
             self.assertNotEqual(trade["risk_percent_used"], "")
 
     def test_breakeven_stop_close_is_logged_even_with_zero_realized_pnl(self) -> None:
@@ -221,10 +221,10 @@ class PaperClosedTradesFixTests(unittest.TestCase):
         )
 
         self.assertEqual(trade["leverage"], "5")
-        self.assertEqual(Decimal(trade["position_notional"]), Decimal("98000"))
-        self.assertEqual(Decimal(trade["margin_used"]), Decimal("19600"))
-        self.assertEqual(Decimal(trade["required_margin"]), Decimal("19600"))
-        self.assertEqual(Decimal(trade["net_roe_pct"]), Decimal("50.0"))
+        self.assertEqual(Decimal(trade["position_notional"]), Decimal("102000"))
+        self.assertEqual(Decimal(trade["margin_used"]), Decimal("20400"))
+        self.assertEqual(Decimal(trade["required_margin"]), Decimal("20400"))
+        self.assertEqual(Decimal(trade["net_roe_pct"]), Decimal("48.03921568627450980392156863"))
         self.assertEqual(trade["exit_reason"], "dynamic_atr_stop")
 
     def test_paper_state_serialization_handles_enums(self) -> None:

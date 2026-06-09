@@ -128,6 +128,13 @@
       live_dry_run: 'Live Dry Run',
       live_pilot: 'Live Pilot'
     }[String(mode || 'paper')] || 'Paper');
+    const syncSafetyInput = (el, value, staleDefaults = []) => {
+      if (!el || document.activeElement === el || !hasValue(value)) return;
+      const current = String(el.value || '').trim();
+      if (!hasValue(current) || staleDefaults.includes(current)) {
+        el.value = value;
+      }
+    };
     const boolVal = value => {
       if (value === true) return true;
       if (value === false || value === null || value === undefined) return false;
@@ -158,6 +165,18 @@
       '"': '&quot;',
       "'": '&#39;'
     }[char]));
+    const eventTimestamp = row => {
+      for (const value of [row?.time, row?.candle_time]) {
+        const parsed = Date.parse(value);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+      return 0;
+    };
+    const displayTime = row => {
+      const parsed = eventTimestamp(row);
+      if (parsed > 0) return new Date(parsed).toLocaleTimeString();
+      return row?.time || row?.candle_time || '-';
+    };
 
     function setMessage(text, kind = '') {
       ids.message.textContent = text || '';
@@ -178,11 +197,18 @@
       document.getElementById('paperControls').style.display = mode === 'paper' ? '' : 'none';
       document.getElementById('backtestMain').style.display = mode === 'backtest' ? '' : 'none';
       document.getElementById('paperMain').style.display = mode === 'paper' ? '' : 'none';
+      const liveMain = document.getElementById('liveMain');
+      if (liveMain) liveMain.style.display = mode === 'live' ? '' : 'none';
+      
       document.getElementById('tabBacktest').className = 'modeTab' + (mode === 'backtest' ? ' active' : '');
       document.getElementById('tabPaper').className = 'modeTab' + (mode === 'paper' ? ' active' : '');
+      const tabLive = document.getElementById('tabLive');
+      if (tabLive) tabLive.className = 'modeTab' + (mode === 'live' ? ' active' : '');
     }
     document.getElementById('tabBacktest').addEventListener('click', () => switchMode('backtest'));
     document.getElementById('tabPaper').addEventListener('click', () => switchMode('paper'));
+    const tabLiveBtn = document.getElementById('tabLive');
+    if (tabLiveBtn) tabLiveBtn.addEventListener('click', () => switchMode('live'));
 
     function renderStatusBadges(config, botMode) {
       ids.statusRows.innerHTML = '';
@@ -232,6 +258,47 @@
     }
 
     let allPairs = []; // Stores {pair: 'B-BTC_USDT', display_name: 'BTC-USDT'}
+
+    function pairDisplayName(pair) {
+      const normalized = String(pair || '').trim().toUpperCase();
+      return normalized.startsWith('B-')
+        ? normalized.slice(2).replaceAll('_', '-')
+        : normalized.replaceAll('_', '-');
+    }
+
+    function normalizePairRecords(payload) {
+      const rawPairs = payload && payload.pairs;
+      let records = [];
+      if (Array.isArray(rawPairs)) {
+        records = rawPairs;
+      } else if (rawPairs && typeof rawPairs === 'object') {
+        records = Object.entries(rawPairs).map(([key, value]) => {
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            return {...value, pair: value.pair || key};
+          }
+          return {
+            pair: key,
+            display_name: typeof value === 'string' ? value : undefined
+          };
+        });
+      }
+
+      const seen = new Set();
+      return records
+        .map(record => typeof record === 'string' ? {pair: record} : record)
+        .map(record => {
+          const pair = String((record && record.pair) || '').trim().toUpperCase();
+          if (!pair || seen.has(pair)) return null;
+          seen.add(pair);
+          return {
+            ...record,
+            pair,
+            display_name: String(record.display_name || pairDisplayName(pair))
+          };
+        })
+        .filter(Boolean);
+    }
+
     let activePaperSettingsPair = '';
     let paperDefaultSettings = null;
     let paperPairSettings = {};
@@ -282,9 +349,10 @@
       const risk = hasValue(s.risk_pct) ? `${s.risk_pct}% risk` : 'risk -';
       const lev = hasValue(s.leverage) ? `${s.leverage}x` : '-x';
       const strategy = s.strategy || '-';
+      const trail = boolVal(s.trailing_stop_enabled) ? 'Trail on' : 'Trail off';
       const bb = boolVal(s.bb_trail_enabled) ? 'BB on' : 'BB off';
       const atr = boolVal(s.atr_dynamic_exits_enabled) ? 'ATR on' : 'ATR off';
-      return `${risk} / ${lev} / ${strategy} / ${bb} / ${atr}`;
+      return `${risk} / ${lev} / ${strategy} / ${trail} / ${bb} / ${atr}`;
     }
 
     function updatePaperEditingContext() {
@@ -396,6 +464,17 @@
       return overrides;
     }
 
+    function assignCurrentControlsToPaperPair(pair) {
+      const normalized = normalizePair(pair);
+      if (!normalized) return;
+      if (activePaperSettingsPair && activePaperSettingsPair !== normalized) {
+        saveActivePaperPairSettings();
+      }
+      activePaperSettingsPair = normalized;
+      paperPairSettings[normalized] = paperSettingsFromControls();
+      updatePaperEditingContext();
+    }
+
     function paperRuntimePairs() {
       const watchlistPairs = watchlistPairsFromInput();
       if (watchlistPairs.length) return watchlistPairs;
@@ -414,6 +493,10 @@
         use_partial_parent_candle: document.getElementById('p_partial_htf').checked,
         max_entries_per_parent_candle: document.getElementById('p_max_entries').value,
         leverage: document.getElementById('p_leverage').value,
+        live_max_order_notional: ids.l_max_notional ? ids.l_max_notional.value : '',
+        live_max_margin_per_order: ids.l_max_margin ? ids.l_max_margin.value : '',
+        live_require_stop_loss: ids.l_req_sl ? ids.l_req_sl.checked : true,
+        live_kill_switch: ids.l_kill_switch ? ids.l_kill_switch.checked : false,
         pair_overrides: pairOverridesForPairs(pairs),
       };
     }
@@ -566,7 +649,7 @@
     async function loadPairs() {
       try {
         const data = await fetchJson('/api/pairs');
-        allPairs = data.pairs || [];
+        allPairs = normalizePairRecords(data);
         // Setup both dropdowns
         setupSearchableDropdown('pairSearchInput', 'pairDropdownList', 'selectedPairDisplay', 'selectedPairValue');
         setupSearchableDropdown('p_pairSearchInput', 'p_pairDropdownList', 'p_selectedPairDisplay', 'p_selectedPairValue');
@@ -670,6 +753,10 @@
       if (ids.p_leverage) ids.p_leverage.value = defaults.leverage || '5';
       if (ids.p_risk_pct) ids.p_risk_pct.value = initialConfig.risk_per_trade_pct || '1';
       if (ids.p_max_daily_loss_pct) ids.p_max_daily_loss_pct.value = initialConfig.max_daily_loss_pct || '3';
+      if (ids.l_max_notional) ids.l_max_notional.value = risk.live_max_order_notional || '5000';
+      if (ids.l_max_margin) ids.l_max_margin.value = risk.live_max_margin_per_order || '1000';
+      if (ids.l_req_sl) ids.l_req_sl.checked = boolVal(risk.live_require_stop_loss);
+      if (ids.l_kill_switch) ids.l_kill_switch.checked = boolVal(risk.live_kill_switch);
       
       ids.p_trailing_stop.checked = Boolean(initialConfig.trailing_stop_enabled);
       ids.p_atr_exits.checked = Boolean(defaults.atr_dynamic_exits_enabled);
@@ -751,6 +838,9 @@
       }
       if (strategy === 'rsi_macd_momentum') {
         return { mode: 'Momentum', primary: 'RSI 50 reclaim/loss', secondary: 'MACD cross/flip', filter: 'RSI/MACD exits + hard stop' };
+      }
+      if (strategy === 'fib_ma_pullback') {
+        return { mode: 'Trend Pullback', primary: 'EMA 50/200 trend', secondary: '0.382-0.618 fib zone', filter: 'Swing stop + fib/R target' };
       }
       if (strategy === 'ema_rsi_trend') {
         return { mode: 'Trend', primary: 'EMA crossover', secondary: 'RSI filter', filter: 'ATR exits' };
@@ -1458,7 +1548,7 @@
       countChip.textContent = `${rows.length} trades`;
 
       if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="18">No closed trades yet - open positions will appear here when they close</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="21">No closed trades yet - open positions will appear here when they close</td></tr>';
         winChip.textContent = '-';
         winChip.className = 'chip';
         return;
@@ -1472,6 +1562,13 @@
         if (isWin) wins++;
 
         const side = escapeHtml(t.direction || t.side || '');
+        const strategy = escapeHtml(t.strategy || t.paper_pair_strategy || '-');
+        const leverageRaw = t.leverage || t.paper_pair_leverage;
+        const leverage = hasValue(leverageRaw) ? `${num(leverageRaw).toFixed(2).replace(/\.?0+$/, '')}x` : '-';
+        const trailKnown = hasValue(t.trailing_stop_enabled) || hasValue(t.trailing_stop_active);
+        const trail = trailKnown
+          ? (boolVal(t.trailing_stop_active) ? 'active' : (boolVal(t.trailing_stop_enabled) ? 'on' : 'off'))
+          : '-';
         const qtyUnit = t.quantity_unit || 'contracts';
         const qty = `${compact(t.position_size || t.quantity || 0)} ${escapeHtml(qtyUnit)}`;
         const totalFees = num(t.total_fees || t.fees || t.fee || 0);
@@ -1500,7 +1597,9 @@
           <td>${rows.length - i}</td>
           <td>${time}</td>
           <td>${escapeHtml(t.pair || '')}</td>
+          <td>${strategy}</td>
           <td style="color:${side.toLowerCase()==='long'?'var(--green)':'var(--red)'}">${side}</td>
+          <td>${leverage}</td>
           <td>${compact(t.entry_price)}</td>
           <td>${compact(t.exit_price)}</td>
           <td>${qty}</td>
@@ -1514,6 +1613,7 @@
           <td style="color:${isWin?'var(--green)':'var(--red)'}">${netRoePct}</td>
           <td style="color:${isWin?'var(--green)':'var(--red)'}">${accountImpactPct}</td>
           <td>${hold}</td>
+          <td>${trail}</td>
           <td>${reason}</td>
         </tr>`;
       }).join('');
@@ -1660,19 +1760,68 @@
 
     async function refreshPaperStatus() {
       try {
-        const [data, tradesData] = await Promise.all([
+        const [data, tradesData, statusData] = await Promise.all([
           fetchJson('/api/paper-status'),
-          fetchJson('/api/paper-trades').catch(() => ({ trades: [] }))
+          fetchJson('/api/paper-trades').catch(() => ({ trades: [] })),
+          fetchJson('/api/status').catch(() => ({}))
         ]);
 
         const running = data.running;
         paperIsRunning = Boolean(running);
+        const riskConfig = statusData.risk || {};
         const executionMode = data.execution_mode || 'paper';
         const executionLabel = paperExecutionModeLabel(executionMode);
         const trades = tradesData.trades || [];
         const tradeSummary = tradesData.summary || paperTradeSummaryFromRows(trades);
         const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
         const col = (id, good) => { const el = document.getElementById(id); if (el) el.style.color = good ? 'var(--green)' : 'var(--red)'; };
+        const updatePaperRunShell = () => {
+          const displayPair = Array.isArray(data.watchlist) && data.watchlist.length
+            ? data.watchlist.join(', ')
+            : (data.pair || '-');
+          let lastUpdatedStr = 'pending';
+          if (data.last_updated) {
+            const d = new Date(data.last_updated);
+            if (!isNaN(d.getTime())) lastUpdatedStr = d.toLocaleTimeString();
+          }
+
+          set('pmChipStatus', running ? executionLabel : 'Stopped');
+          const pmChip = document.getElementById('pmChipStatus');
+          if (pmChip) pmChip.className = 'chip ' + (running ? (executionMode === 'live_pilot' ? 'warn' : 'good') : '');
+
+          const loopMeta = document.getElementById('paperLoopMeta');
+          if (loopMeta) {
+            loopMeta.innerHTML = running
+              ? `<strong>Running:</strong> ${escapeHtml(displayPair)} | INR-M | ${escapeHtml(data.interval || '-')} | ${escapeHtml(data.strategy || '-')} | ${escapeHtml(executionLabel)} | <span class="subtle">updated ${escapeHtml(lastUpdatedStr)}</span>`
+              : 'Standby | Ready to start INR-M session';
+          }
+
+          const topChips = document.getElementById('paperTopChips');
+          if (topChips) {
+            const liveOrderChip = executionMode === 'live_pilot'
+              ? '<span class="chip warn">Live Orders Armed</span>'
+              : '<span class="chip bad">Live Orders Locked</span>';
+            topChips.innerHTML = running
+              ? `<span class="chip warn">${escapeHtml(executionLabel)}</span><span class="chip good">INR-M Futures</span><span class="chip good">Live</span>${liveOrderChip}`
+              : '<span class="chip warn">Paper</span><span class="chip good">INR-M Futures</span><span class="chip bad">Live Locked</span>';
+          }
+
+          const runningLabelWrap = document.getElementById('runningPairLabelWrap');
+          const runningLabel = document.getElementById('runningPairLabel');
+          if (runningLabelWrap) runningLabelWrap.style.display = running ? 'block' : 'none';
+          if (runningLabel) runningLabel.textContent = displayPair;
+
+          const startBtn = document.getElementById('startPaperBtn');
+          const stopBtn = document.getElementById('stopPaperBtn');
+          if (startBtn) startBtn.disabled = running;
+          if (stopBtn) stopBtn.disabled = !running;
+          set('paperRunChip', running ? executionLabel : 'Stopped');
+          const runChip = document.getElementById('paperRunChip');
+          if (runChip) runChip.className = 'chip ' + (running ? (executionMode === 'live_pilot' ? 'warn' : 'good') : '');
+          if (running) set('paperRunMeta', `${displayPair} ${data.interval || '-'}`);
+        };
+
+        updatePaperRunShell();
 
         document.getElementById('pmChipStatus').textContent = running ? executionLabel : 'Stopped';
         document.getElementById('pmChipStatus').className = 'chip ' + (running ? (executionMode === 'live_pilot' ? 'warn' : 'good') : '');
@@ -1803,10 +1952,18 @@
           const ddEl = document.getElementById('pmMaxDD');
           if (ddEl) ddEl.style.color = maxDD < 3 ? 'var(--green)' : maxDD < 8 ? 'var(--amber, #f59e0b)' : 'var(--red)';
           set('pmPeakLabel', 'Peak: ' + money(peak));
-          renderPaperEquityChart(window.pmEquityHistory);
+          try {
+            renderPaperEquityChart(window.pmEquityHistory);
+          } catch (chartError) {
+            console.warn('Paper equity chart render failed', chartError);
+          }
         }
         window.pmLastCandlePayload = data.candles_json;
-        renderPaperCandleChart(data.candles_json);
+        try {
+          renderPaperCandleChart(data.candles_json);
+        } catch (chartError) {
+          console.warn('Paper candle chart render failed', chartError);
+        }
 
         set('pmCandles', data.candle_count);
         set('pmCandlesSub', running ? `Interval: ${data.interval}` : 'Standby');
@@ -1879,17 +2036,33 @@
         if (ids.l_trading_mode && document.activeElement !== ids.l_trading_mode) {
              ids.l_trading_mode.value = executionMode;
         }
-        if (ids.l_max_notional && document.activeElement !== ids.l_max_notional) {
-             ids.l_max_notional.value = data.live_max_order_notional || "1000";
-        }
-        if (ids.l_max_margin && document.activeElement !== ids.l_max_margin) {
-             ids.l_max_margin.value = data.live_max_margin_per_order || "500";
-        }
+        const maxNotional = firstValue(
+          riskConfig.live_max_order_notional,
+          data.live_max_order_notional,
+          ids.l_max_notional && ids.l_max_notional.value,
+          "5000"
+        );
+        const maxMargin = firstValue(
+          riskConfig.live_max_margin_per_order,
+          data.live_max_margin_per_order,
+          ids.l_max_margin && ids.l_max_margin.value,
+          "1000"
+        );
+        syncSafetyInput(ids.l_max_notional, maxNotional, ["1000"]);
+        syncSafetyInput(ids.l_max_margin, maxMargin, ["500"]);
         if (ids.l_req_sl) {
-             ids.l_req_sl.checked = boolVal(data.live_require_stop_loss);
+             ids.l_req_sl.checked = boolVal(
+               running
+                 ? firstValue(data.live_require_stop_loss, riskConfig.live_require_stop_loss)
+                 : firstValue(riskConfig.live_require_stop_loss, data.live_require_stop_loss)
+             );
         }
         if (ids.l_kill_switch) {
-             ids.l_kill_switch.checked = boolVal(data.live_kill_switch);
+             ids.l_kill_switch.checked = boolVal(
+               running
+                 ? firstValue(data.live_kill_switch, riskConfig.live_kill_switch)
+                 : firstValue(riskConfig.live_kill_switch, data.live_kill_switch)
+             );
         }
         if (ids.liveWarning) {
              ids.liveWarning.style.display = boolVal(data.live_trading_allowed) ? 'none' : 'block';
@@ -1952,6 +2125,7 @@
               const settings = paperPairSettings[normalizePair(pair)] || {};
               const riskLabel = hasValue(settings.risk_pct) ? `${settings.risk_pct}% risk` : 'risk -';
               const levLabel = hasValue(settings.leverage) ? `${settings.leverage}x` : '-x';
+              const trailLabel = boolVal(settings.trailing_stop_enabled) ? 'Trail on' : 'Trail off';
               const bbLabel = boolVal(settings.bb_trail_enabled) ? 'BB on' : 'BB off';
               const atrLabel = boolVal(settings.atr_dynamic_exits_enabled) ? 'ATR on' : 'ATR off';
               return `<div class="watchPairCard ${chartActive ? 'active' : ''} ${editing ? 'editing' : ''}" onclick='selectRunningPaperPair(${JSON.stringify(pair)})'>
@@ -1963,6 +2137,7 @@
                 <div class="watchPairSettings">
                   <span>${escapeHtml(riskLabel)}</span>
                   <span>${escapeHtml(levLabel)}</span>
+                  <span>${escapeHtml(trailLabel)}</span>
                   <span>${escapeHtml(bbLabel)}</span>
                   <span>${escapeHtml(atrLabel)}</span>
                 </div>
@@ -2001,7 +2176,7 @@
           if (!diags.length) {
             pmDiagRows.innerHTML = '<tr><td colspan="15">No diagnostic data yet</td></tr>';
           } else {
-            pmDiagRows.innerHTML = diags.slice().reverse().map(d => {
+            pmDiagRows.innerHTML = diags.slice().sort((a, b) => eventTimestamp(b) - eventTimestamp(a)).map(d => {
               const decCls = d.decision === 'entered' ? 'good' : d.decision === 'rejected' ? 'bad' : 'muted';
               const gate = String(d.bb_gate || '-');
               const gateCls = gate === 'pass' ? 'good' : gate === 'blocked' ? 'bad' : '';
@@ -2110,6 +2285,10 @@
         execution_interval: document.getElementById('p_exec_interval').value,
         use_partial_parent_candle: document.getElementById('p_partial_htf').checked,
         max_entries_per_parent_candle: document.getElementById('p_max_entries').value,
+        live_max_order_notional: ids.l_max_notional ? ids.l_max_notional.value : '',
+        live_max_margin_per_order: ids.l_max_margin ? ids.l_max_margin.value : '',
+        live_require_stop_loss: ids.l_req_sl ? ids.l_req_sl.checked : true,
+        live_kill_switch: ids.l_kill_switch ? ids.l_kill_switch.checked : false,
         pair_overrides: pairOverridesForPairs(normalizedPairs),
       };
       document.getElementById('startPaperBtn').disabled = true;
@@ -2215,6 +2394,7 @@
     async function addCurrentToWatchlist() {
       const pair = getSelectedPair('p_');
       const normalized = normalizePair(pair);
+      assignCurrentControlsToPaperPair(normalized);
       try {
         const payload = await fetchJson('/api/paper-add-pair', {
           method: 'POST',
@@ -2263,6 +2443,12 @@
       syncPaperSelectionToWatchlist({force: paperIsRunning});
       schedulePaperSettingsAutoApply();
     });
+    ['l_max_notional', 'l_max_margin', 'l_req_sl', 'l_kill_switch'].forEach(id => {
+      const el = ids[id];
+      if (!el) return;
+      el.addEventListener(el.type === 'checkbox' ? 'change' : 'input', schedulePaperSettingsAutoApply);
+      el.addEventListener('change', schedulePaperSettingsAutoApply);
+    });
     document.getElementById('startPaperBtn').textContent = 'Start';
     document.getElementById('stopPaperBtn').textContent = 'Stop';
     
@@ -2305,8 +2491,208 @@
     document.getElementById('stopPaperBtn').addEventListener('click', stopPaper);
     document.getElementById('resetPaperBtn').addEventListener('click', resetPaper);
 
-    setInterval(refreshPaperStatus, 4000);
+    async function refreshLiveStatus() {
+      if (document.getElementById('liveMain').style.display === 'none') return;
+      try {
+        const [status, state] = await Promise.all([
+             fetchJson('/api/status'),
+             fetchJson('/api/live-state')
+        ]);
+        
+        const modeBadge = document.getElementById('liveModeBadge');
+        const loopMeta = document.getElementById('liveLoopMeta');
+        const safetyBanner = document.getElementById('liveSafetyBanner');
+        
+        const botMode = (state.execution_mode || (status.bot ? status.bot.mode : 'paper')).toLowerCase();
+        const liveEnabled = botMode === 'live' || (status.bot ? status.bot.live_trading_enabled : false);
+        const dryRun = state.live_dry_run !== undefined
+          ? boolVal(state.live_dry_run)
+          : (status.bot ? status.bot.live_pilot_dry_run : true);
+        
+        let modeLabel = "Checking...";
+        let modeCls = "warn";
+        if (botMode === "live") {
+             if (liveEnabled && !dryRun) {
+                  modeLabel = "REAL LIVE MONEY";
+                  modeCls = "bad";
+                  safetyBanner.style.display = "block";
+                  safetyBanner.className = "message error";
+                  safetyBanner.innerHTML = "<strong>CRITICAL WARNING:</strong> REAL LIVE TRADING IS ACTIVE. REAL MONEY IS AT RISK.";
+             } else if (liveEnabled && dryRun) {
+                  modeLabel = "LIVE DRY-RUN";
+                  modeCls = "warn";
+                  safetyBanner.style.display = "block";
+                  safetyBanner.className = "message warn";
+                  safetyBanner.innerHTML = "<strong>DRY-RUN MODE:</strong> Trading with simulated fills via live websocket data.";
+             } else {
+                  modeLabel = "LIVE BLOCKED";
+                  modeCls = "warn";
+                  safetyBanner.style.display = "block";
+                  safetyBanner.className = "message warn";
+                  safetyBanner.innerHTML = "<strong>LIVE BLOCKED:</strong> Check your .env flags.";
+             }
+        } else {
+             modeLabel = "PAPER";
+             modeCls = "good";
+             safetyBanner.style.display = "none";
+        }
+        
+        modeBadge.className = "chip " + modeCls;
+        modeBadge.textContent = modeLabel;
+        
+        const loopStatus = boolVal(state.running) ? 'Running' : 'Stopped';
+        const pairs = Array.isArray(state.watchlist) && state.watchlist.length
+          ? state.watchlist.join(', ')
+          : (state.pair || '-');
+        const intervalLabel = `${state.interval || '-'} / ${state.execution_interval || '-'}`;
+        const updated = state.last_updated ? new Date(state.last_updated).toLocaleTimeString() : '-';
+        loopMeta.textContent = `${loopStatus} | ${pairs} | ${intervalLabel} | ${state.strategy || '-'} | updated ${updated}`;
+        
+        const ksStatusChip = document.getElementById('ksStatusChip');
+        const ksActive = boolVal(state.kill_switch_active);
+        ksStatusChip.textContent = ksActive ? 'ACTIVE' : 'Inactive';
+        ksStatusChip.className = ksActive ? 'chip bad' : 'chip good';
+        
+        document.getElementById('livePortfolioEq').textContent = money(state.portfolio_equity || 0);
+        document.getElementById('liveWalletBalance').textContent = money(state.wallet_balance || 0);
+        document.getElementById('liveAllocatedCapital').textContent = money(state.allocated_capital || state.initial_equity || 0);
+        document.getElementById('liveTradableBase').textContent = money(state.tradable_base || 0);
+        document.getElementById('liveFreeCollateral').textContent = money(state.wallet_free_collateral || 0);
+        document.getElementById('liveUsableCapital').textContent = money(state.usable_capital || 0);
+        document.getElementById('liveMaxNotional').textContent = money(state.max_leveraged_notional || 0);
+        document.getElementById('liveLockedProfit').textContent = money(state.locked_profit || 0);
+        document.getElementById('livePortfolioUPnL').textContent = money(state.portfolio_unrealized_pnl || 0);
+
+        document.getElementById('liveDailyLimit').textContent = money(status.risk ? status.risk.live_max_daily_loss_inr : 0);
+        document.getElementById('liveDailyLossUsed').textContent = money(state.daily_loss_from_tradable_base || 0);
+        
+        document.getElementById('liveConfigDisplay').textContent = JSON.stringify({
+             allowed_pairs: status.bot ? status.bot.live_allowed_pairs : null,
+             margin_currency: status.bot ? status.bot.futures_margin_currency : null,
+             live_trading_enabled: liveEnabled,
+             live_pilot_dry_run: dryRun,
+             strategy_interval: state.interval || null,
+             execution_interval: state.execution_interval || null,
+             allocated_capital: state.allocated_capital || null,
+             usable_capital: state.usable_capital || null,
+             kill_switch_active: ksActive
+        }, null, 2);
+        
+        const posBody = document.getElementById('livePositionsTableBody');
+        const portfolioPositions = state.portfolio_positions || {};
+        const localPositions = state.positions || {};
+        const posDict = Object.keys(portfolioPositions).length ? portfolioPositions : localPositions;
+        const posKeys = Object.keys(posDict).filter(k => {
+             const p = posDict[k] || {};
+             const qty = Number(p.active_pos || p.quantity || 0);
+             const status = String(p.status || p.state || 'open').toLowerCase();
+             return Math.abs(qty) > 0 && !['closed', 'close', 'exited', 'settled'].includes(status);
+        }).sort();
+        if (posKeys.length > 0) {
+             posBody.innerHTML = posKeys.map(k => {
+                  const p = posDict[k];
+                  const dir = (p.direction || '').toUpperCase();
+                  if (!dir) return `<tr><td colspan="11" style="color:var(--amber)">POSITION DIRECTION MISSING for ${escapeHtml(k)}</td></tr>`;
+                  return `<tr>
+                       <td>${escapeHtml(k)}</td>
+                       <td>${escapeHtml(p.source || 'unknown')}</td>
+                       <td>${escapeHtml(p.status || 'open')}</td>
+                       <td style="color:${dir==='LONG'?'var(--green)':'var(--red)'}">${escapeHtml(dir)}</td>
+                       <td>${compact(p.active_pos || p.quantity)}</td>
+                       <td>${compact(p.avg_price || p.entry_price)}</td>
+                       <td>${compact(p.leverage)}</td>
+                       <td>${compact(p.stop_loss_trigger || p.stop_loss || '-')}</td>
+                       <td>${compact(p.take_profit_trigger || p.take_profit || '-')}</td>
+                       <td>-</td>
+                       <td>-</td>
+                  </tr>`;
+             }).join('');
+        } else {
+             posBody.innerHTML = '<tr><td colspan="11">No positions loaded</td></tr>';
+        }
+        
+        const signalsBody = document.getElementById('liveSignalsTableBody');
+        const signals = (state.recent_diagnostics || []).filter(s => {
+              // Only show live or live_dry_run in the Live Monitor
+              // Default to live if mode is missing for backward compatibility
+              const mode = (s.trading_mode || 'live').toLowerCase();
+              return mode === 'live' || mode === 'live_dry_run';
+        }).sort((a, b) => eventTimestamp(b) - eventTimestamp(a));
+         
+        if (signals.length > 0) {
+             signalsBody.innerHTML = signals.map(s => {
+                  const userReason = s.user_reason || '-';
+                  const truncated = userReason.length > 120 ? userReason.substring(0, 117) + '...' : userReason;
+                  const modeLabel = s.trading_mode === 'live_dry_run' ? '[DRY] ' : '';
+                  
+                  return `<tr>
+                       <td>${escapeHtml(displayTime(s))}</td>
+                       <td>${escapeHtml(s.pair || '-')}</td>
+                       <td><span class="badge ${s.action === 'APPROVED' ? 'badge-success' : 'badge-neutral'}">${escapeHtml(s.action || '-')}</span></td>
+                       <td>${compact(s.confidence)}</td>
+                       <td>${escapeHtml(s.reason || '-')}</td>
+                       <td style="font-size: 11px;">${escapeHtml(s.relation || '-')}</td>
+                       <td style="font-size: 11px;" title="${escapeHtml(userReason)}">
+                           <strong>${modeLabel}</strong>${escapeHtml(truncated)}
+                           ${s.metadata ? `<br><a href="#" onclick="console.log('Metadata for ${s.pair}:', ${JSON.stringify(s.metadata)}); alert('Metadata logged to console. View with F12.'); return false;" style="font-size: 9px; color: var(--accent); text-decoration: underline;">View Raw Metadata (F12)</a>` : ''}
+                       </td>
+                  </tr>`;
+             }).join('');
+        } else {
+             signalsBody.innerHTML = '<tr><td colspan="7">No live signals loaded</td></tr>';
+        }
+        
+        const pairsBody = document.getElementById('livePairsTableBody');
+        const scanned = state.scanned_pairs || {};
+        const scannedKeys = Object.keys(scanned);
+        if (scannedKeys.length > 0) {
+             pairsBody.innerHTML = scannedKeys.map(k => {
+                  const s = scanned[k];
+                  const wsCls = s.ws_health === 'connected' ? 'color:var(--green)' : 'color:var(--red)';
+                  return `<tr>
+                       <td>${escapeHtml(k)}</td>
+                       <td style="${wsCls}"><strong>${escapeHtml(s.ws_health || '-')}</strong></td>
+                       <td>-</td>
+                       <td>${new Date(s.last_ws_event).toLocaleTimeString()}</td>
+                       <td>${new Date(s.last_strat_candle).toLocaleTimeString()}</td>
+                       <td>${s.skip_count || 0}</td>
+                  </tr>`;
+             }).join('');
+        } else {
+             pairsBody.innerHTML = '<tr><td colspan="6">No pairs loaded</td></tr>';
+        }
+        
+      } catch(e) {
+        console.error("Live status error", e);
+      }
+    }
+    setInterval(refreshPaperStatus, 3000);
     refreshPaperStatus();
+    setInterval(refreshLiveStatus, 3000);
+    refreshLiveStatus();
+    
+    window.enableLiveKillSwitch = async function() {
+        if (!confirm("Activate Kill Switch? This will block new entries and may close positions!")) return;
+        try {
+            const payload = await fetchJson('/api/kill-switch/enable', {method: 'POST'});
+            alert(payload.message || "Enabled");
+            refreshLiveStatus();
+        } catch(e) { alert(e.message); }
+    };
+    
+    window.disableLiveKillSwitch = async function() {
+        const text = prompt("Type 'DISABLE' to confirm disabling the kill switch.");
+        if (text !== 'DISABLE') { alert("Confirmation failed."); return; }
+        try {
+            const payload = await fetchJson('/api/kill-switch/disable', {
+                method: 'POST', 
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({confirm: "DISABLE"})
+            });
+            alert(payload.message || "Disabled");
+            refreshLiveStatus();
+        } catch(e) { alert(e.message); }
+    };
 
     ids.runButton.addEventListener('click', runBacktest);
     ids.strategy.addEventListener('change', refreshStrategyPreview);

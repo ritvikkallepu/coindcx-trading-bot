@@ -82,11 +82,19 @@ class OHLCVCandle:
         row: dict[str, Any],
     ) -> OHLCVCandle:
         open_time_ms = _timestamp_to_ms(row["time"])
+        interval_ms = interval_to_ms(interval)
+        close_time_ms = open_time_ms + interval_ms - 1
+        
+        # A candle is only closed if its end time has passed
+        import time
+        now_ms = int(time.time() * 1000)
+        is_closed = now_ms >= close_time_ms
+        
         return cls(
             pair=pair,
             interval=interval,
             open_time_ms=open_time_ms,
-            close_time_ms=open_time_ms + interval_to_ms(interval) - 1,
+            close_time_ms=close_time_ms,
             open=_decimal(row["open"]),
             high=_decimal(row["high"]),
             low=_decimal(row["low"]),
@@ -94,6 +102,7 @@ class OHLCVCandle:
             volume=_decimal(row["volume"]),
             quote_volume=_decimal(row.get("quote_volume", "0")),
             trade_count=int(row.get("trade_count", 0) or 0),
+            is_closed=is_closed,
         )
 
     def to_candle_event(self) -> CandleEvent:
@@ -278,6 +287,34 @@ class CandleSeries:
 
     def volumes(self) -> list[Decimal]:
         return [candle.volume for candle in self._candles]
+
+    def apply_trade(self, trade: TradeEvent) -> None:
+        """
+        Updates the latest candle in the series with a new trade tick.
+        Used for intrabar softening and indicator updates between closed candles.
+        """
+        if not self._candles:
+            return
+            
+        latest = self._candles[-1]
+        interval_ms = interval_to_ms(latest.interval)
+        trade_bucket = (trade.timestamp_ms // interval_ms) * interval_ms
+        
+        # Only update if the trade belongs to the current latest candle's time bucket
+        if trade_bucket == latest.open_time_ms:
+            # OHLCVCandle is frozen, so we must create a new instance
+            from dataclasses import replace
+            new_candle = replace(
+                latest,
+                high=max(latest.high, trade.price),
+                low=min(latest.low, trade.price),
+                close=trade.price,
+                volume=latest.volume + trade.quantity,
+                quote_volume=latest.quote_volume + (trade.price * trade.quantity),
+                trade_count=latest.trade_count + 1,
+                is_closed=False # It's now definitely a partial/dirty candle
+            )
+            self._candles[-1] = new_candle
 
 
 def rest_rows_to_series(

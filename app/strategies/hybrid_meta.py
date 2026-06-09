@@ -93,6 +93,10 @@ class HybridMetaStrategy(Strategy):
     pullback_resume_body_ratio_min: Decimal = Decimal("0.45")
     pullback_risk_multiplier: Decimal = Decimal("0.50")
     
+    bb_trail_partial_close_at_tp: bool = True
+    bb_trail_partial_close_pct: Decimal = Decimal("0.60")
+    bb_trail_observe_only: bool = True
+    
     # Exit Compat
     time_stop_extend_if_momentum_strong: bool = True
 
@@ -437,6 +441,18 @@ class HybridMetaStrategy(Strategy):
         candle_range = latest_exec.high - latest_exec.low
         if candle_range <= 0: return None
         body_ratio = abs(latest_exec.close - latest_exec.open) / candle_range
+        is_directional_body = (
+            latest_exec.close > latest_exec.open
+            if direction == SignalDirection.LONG
+            else latest_exec.close < latest_exec.open
+        )
+        if not is_directional_body: return None
+
+        close_position_ratio = (
+            (latest_exec.close - latest_exec.low) / candle_range
+            if direction == SignalDirection.LONG
+            else (latest_exec.high - latest_exec.close) / candle_range
+        )
         
         # Must be a breakout
         is_breakout = (latest_exec.close > parent_high) if direction == SignalDirection.LONG else (latest_exec.close < parent_low)
@@ -445,11 +461,32 @@ class HybridMetaStrategy(Strategy):
         # Volume must be extreme
         avg_vol = _average_volume(execution_candles[:-1]) if len(execution_candles) > 1 else Decimal("1")
         vol_ratio = latest_exec.volume / avg_vol if avg_vol > 0 else Decimal("1")
-        
-        if vol_ratio < Decimal("4.0") or body_ratio < Decimal("0.8"): return None
+
+        min_volume_ratio = _decimal_from_metadata(
+            config.get("reversal_breakout_ignition_volume_ratio"),
+            Decimal("4.0"),
+        )
+        min_body_ratio = _decimal_from_metadata(
+            config.get("reversal_breakout_ignition_body_ratio"),
+            Decimal("0.8"),
+        )
+        min_close_position_ratio = _decimal_from_metadata(
+            config.get("reversal_breakout_ignition_close_position_ratio"),
+            Decimal("0.75"),
+        )
+        if (
+            vol_ratio < min_volume_ratio
+            or body_ratio < min_body_ratio
+            or close_position_ratio < min_close_position_ratio
+        ):
+            return None
         
         extension_atr = abs(latest_exec.close - fast_ema) / atr if atr > 0 else Decimal("0")
-        if extension_atr > Decimal("6.0"): return None # Too late even for ignition
+        max_extension_atr = _decimal_from_metadata(
+            config.get("reversal_breakout_ignition_max_extension_atr"),
+            Decimal("6.0"),
+        )
+        if extension_atr > max_extension_atr: return None # Too late even for ignition
         
         return {
             "entry_type": "intrabar_reversal_breakout",
@@ -460,7 +497,12 @@ class HybridMetaStrategy(Strategy):
             "candle": latest_exec,
             "extension_atr": extension_atr,
             "volume_ratio": vol_ratio,
-            "risk_multiplier": Decimal("0.25"),
+            "body_ratio": body_ratio,
+            "close_position_ratio": close_position_ratio,
+            "risk_multiplier": _decimal_from_metadata(
+                config.get("reversal_breakout_ignition_risk_multiplier"),
+                Decimal("0.25"),
+            ),
         }
 
     def _detect_pullback_continuation(self, *, context: StrategyContext, direction: SignalDirection, parent_high: Decimal, parent_low: Decimal, atr: Decimal, fast_ema: Decimal, config: dict[str, Any]) -> dict[str, Any] | None:
@@ -654,6 +696,7 @@ class HybridMetaStrategy(Strategy):
             "bb_trail_force_close_r",
             "bb_trail_partial_close_at_tp",
             "bb_trail_partial_close_pct",
+            "bb_trail_observe_only",
         ):
             if key in config:
                 policy_metadata[key] = config[key]

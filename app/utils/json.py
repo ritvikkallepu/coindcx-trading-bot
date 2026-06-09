@@ -33,6 +33,10 @@ def to_jsonable(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {str(k): to_jsonable(v) for k, v in obj.items()}
     
+    # Avoid recursion on Mock objects in tests
+    if "unittest.mock" in str(type(obj)):
+        return str(obj)
+
     # Fallback for objects that might have a to_dict method (like our models)
     if hasattr(obj, "to_dict") and callable(obj.to_dict):
         return to_jsonable(obj.to_dict())

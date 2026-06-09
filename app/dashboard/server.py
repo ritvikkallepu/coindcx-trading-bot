@@ -4,6 +4,7 @@ import json
 import logging
 import mimetypes
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,7 +25,6 @@ from app.dashboard.state import (
     build_backtest_dashboard_payload,
     build_status_payload,
 )
-from app.dashboard.web import DASHBOARD_HTML
 from app.data.candle_builder import interval_to_ms
 from app.data.open_interest import (
     OpenInterestFeatureSeries,
@@ -42,6 +42,17 @@ from app.utils.logging import configure_logging
 
 
 OPEN_INTEREST_STRATEGIES = {"hybrid_meta", "hybrid_meta_v2", "adaptive_hybrid"}
+
+
+def _dashboard_html() -> str:
+    """Load the maintained dashboard page instead of the legacy embedded copy."""
+
+    return (
+        files("app.dashboard")
+        .joinpath("static")
+        .joinpath("index.html")
+        .read_text(encoding="utf-8")
+    )
 
 
 def _normalize_dashboard_pair(value: object) -> str:
@@ -89,6 +100,259 @@ def _dashboard_pair_list(value: object) -> list[str]:
         seen.add(pair)
         pairs.append(pair)
     return pairs
+
+
+def _read_json_dict(path: Any) -> dict[str, Any]:
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _live_state_paths() -> tuple[list[Any], Any]:
+    from pathlib import Path
+
+    state_dir = Path("data/live_state")
+    legacy_path = Path("data/live_state.json")
+    run_paths: list[Any] = []
+    try:
+        if state_dir.exists():
+            run_paths = sorted(
+                [path for path in state_dir.glob("*.json") if path.is_file()],
+                key=lambda path: str(path),
+            )
+    except Exception:
+        run_paths = []
+    return run_paths, legacy_path
+
+
+def _state_pair_list(state: dict[str, Any]) -> list[str]:
+    watchlist = state.get("watchlist")
+    if isinstance(watchlist, list):
+        raw_values = watchlist
+    elif isinstance(watchlist, str):
+        raw_values = watchlist.split(",")
+    else:
+        raw_values = [state.get("pair")]
+
+    pairs: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        pair = str(raw or "").strip()
+        if not pair or pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    return pairs
+
+
+def _mixed_or_single(values: list[Any], default: str = "") -> str:
+    clean = [str(value) for value in values if value not in (None, "")]
+    unique = list(dict.fromkeys(clean))
+    if not unique:
+        return default
+    if len(unique) == 1:
+        return unique[0]
+    return "mixed"
+
+
+def _state_updated_key(state: dict[str, Any]) -> str:
+    return str(state.get("last_updated") or state.get("updated_at") or "")
+
+
+_LIVE_STATE_FRESH_WINDOW = timedelta(minutes=15)
+_LIVE_DIAGNOSTIC_MAX_ROWS = 5000
+
+
+def _state_updated_dt(state: dict[str, Any]) -> datetime | None:
+    raw_value = _state_updated_key(state).strip()
+    return _parse_iso_datetime(raw_value)
+
+
+def _parse_iso_datetime(raw_value: Any) -> datetime | None:
+    raw_text = str(raw_value or "").strip()
+    if not raw_text:
+        return None
+    if raw_text.endswith("Z"):
+        raw_text = f"{raw_text[:-1]}+00:00"
+    try:
+        updated = datetime.fromisoformat(raw_text)
+    except ValueError:
+        return None
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    return updated.astimezone(timezone.utc)
+
+
+def _diagnostic_time(row: Any) -> datetime | None:
+    if not isinstance(row, dict):
+        return None
+    for raw_value in (row.get("time"), row.get("candle_time")):
+        parsed = _parse_iso_datetime(raw_value)
+        if parsed is not None:
+            return parsed
+    raw_timestamp = row.get("timestamp_ms")
+    if raw_timestamp is not None:
+        try:
+            return datetime.fromtimestamp(int(raw_timestamp) / 1000, tz=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def _fresh_recent_diagnostics(state: dict[str, Any]) -> list[Any]:
+    diagnostics = state.get("recent_diagnostics")
+    if not isinstance(diagnostics, list):
+        return []
+
+    session_started = _parse_iso_datetime(state.get("session_started_at"))
+    if session_started is None:
+        return diagnostics
+
+    fresh: list[Any] = []
+    for row in diagnostics:
+        row_time = _diagnostic_time(row)
+        if row_time is not None and row_time >= session_started:
+            fresh.append(row)
+    return fresh
+
+
+def _diagnostic_sort_key(row: Any) -> tuple[int, float]:
+    row_time = _diagnostic_time(row)
+    if row_time is None:
+        return (0, 0.0)
+    return (1, row_time.timestamp())
+
+
+def _is_open_position_row(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    try:
+        active_pos = Decimal(str(row.get("active_pos") or row.get("quantity") or "0"))
+    except Exception:
+        active_pos = Decimal("0")
+    status = str(row.get("status") or row.get("state") or "open").lower()
+    if status in {"closed", "close", "exited", "settled"}:
+        return False
+    return active_pos.copy_abs() > 0
+
+
+def _open_position_rows(rows: Any) -> dict[str, Any]:
+    if not isinstance(rows, dict):
+        return {}
+    return {
+        str(pair): row
+        for pair, row in rows.items()
+        if _is_open_position_row(row)
+    }
+
+
+def _state_sort_key(state: dict[str, Any]) -> tuple[int, float | str]:
+    updated = _state_updated_dt(state)
+    if updated is not None:
+        return (1, updated.timestamp())
+    return (0, _state_updated_key(state))
+
+
+def _fresh_running_states(running_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(running_states) <= 1:
+        return running_states
+
+    newest_updated = next(
+        (_state_updated_dt(state) for state in running_states if _state_updated_dt(state) is not None),
+        None,
+    )
+    if newest_updated is None:
+        return running_states[:1]
+
+    fresh: list[dict[str, Any]] = []
+    for index, state in enumerate(running_states):
+        updated = _state_updated_dt(state)
+        if updated is None:
+            if index == 0:
+                fresh.append(state)
+            continue
+        if newest_updated - updated <= _LIVE_STATE_FRESH_WINDOW:
+            fresh.append(state)
+    return fresh or running_states[:1]
+
+
+def _merge_live_state_dicts(states: list[dict[str, Any]]) -> dict[str, Any]:
+    if not states:
+        return {}
+
+    ordered = sorted(states, key=_state_sort_key, reverse=True)
+    running_states = [state for state in ordered if bool(state.get("running", False))]
+    fresh_running_states = _fresh_running_states(running_states)
+    merge_pool = fresh_running_states or ordered[:1]
+    newest = merge_pool[0]
+    aggregate: dict[str, Any] = dict(newest)
+    included_state_ids = {id(state) for state in merge_pool}
+
+    combined_pairs: list[str] = []
+    for state in merge_pool:
+        for pair in _state_pair_list(state):
+            if pair not in combined_pairs:
+                combined_pairs.append(pair)
+
+    aggregate["runs"] = [
+        {
+            "run_id": state.get("run_id", ""),
+            "pair": ", ".join(_state_pair_list(state)),
+            "watchlist": _state_pair_list(state),
+            "strategy": state.get("strategy", ""),
+            "interval": state.get("interval", ""),
+            "execution_interval": state.get("execution_interval", ""),
+            "running": bool(state.get("running", False)),
+            "last_updated": state.get("last_updated", ""),
+            "included_in_live_view": id(state) in included_state_ids,
+        }
+        for state in ordered
+    ]
+    included_running_states = [state for state in merge_pool if bool(state.get("running", False))]
+    aggregate["active_runs"] = len(included_running_states)
+    aggregate["running"] = bool(included_running_states)
+    aggregate["pair"] = ", ".join(combined_pairs)
+    aggregate["watchlist"] = combined_pairs
+    aggregate["strategy"] = _mixed_or_single([state.get("strategy") for state in merge_pool])
+    aggregate["interval"] = _mixed_or_single([state.get("interval") for state in merge_pool])
+    aggregate["execution_interval"] = _mixed_or_single([state.get("execution_interval") for state in merge_pool])
+    aggregate["execution_mode"] = _mixed_or_single([state.get("execution_mode") for state in merge_pool])
+    aggregate["kill_switch_active"] = any(bool(state.get("kill_switch_active", False)) for state in merge_pool)
+
+    merged_positions: dict[str, Any] = {}
+    merged_portfolio_positions: dict[str, Any] = {}
+    merged_scanned: dict[str, Any] = {}
+    for state in reversed(merge_pool):
+        if isinstance(state.get("positions"), dict):
+            merged_positions.update(_open_position_rows(state["positions"]))
+        if (
+            isinstance(state.get("portfolio_positions"), dict)
+            and not bool(state.get("portfolio_positions_stale", False))
+        ):
+            merged_portfolio_positions.update(_open_position_rows(state["portfolio_positions"]))
+        if isinstance(state.get("scanned_pairs"), dict):
+            merged_scanned.update(state["scanned_pairs"])
+    aggregate["positions"] = merged_positions
+    aggregate["portfolio_positions"] = merged_portfolio_positions
+    aggregate["scanned_pairs"] = merged_scanned
+
+    for key in ("orders", "closed_trades", "alerts", "recent_diagnostics"):
+        combined: list[Any] = []
+        for state in merge_pool:
+            value = _fresh_recent_diagnostics(state) if key == "recent_diagnostics" else state.get(key)
+            if isinstance(value, list):
+                combined.extend(value)
+        if key == "recent_diagnostics":
+            combined.sort(key=_diagnostic_sort_key, reverse=True)
+            aggregate[key] = combined[:_LIVE_DIAGNOSTIC_MAX_ROWS]
+        else:
+            aggregate[key] = combined[:200]
+
+    return aggregate
 
 
 def _paper_pair_overrides(value: object) -> dict[str, dict[str, object]]:
@@ -159,6 +423,31 @@ def _paper_runtime_settings(params: dict[str, Any]) -> dict[str, Any]:
         if "leverage" in params
         else None
     )
+    risk_updates: dict[str, Any] = {}
+    if "live_max_order_notional" in params:
+        value = _decimal_param(
+            params.get("live_max_order_notional"),
+            Decimal("0"),
+        )
+        if value > 0:
+            risk_updates["live_max_order_notional"] = value
+    if "live_max_margin_per_order" in params:
+        value = _decimal_param(
+            params.get("live_max_margin_per_order"),
+            Decimal("0"),
+        )
+        if value > 0:
+            risk_updates["live_max_margin_per_order"] = value
+    if "live_require_stop_loss" in params:
+        risk_updates["live_require_stop_loss"] = _bool_param(
+            params.get("live_require_stop_loss"),
+            True,
+        )
+    if "live_kill_switch" in params:
+        risk_updates["live_kill_switch"] = _bool_param(
+            params.get("live_kill_switch"),
+            False,
+        )
 
     if interval:
         if interval not in REST_RESOLUTION_BY_INTERVAL:
@@ -183,6 +472,8 @@ def _paper_runtime_settings(params: dict[str, Any]) -> dict[str, Any]:
         updates["max_entries_per_parent_candle"] = max_entries
     if leverage is not None and leverage > 0:
         updates["paper_leverage"] = leverage
+    if risk_updates:
+        updates["risk_updates"] = risk_updates
     return updates
 
 
@@ -404,7 +695,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path in {"/", "/index.html"}:
-            self._send_html(DASHBOARD_HTML)
+            self._send_html(_dashboard_html())
             return
         if parsed.path.startswith("/static/"):
             self._send_static_asset(parsed.path.removeprefix("/static/"))
@@ -420,8 +711,45 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if parsed.path == "/api/live-state":
+            self._send_json(self._get_live_state_safe())
+            return
         if parsed.path == "/api/pairs":
             self._send_pairs()
+            return
+        if parsed.path == "/api/positions":
+            self._send_json({"positions": self._get_live_state_safe().get("positions", {})})
+            return
+        if parsed.path == "/api/orders":
+            self._send_json({"orders": self._get_live_state_safe().get("orders", [])})
+            return
+        if parsed.path == "/api/risk":
+            state = self._get_live_state_safe()
+            self._send_json({
+                "initial_equity": state.get("initial_equity", "0"),
+                "allocated_capital": state.get("allocated_capital", "0"),
+                "portfolio_equity": state.get("portfolio_equity", "0"),
+                "wallet_balance": state.get("wallet_balance", "0"),
+                "wallet_locked_collateral": state.get("wallet_locked_collateral", "0"),
+                "wallet_free_collateral": state.get("wallet_free_collateral", "0"),
+                "portfolio_unrealized_pnl": state.get("portfolio_unrealized_pnl", "0"),
+                "usable_capital": state.get("usable_capital", "0"),
+                "tradable_base": state.get("tradable_base", "0"),
+                "locked_profit": state.get("locked_profit", "0"),
+                "max_leveraged_notional": state.get("max_leveraged_notional", "0"),
+                "effective_leverage": state.get("effective_leverage", "1"),
+                "daily_loss_from_tradable_base": state.get("daily_loss_from_tradable_base", "0"),
+                "kill_switch_active": state.get("kill_switch_active", False)
+            })
+            return
+        if parsed.path == "/api/signals/latest":
+            self._send_json({"signals": self._get_live_state_safe().get("recent_diagnostics", [])})
+            return
+        if parsed.path == "/api/trades/closed":
+            self._send_json({"trades": self._get_live_state_safe().get("closed_trades", [])})
+            return
+        if parsed.path == "/api/alerts":
+            self._send_json({"alerts": self._get_live_state_safe().get("alerts", [])})
             return
         if parsed.path == "/api/backtest":
             params = _flatten_query(parse_qs(parsed.query))
@@ -431,8 +759,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             from app.live.paper_loop import get_active_loop, get_live_state
             state = get_live_state()
             active_loop = get_active_loop()
+            state = dict(state)
             if active_loop is not None and not state.get("running"):
-                state = dict(state)
                 state["running"] = True
                 execution_mode = getattr(active_loop, "execution_mode", "paper")
                 live_dry_run = getattr(active_loop, "live_dry_run", True)
@@ -452,6 +780,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 interval = getattr(active_loop, "_current_interval", "")
                 if interval and not state.get("interval"):
                     state["interval"] = interval
+            effective_settings = getattr(active_loop, "settings", self.server.settings)
+            effective_risk = getattr(effective_settings, "risk", self.server.settings.risk)
+            state["live_max_order_notional"] = str(effective_risk.live_max_order_notional)
+            state["live_max_margin_per_order"] = str(effective_risk.live_max_margin_per_order)
+            state["live_require_stop_loss"] = bool(effective_risk.live_require_stop_loss)
+            state["live_kill_switch"] = bool(effective_risk.live_kill_switch)
             self._send_json(state)
             return
         if parsed.path == "/api/paper-trades":
@@ -461,6 +795,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/kill-switch/enable":
+            self._handle_kill_switch_enable()
+            return
+        if parsed.path == "/api/kill-switch/disable":
+            self._handle_kill_switch_disable(self._read_json_body())
+            return
+        if parsed.path == "/api/refresh":
+            self._send_json({"success": True})
+            return
         if parsed.path == "/api/backtest":
             self._send_backtest(self._read_json_body())
             return
@@ -501,6 +844,51 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         logging.getLogger("app.dashboard").debug(format, *args)
+
+    def _get_live_state_safe(self) -> dict[str, Any]:
+        run_paths, legacy_path = _live_state_paths()
+        run_states = [
+            state
+            for state in (_read_json_dict(path) for path in run_paths)
+            if state
+        ]
+        if run_states:
+            state = _merge_live_state_dicts(run_states)
+            control = _read_json_dict(legacy_path)
+            if control.get("live_state_control") and "kill_switch_active" in control:
+                state["kill_switch_active"] = bool(control.get("kill_switch_active"))
+            return state
+
+        return _read_json_dict(legacy_path)
+
+    def _handle_kill_switch_enable(self) -> None:
+        self._write_live_kill_switch_state(True)
+        self._send_json({"success": True, "message": "Kill switch activated via dashboard."})
+
+    def _handle_kill_switch_disable(self, params: dict[str, Any]) -> None:
+        if params.get("confirm") != "DISABLE":
+             self._send_json({"error": "Confirmation text 'DISABLE' required."}, status=HTTPStatus.BAD_REQUEST)
+             return
+        self._write_live_kill_switch_state(False)
+        self._send_json({"success": True, "message": "Kill switch disabled via dashboard."})
+
+    def _write_live_kill_switch_state(self, active: bool) -> None:
+        run_paths, legacy_path = _live_state_paths()
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(json.dumps({
+            "kill_switch_active": active,
+            "live_state_control": True,
+        }, indent=2))
+
+        for path in run_paths:
+            state = _read_json_dict(path)
+            if not state:
+                continue
+            state["kill_switch_active"] = active
+            try:
+                path.write_text(json.dumps(to_jsonable(state), indent=2))
+            except Exception:
+                logging.getLogger("app.dashboard").warning("Failed to update kill switch in %s", path)
 
     def _handle_paper_start(self, params: dict[str, Any]) -> None:
         import threading
@@ -609,6 +997,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 params.get("bb_trail_enabled"),
                 settings.risk.bb_trail_enabled,
             )
+            live_max_order_notional = Decimal(
+                str(params.get("live_max_order_notional", settings.risk.live_max_order_notional))
+            )
+            live_max_margin_per_order = Decimal(
+                str(params.get("live_max_margin_per_order", settings.risk.live_max_margin_per_order))
+            )
+            live_require_stop_loss = _bool_param(
+                params.get("live_require_stop_loss"),
+                settings.risk.live_require_stop_loss,
+            )
+            live_kill_switch = _bool_param(
+                params.get("live_kill_switch"),
+                settings.risk.live_kill_switch,
+            )
         except (ValueError, InvalidOperation) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -639,6 +1041,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             atr_trailing_enabled=atr_exits_enabled,
             profit_lock_enabled=profit_lock_enabled,
             bb_trail_enabled=bb_trail_enabled,
+            live_max_order_notional=live_max_order_notional,
+            live_max_margin_per_order=live_max_margin_per_order,
+            live_require_stop_loss=live_require_stop_loss,
+            live_kill_switch=live_kill_switch,
             live_risk_approval_enabled=(
                 execution_mode != "paper" or settings.risk.live_risk_approval_enabled
             ),

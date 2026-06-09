@@ -360,6 +360,29 @@ class PaperLoopIntegrationTests(unittest.TestCase):
         self.assertFalse(features["backtest_config"]["trailing_stop_enabled"])
         self.assertFalse(features["backtest_config"]["atr_dynamic_exits_enabled"])
 
+        from app.strategies.base import SignalAction, SignalDirection, StrategySignal
+
+        signal = StrategySignal(
+            strategy_name="bb_dynamic_grid",
+            pair="B-BTC_USDT",
+            interval="5m",
+            action=SignalAction.ENTER_LONG,
+            direction=SignalDirection.LONG,
+            confidence=Decimal("1"),
+            reason="test",
+            timestamp_ms=0,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("95"),
+        )
+        stamped = self.loop._with_pair_runtime_metadata(signal, risk)
+
+        self.assertEqual(stamped.metadata["paper_pair_strategy"], "bb_dynamic_grid")
+        self.assertEqual(stamped.metadata["paper_pair_leverage"], Decimal("2"))
+        self.assertTrue(stamped.metadata["paper_pair_override_applied"])
+        self.assertFalse(stamped.metadata["trailing_stop_enabled"])
+        self.assertFalse(stamped.metadata["atr_dynamic_exits_enabled"])
+        self.assertFalse(stamped.metadata["atr_stop_enabled"])
+
     def test_live_dry_run_mode_records_live_report_on_shadow_decision(self) -> None:
         from app.execution.live import LiveExecutionReport
         from app.risk.models import RiskDecision

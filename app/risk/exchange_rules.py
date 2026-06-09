@@ -24,13 +24,13 @@ def normalize_signal_prices_to_tick(
     original: dict[str, Decimal] = {}
 
     if signal.direction == SignalDirection.LONG:
-        entry_price = _round_price(signal.entry_price, tick_size, "up")
-        stop_loss = _round_price(signal.stop_loss, tick_size, "down")
-        take_profit = _round_price(signal.take_profit, tick_size, "up")
+        entry_price = round_price(signal.entry_price, tick_size, "up")
+        stop_loss = round_price(signal.stop_loss, tick_size, "down")
+        take_profit = round_price(signal.take_profit, tick_size, "up")
     elif signal.direction == SignalDirection.SHORT:
-        entry_price = _round_price(signal.entry_price, tick_size, "down")
-        stop_loss = _round_price(signal.stop_loss, tick_size, "up")
-        take_profit = _round_price(signal.take_profit, tick_size, "down")
+        entry_price = round_price(signal.entry_price, tick_size, "down")
+        stop_loss = round_price(signal.stop_loss, tick_size, "up")
+        take_profit = round_price(signal.take_profit, tick_size, "down")
 
     for field_name, before, after in (
         ("entry_price", signal.entry_price, entry_price),
@@ -106,7 +106,7 @@ def liquidation_guard(
     return None, metadata
 
 
-def _round_price(
+def round_price(
     value: Decimal | None,
     tick_size: Decimal,
     mode: str,

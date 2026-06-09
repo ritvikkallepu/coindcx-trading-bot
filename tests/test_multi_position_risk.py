@@ -103,15 +103,16 @@ class TestMultiPositionRisk(unittest.TestCase):
         self.assertFalse(decision.approved)
         self.assertIn("same_pair_position_blocked", decision.reason)
 
-    def test_max_open_positions_limit(self) -> None:
-        # 1. Open 3 positions (max)
+    def test_max_open_positions_does_not_limit_distinct_pairs(self) -> None:
+        # 1. Open 3 different-pair positions (old max)
         open_positions = [
             OpenPosition(pair="B-BTC_USDT", direction=SignalDirection.LONG, quantity=Decimal("1"), entry_price=Decimal("1"), leverage=Decimal("1")),
             OpenPosition(pair="B-SOL_USDT", direction=SignalDirection.LONG, quantity=Decimal("1"), entry_price=Decimal("1"), leverage=Decimal("1")),
             OpenPosition(pair="B-BSB_USDT", direction=SignalDirection.LONG, quantity=Decimal("1"), entry_price=Decimal("1"), leverage=Decimal("1")),
         ]
         
-        # 2. Evaluate 4th signal
+        # 2. Evaluate 4th different coin. This should be controlled by
+        # margin/risk caps, not by the old global position count.
         signal = StrategySignal(
             strategy_name="test_strat",
             pair="B-ETH_USDT",
@@ -120,6 +121,8 @@ class TestMultiPositionRisk(unittest.TestCase):
             confidence=Decimal("1"),
             direction=SignalDirection.LONG,
             entry_price=Decimal("2000"),
+            stop_loss=Decimal("1900"),
+            take_profit=Decimal("2200"),
             timestamp_ms=1000,
             reason="test"
         )
@@ -133,8 +136,7 @@ class TestMultiPositionRisk(unittest.TestCase):
             trading_mode="paper"
         )
         
-        self.assertFalse(decision.approved)
-        self.assertIn("max_open_positions_blocked", decision.reason)
+        self.assertTrue(decision.approved, decision.reason)
 
     def test_margin_usage_limit(self) -> None:
         # Max margin % = 50%

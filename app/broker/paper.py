@@ -370,6 +370,7 @@ class PaperBroker:
         bb_trail_force_close_r: Decimal = Decimal("4.0"),
         bb_trail_partial_close_at_tp: bool = True,
         bb_trail_partial_close_pct: Decimal = Decimal("0.60"),
+        bb_trail_observe_only: bool = True,
     ) -> None:
         if atr is None or atr <= 0:
             return
@@ -471,6 +472,9 @@ class PaperBroker:
             position.metadata,
             "bb_trail_partial_close_pct",
             bb_trail_partial_close_pct,
+        )
+        bb_trail_observe_only = _bool_metadata(
+            position.metadata, "bb_trail_observe_only", bb_trail_observe_only
         )
 
         if (
@@ -705,7 +709,7 @@ class PaperBroker:
                 force_close_r=bb_trail_force_close_r,
             )
             bb_stop = bb_metadata.get("bb_trail_stop")
-            if bb_metadata.get("bb_trail_active") and isinstance(bb_stop, Decimal):
+            if not bb_trail_observe_only and bb_metadata.get("bb_trail_active") and isinstance(bb_stop, Decimal):
                 if position.direction == SignalDirection.LONG:
                     combined_stop = max(stop_candidate or Decimal("0"), bb_stop)
                 else:
@@ -726,7 +730,7 @@ class PaperBroker:
                 else "atr"
             )
         )
-        if bb_stop_applied:
+        if bb_stop_applied and not bb_trail_observe_only:
             resolved_stop_type = "bb_trail"
 
         bb_partial_enabled = (
@@ -1910,7 +1914,9 @@ class PaperBroker:
         candle: OHLCVCandle,
     ) -> _ExitTrigger | None:
         same_entry_candle = _position_opened_on_execution_candle(position, candle)
-        if _bool_metadata(position.metadata, "bb_trail_force_close", False):
+        bb_trail_observe_only = _bool_metadata(position.metadata, "bb_trail_observe_only", True)
+        
+        if not bb_trail_observe_only and _bool_metadata(position.metadata, "bb_trail_force_close", False):
             return _exit_trigger(
                 action=(
                     SignalAction.EXIT_LONG
@@ -1927,7 +1933,7 @@ class PaperBroker:
             stop = position.stop_loss
             target = (
                 position.take_profit
-                if _bb_partial_close_enabled(position)
+                if not bb_trail_observe_only and _bb_partial_close_enabled(position)
                 else None if _trailing_priority_enabled(position) else position.take_profit
             )
             if not same_entry_candle and stop is not None and candle.open <= stop:
@@ -1941,7 +1947,7 @@ class PaperBroker:
                     gap_exit=True,
                 )
             if not same_entry_candle and target is not None and candle.open >= target:
-                if _bb_partial_close_enabled(position):
+                if not bb_trail_observe_only and _bb_partial_close_enabled(position):
                     partial_pct = _decimal_metadata(
                         position.metadata,
                         "bb_trail_partial_close_pct",
@@ -1998,7 +2004,7 @@ class PaperBroker:
                 )
             if target_hit:
                 assert target is not None
-                if _bb_partial_close_enabled(position):
+                if not bb_trail_observe_only and _bb_partial_close_enabled(position):
                     partial_pct = _decimal_metadata(
                         position.metadata,
                         "bb_trail_partial_close_pct",
@@ -2036,7 +2042,7 @@ class PaperBroker:
         stop = position.stop_loss
         target = (
             position.take_profit
-            if _bb_partial_close_enabled(position)
+            if not bb_trail_observe_only and _bb_partial_close_enabled(position)
             else None if _trailing_priority_enabled(position) else position.take_profit
         )
         if not same_entry_candle and stop is not None and candle.open >= stop:
@@ -2050,7 +2056,7 @@ class PaperBroker:
                 gap_exit=True,
             )
         if not same_entry_candle and target is not None and candle.open <= target:
-            if _bb_partial_close_enabled(position):
+            if not bb_trail_observe_only and _bb_partial_close_enabled(position):
                 partial_pct = _decimal_metadata(
                     position.metadata,
                     "bb_trail_partial_close_pct",
@@ -2107,7 +2113,7 @@ class PaperBroker:
             )
         if target_hit:
             assert target is not None
-            if _bb_partial_close_enabled(position):
+            if not bb_trail_observe_only and _bb_partial_close_enabled(position):
                 partial_pct = _decimal_metadata(
                     position.metadata,
                     "bb_trail_partial_close_pct",

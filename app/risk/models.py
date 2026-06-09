@@ -100,6 +100,14 @@ class InstrumentMetadata:
         )
 
 
+def get_unit_contract_value(pair: str) -> Decimal:
+    """
+    Get the unit contract value for a given pair.
+    TODO: Support instrument metadata from exchange for non-1x contracts.
+    """
+    return Decimal("1")
+
+
 @dataclass(frozen=True)
 class OpenPosition:
     pair: str
@@ -109,7 +117,12 @@ class OpenPosition:
     leverage: Decimal = Decimal("1")
     stop_loss: Decimal | None = None
     quote_to_margin_rate: Decimal = Decimal("1")
-    unit_contract_value: Decimal = Decimal("1")
+    unit_contract_value: Decimal = field(default_factory=lambda: Decimal("1"))
+
+    def __post_init__(self):
+        # Ensure unit_contract_value is set if not provided
+        if self.unit_contract_value is None:
+            object.__setattr__(self, 'unit_contract_value', get_unit_contract_value(self.pair))
 
     @property
     def is_open(self) -> bool:
@@ -144,6 +157,7 @@ class RiskContext:
     signal: StrategySignal
     account_equity: Decimal
     available_equity: Decimal | None = None
+    sizing_equity: Decimal | None = None
     risk_base_mode: str = "current"
     open_positions: OpenPositions = ()
     daily_realized_pnl: Decimal = Decimal("0")
@@ -151,10 +165,14 @@ class RiskContext:
     instrument: InstrumentMetadata | None = None
     requested_leverage: Decimal | None = None
     quote_to_margin_rate: Decimal = Decimal("1")
-    unit_contract_value: Decimal = Decimal("1")
+    unit_contract_value: Decimal = field(default_factory=lambda: Decimal("1"))
     trading_mode: str = "paper"
     live_trading_enabled: bool = False
     protected_profit_override_enabled: bool = False
+
+    def __post_init__(self):
+        if self.unit_contract_value is None and self.signal:
+            object.__setattr__(self, 'unit_contract_value', get_unit_contract_value(self.signal.pair))
 
     @property
     def live_trading_allowed(self) -> bool:

@@ -62,6 +62,7 @@ class ResearchSweepTests(unittest.TestCase):
         self.assertIn("adaptive_default", names)
         self.assertIn("hybrid_meta", names)
         self.assertIn("hybrid_meta_v2", names)
+        self.assertIn("fib_ma_pullback", names)
         self.assertIn("bb_strict_volume", names)
         self.assertIn("grid_bb_dynamic", names)
 
@@ -69,6 +70,14 @@ class ResearchSweepTests(unittest.TestCase):
         variants = strategy_variants_for_names(("hybrid_meta", "adaptive_hybrid"))
 
         self.assertEqual([variant.name for variant in variants], ["hybrid_meta", "adaptive_default"])
+
+    def test_fib_ma_pullback_variant_aliases_are_selectable(self) -> None:
+        variants = strategy_variants_for_names(("fib", "fib_ma"))
+
+        self.assertEqual(
+            [variant.name for variant in variants],
+            ["fib_ma_pullback", "fib_ma_pullback"],
+        )
 
     def test_grid_parsers_handle_sweep_values(self) -> None:
         self.assertEqual(parse_decimal_list("1, 2.5", ()), (Decimal("1"), Decimal("2.5")))

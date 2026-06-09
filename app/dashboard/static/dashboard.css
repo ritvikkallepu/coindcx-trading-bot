@@ -1028,3 +1028,8 @@
       }
     }
 
+
+.badge { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.badge-success { background: rgba(64,201,138,0.2); color: #40c98a; }
+.badge-neutral { background: rgba(168,173,183,0.15); color: #a8adb7; }
+

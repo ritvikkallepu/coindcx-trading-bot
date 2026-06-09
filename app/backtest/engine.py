@@ -666,22 +666,29 @@ class BacktestEngine:
                     config=self.config,
                 )
 
-                # Task 1: Check for breakout entries in early children
+                # Task 1: Check for execution-candle entries in early children
+                fib_intrabar_entry = self.config.strategy_name == "fib_ma_pullback"
+                hybrid_intrabar_entry = (
+                    self.config.intrabar_reversal_breakout_enabled
+                    and self.config.strategy_name == "hybrid_meta_v2"
+                )
                 if (
                     day not in halted_days
-                    and self.config.intrabar_reversal_breakout_enabled
-                    and self.config.strategy_name == "hybrid_meta_v2"
+                    and (hybrid_intrabar_entry or fib_intrabar_entry)
                     and parent_breakout_entries < 1
                     and not broker.open_positions()
                     and not pending_decisions
                     and not safety_state.active(child.close_time_ms)
                 ):
-                    # Task 11: Parity - strategy needs current child candle as 'latest'
-                    provisional_series = series.copy()
-                    provisional_series.add(child)
-                    
+                    if fib_intrabar_entry:
+                        context_series = series
+                    else:
+                        # Hybrid ignition expects the execution candle as the latest candle.
+                        context_series = series.copy()
+                        context_series.add(child)
+
                     indicators = latest_indicator_snapshot(
-                        provisional_series,
+                        context_series,
                         atr_period=self.config.atr_period,
                     )
                     prev_parent = series.latest() # 'series' still only has closed parents
@@ -700,12 +707,17 @@ class BacktestEngine:
                     context = StrategyContext(
                         pair=self.config.pair,
                         interval=self.config.interval,
-                        candles=provisional_series,
+                        candles=context_series,
                         indicators=indicators,
                         features=features,
                     )
+                    allowed_entry_types = (
+                        {"fib_ma_intrabar_pullback"}
+                        if fib_intrabar_entry
+                        else {"intrabar_reversal_breakout", "balanced_breakout", "pullback_continuation"}
+                    )
                     for signal in self.strategy_engine.evaluate(context):
-                        if signal.metadata.get("entry_type") not in {"intrabar_reversal_breakout", "balanced_breakout", "pullback_continuation"}:
+                        if signal.metadata.get("entry_type") not in allowed_entry_types:
                             continue
                         signal = _apply_exit_overrides(
                             signal,
@@ -1721,6 +1733,7 @@ def _update_dynamic_exits(
         bb_trail_force_close_r=config.bb_trail_force_close_r,
         bb_trail_partial_close_at_tp=config.bb_trail_partial_close_at_tp,
         bb_trail_partial_close_pct=config.bb_trail_partial_close_pct,
+        bb_trail_observe_only=config.bb_trail_observe_only,
     )
 
 
@@ -2085,6 +2098,7 @@ def _strategy_features(
             "bb_trail_force_close_r": config.bb_trail_force_close_r,
             "bb_trail_partial_close_at_tp": config.bb_trail_partial_close_at_tp,
             "bb_trail_partial_close_pct": config.bb_trail_partial_close_pct,
+            "bb_trail_observe_only": config.bb_trail_observe_only,
             "atr_entry_filter_enabled": config.atr_entry_filter_enabled,
             "atr_policy_mode": config.atr_policy_mode,
             "intrabar_reversal_breakout_enabled": (

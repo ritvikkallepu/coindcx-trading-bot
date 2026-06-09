@@ -79,6 +79,7 @@ class BollingerTrailBrokerTests(unittest.TestCase):
                 "bb_trail_enabled": True,
                 "bb_trail_active": True,
                 "bb_trail_stop": stop_loss,
+                "bb_trail_observe_only": False,
                 "stop_type": "bb_trail",
                 "atr_stop_enabled": False,
                 "atr_dynamic_exit_active": False,
@@ -144,7 +145,7 @@ class BollingerTrailBrokerTests(unittest.TestCase):
             entry_price=Decimal("100"),
             stop_loss=Decimal("95"),
             take_profit=Decimal("104"),
-            metadata={"atr_dynamic_exits_enabled": True},
+            metadata={"atr_dynamic_exits_enabled": True, "bb_trail_observe_only": False},
         )
         decision = RiskDecision(
             approved=True,
@@ -174,6 +175,7 @@ class BollingerTrailBrokerTests(unittest.TestCase):
             bb_trail_enabled=True,
             bb_trail_partial_close_at_tp=True,
             bb_trail_partial_close_pct=Decimal("0.60"),
+            bb_trail_observe_only=False,
         )
         position = broker.open_positions()[0]
         self.assertTrue(position.metadata["bb_trail_active"])
@@ -206,6 +208,77 @@ class BollingerTrailBrokerTests(unittest.TestCase):
         )
         self.assertEqual(second_reports, [])
         self.assertEqual(broker.open_positions()[0].quantity, Decimal("4"))
+
+    def test_observe_only_does_not_override_stop_candidate(self) -> None:
+        broker = PaperBroker(starting_equity=Decimal("10000"))
+        signal = StrategySignal(
+            strategy_name="test", pair="B-BTC_USDT", interval="5m",
+            action=SignalAction.ENTER_LONG, direction=SignalDirection.LONG,
+            confidence=Decimal("1"), reason="entry", timestamp_ms=0,
+            entry_price=Decimal("100"), stop_loss=Decimal("95"),
+            take_profit=Decimal("115"),
+            metadata={"bb_trail_enabled": True, "bb_trail_observe_only": True}
+        )
+        decision = RiskDecision(approved=True, reason="ok", signal=signal, position_size=Decimal("10"))
+        broker.execute_decision(decision, market_price=Decimal("100"), timestamp_ms=0)
+        
+        # known ATR stop at 96
+        # BB trail would compute stop at 102
+        broker.update_dynamic_atr_exits(
+            _candle(close=Decimal("105")),
+            atr=Decimal("2"),
+            stop_multiple=Decimal("2"), # 105 - 4 = 101? No, best_price=100. 100 - 4 = 96.
+            take_profit_multiple=Decimal("10"),
+            trailing_enabled=False,
+            bb_band=BollingerBandPoint(
+                middle=Decimal("104"), # 104 - 2*1 = 102
+                upper=Decimal("110"),
+                lower=Decimal("98"),
+                width_pct=Decimal("12"),
+            ),
+            bb_trail_enabled=True,
+            bb_trail_observe_only=True,
+        )
+        
+        position = broker.open_positions()[0]
+        # ATR stop (96) should be preserved, BB stop (102) should NOT override it
+        self.assertEqual(position.stop_loss, Decimal("96"))
+        self.assertEqual(position.metadata["bb_trail_stop"], Decimal("102"))
+        self.assertNotEqual(position.metadata["stop_type"], "bb_trail")
+
+    def test_observe_only_false_does_override_stop_candidate(self) -> None:
+        broker = PaperBroker(starting_equity=Decimal("10000"))
+        signal = StrategySignal(
+            strategy_name="test", pair="B-BTC_USDT", interval="5m",
+            action=SignalAction.ENTER_LONG, direction=SignalDirection.LONG,
+            confidence=Decimal("1"), reason="entry", timestamp_ms=0,
+            entry_price=Decimal("100"), stop_loss=Decimal("95"),
+            take_profit=Decimal("115"),
+            metadata={"bb_trail_enabled": True, "bb_trail_observe_only": False}
+        )
+        decision = RiskDecision(approved=True, reason="ok", signal=signal, position_size=Decimal("10"))
+        broker.execute_decision(decision, market_price=Decimal("100"), timestamp_ms=0)
+        
+        broker.update_dynamic_atr_exits(
+            _candle(close=Decimal("105")),
+            atr=Decimal("2"),
+            stop_multiple=Decimal("2"), # 100 - 4 = 96
+            take_profit_multiple=Decimal("10"),
+            trailing_enabled=False,
+            bb_band=BollingerBandPoint(
+                middle=Decimal("104"), # 104 - 2*1 = 102
+                upper=Decimal("110"),
+                lower=Decimal("98"),
+                width_pct=Decimal("12"),
+            ),
+            bb_trail_enabled=True,
+            bb_trail_observe_only=False,
+        )
+        
+        position = broker.open_positions()[0]
+        # BB stop (102) SHOULD override ATR stop (96)
+        self.assertEqual(position.stop_loss, Decimal("102"))
+        self.assertEqual(position.metadata["stop_type"], "bb_trail")
 
 
 if __name__ == "__main__":

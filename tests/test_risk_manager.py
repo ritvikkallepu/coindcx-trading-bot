@@ -16,11 +16,12 @@ def _entry_signal(
     entry_price: Decimal = Decimal("100"),
     stop_loss: Decimal | None = Decimal("95"),
     take_profit: Decimal | None = Decimal("110"),
+    pair: str = "B-BTC_USDT",
     metadata: dict[str, object] | None = None,
 ) -> StrategySignal:
     return StrategySignal(
         strategy_name="test",
-        pair="B-BTC_USDT",
+        pair=pair,
         interval="1h",
         action=action,
         direction=direction,
@@ -109,7 +110,7 @@ class RiskManagerTests(unittest.TestCase):
 
         self.assertTrue(decision.approved)
 
-    def test_rejects_entry_when_max_open_positions_reached(self) -> None:
+    def test_allows_different_pair_when_max_open_positions_reached(self) -> None:
         position = OpenPosition(
             pair="B-ETH_USDT",
             direction=SignalDirection.LONG,
@@ -120,6 +121,15 @@ class RiskManagerTests(unittest.TestCase):
             _entry_signal(),
             account_equity=Decimal("1000"),
             open_positions=[position],
+        )
+
+        self.assertTrue(decision.approved, decision.reason)
+
+    def test_count_only_position_context_still_uses_max_open_positions(self) -> None:
+        decision = _manager().evaluate_signal(
+            _entry_signal(),
+            account_equity=Decimal("1000"),
+            open_positions=1,
         )
 
         self.assertFalse(decision.approved)
@@ -153,6 +163,70 @@ class RiskManagerTests(unittest.TestCase):
 
         self.assertTrue(decision.metadata["basket_risk_checked"])
         self.assertTrue(decision.metadata["position_size_adjusted_for_basket_risk"])
+
+    def test_rejects_same_pair_when_margin_bucket_would_be_exceeded(self) -> None:
+        manager = RiskManager(
+            RiskSettings(
+                max_risk_per_trade_pct=Decimal("0.1"),
+                max_daily_loss_pct=Decimal("100"),
+                max_open_positions=5,
+                max_open_positions_per_pair=5,
+                allow_same_pair_pyramiding=True,
+                max_leverage=5,
+                max_margin_per_pair=Decimal("1000"),
+            )
+        )
+        position = OpenPosition(
+            pair="B-BTC_USDT",
+            direction=SignalDirection.LONG,
+            quantity=Decimal("9"),
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("99.9"),
+            leverage=Decimal("1"),
+        )
+
+        decision = manager.evaluate_signal(
+            _entry_signal(metadata={"allow_scale_in": True}),
+            account_equity=Decimal("10000"),
+            open_positions=[position],
+            requested_leverage=Decimal("1"),
+        )
+
+        self.assertFalse(decision.approved)
+        self.assertIn("pair_margin_cap_blocked", decision.reason)
+
+    def test_pair_margin_bucket_does_not_block_other_pairs(self) -> None:
+        manager = RiskManager(
+            RiskSettings(
+                max_risk_per_trade_pct=Decimal("0.1"),
+                max_daily_loss_pct=Decimal("100"),
+                max_open_positions=5,
+                max_leverage=5,
+                max_margin_per_pair=Decimal("1000"),
+            )
+        )
+        position = OpenPosition(
+            pair="B-BTC_USDT",
+            direction=SignalDirection.LONG,
+            quantity=Decimal("9"),
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("95"),
+            leverage=Decimal("1"),
+        )
+
+        decision = manager.evaluate_signal(
+            _entry_signal(pair="B-SOL_USDT"),
+            account_equity=Decimal("10000"),
+            open_positions=[position],
+            requested_leverage=Decimal("1"),
+        )
+
+        self.assertTrue(decision.approved, decision.reason)
+        self.assertEqual(decision.metadata["pair_existing_margin"], Decimal("0"))
+        self.assertLessEqual(
+            decision.metadata["projected_pair_margin"],
+            decision.metadata["max_margin_per_pair"],
+        )
 
     def test_rejects_scale_in_at_global_cap_without_reuse_flag(self) -> None:
         position = OpenPosition(
@@ -421,6 +495,46 @@ class RiskManagerTests(unittest.TestCase):
         self.assertEqual(decision.max_loss, Decimal("5"))
         self.assertEqual(decision.metadata["risk_base_amount"], Decimal("500"))
         self.assertTrue(decision.metadata["risk_base_capped_by_available_equity"])
+
+    def test_sizes_from_pair_sizing_equity_without_using_total_allocation(self) -> None:
+        manager = RiskManager(
+            RiskSettings(
+                max_risk_per_trade_pct=Decimal("20"),
+                max_daily_loss_pct=Decimal("100"),
+                max_open_positions=10,
+                max_leverage=5,
+                max_margin_per_pair=Decimal("1000"),
+            )
+        )
+
+        decision = manager.evaluate_signal(
+            _entry_signal(),
+            account_equity=Decimal("5000"),
+            available_equity=Decimal("5000"),
+            sizing_equity=Decimal("1000"),
+            requested_leverage=Decimal("3"),
+        )
+
+        self.assertTrue(decision.approved, decision.reason)
+        self.assertEqual(decision.notional, Decimal("3000"))
+        self.assertEqual(decision.notional / decision.leverage, Decimal("1000"))
+        self.assertEqual(decision.metadata["risk_budget"], Decimal("200"))
+        self.assertEqual(decision.metadata["risk_base_amount"], Decimal("1000"))
+        self.assertEqual(decision.metadata["sizing_equity"], Decimal("1000"))
+        self.assertTrue(decision.metadata["sizing_equity_applied"])
+        self.assertEqual(decision.metadata["account_equity_for_limits"], Decimal("5000"))
+
+    def test_rejects_when_pair_sizing_equity_is_depleted(self) -> None:
+        decision = _manager().evaluate_signal(
+            _entry_signal(),
+            account_equity=Decimal("5000"),
+            available_equity=Decimal("5000"),
+            sizing_equity=Decimal("0"),
+            requested_leverage=Decimal("1"),
+        )
+
+        self.assertFalse(decision.approved)
+        self.assertIn("no remaining per-pair capital bucket", decision.reason)
 
     def test_correlated_same_direction_basket_reduces_risk(self) -> None:
         manager = RiskManager(

@@ -130,6 +130,36 @@ def _decimal_arg(value: str) -> Decimal:
         raise argparse.ArgumentTypeError(f"Invalid decimal value: {value}") from exc
 
 
+def _pair_decimal_map_arg(value: str) -> dict[str, Decimal]:
+    mapping: dict[str, Decimal] = {}
+    for raw_item in str(value or "").split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError(
+                "Expected comma-separated PAIR=VALUE entries, e.g. B-BTC_USDT=3,B-SOL_USDT=6."
+            )
+        raw_pair, raw_decimal = item.split("=", 1)
+        pair = raw_pair.strip()
+        if not pair:
+            raise argparse.ArgumentTypeError("Pair name cannot be empty in pair map.")
+        try:
+            decimal_value = Decimal(raw_decimal.strip())
+        except InvalidOperation as exc:
+            raise argparse.ArgumentTypeError(
+                f"Invalid decimal value for {pair}: {raw_decimal}"
+            ) from exc
+        if decimal_value <= 0:
+            raise argparse.ArgumentTypeError(
+                f"Value for {pair} must be greater than zero."
+            )
+        mapping[pair] = decimal_value
+    if not mapping:
+        raise argparse.ArgumentTypeError("At least one PAIR=VALUE entry is required.")
+    return mapping
+
+
 def _fee_rate_from_args(
     *,
     fee_rate: Decimal | None,
@@ -484,11 +514,17 @@ def live_run_command(
     pair: str | None,
     pairs_csv: str | None,
     interval: str,
+    execution_interval: str,
     strategy_name: str,
-    equity: Decimal,
+    equity: Decimal | None,
     leverage: Decimal,
+    dry_run: bool = False,
+    capital_per_pair: Decimal | None = None,
+    leverage_by_pair: dict[str, Decimal] | None = None,
 ) -> None:
     settings = load_settings()
+    if dry_run:
+        settings = replace(settings, live_pilot_dry_run=True)
     configure_logging(settings)
 
     if not pair and not pairs_csv:
@@ -508,14 +544,53 @@ def live_run_command(
     if not all_pairs:
         raise SystemExit("Error: No valid pairs identified.")
 
+    if capital_per_pair is not None:
+        if capital_per_pair <= 0:
+            raise SystemExit("Error: --capital-per-pair must be greater than zero.")
+        equity = capital_per_pair * Decimal(len(all_pairs))
+        settings = replace(
+            settings,
+            risk=replace(settings.risk, max_margin_per_pair=capital_per_pair),
+        )
+        logger.info(
+            "Using per-pair capital buckets: %s x %s pair(s) => allocated capital %s.",
+            capital_per_pair,
+            len(all_pairs),
+            equity,
+        )
+
+    if equity is None or equity <= 0:
+        raise SystemExit("Error: --allocated-capital must be greater than zero.")
+
+    effective_leverage: Decimal | dict[str, Decimal] = leverage
+    if leverage_by_pair:
+        unknown_pairs = sorted(set(leverage_by_pair) - set(all_pairs))
+        if unknown_pairs:
+            raise SystemExit(
+                "Error: --leverage-by-pair contains pair(s) not in this run: "
+                + ", ".join(unknown_pairs)
+            )
+        effective_leverage = {
+            run_pair: leverage_by_pair.get(run_pair, leverage)
+            for run_pair in all_pairs
+        }
+        logger.info(
+            "Using pair-specific leverage: %s",
+            ", ".join(
+                f"{run_pair}={effective_leverage[run_pair]}x"
+                for run_pair in all_pairs
+            ),
+        )
+
     from app.live.live_loop import LiveTradingLoop
     loop = LiveTradingLoop(
         settings=settings,
         strategy_name=strategy_name,
         pairs=all_pairs,
         interval=interval,
+        execution_interval=execution_interval,
         starting_equity=equity,
-        leverage=leverage
+        leverage=effective_leverage
     )
 
     try:
@@ -696,15 +771,37 @@ def live_status_command(
 
 
 def live_kill_switch_command(enable: bool) -> None:
-    settings = load_settings()
-    configure_logging(settings)
+    import json
+    from pathlib import Path
+
+    state_path = Path("data/live_state.json")
+    state = {}
+    if state_path.exists():
+        try:
+            # Read current state to preserve other fields
+            with open(state_path, "r") as f:
+                state = json.load(f)
+        except Exception as exc:
+            print(f"Warning: Could not read {state_path}: {exc}")
+
+    # Only update the kill switch
+    state["kill_switch_active"] = enable
     
-    # In a real system, this might update a database or a shared config file.
-    # For now, we'll log what it would do and implement the logic in the loop.
-    action = "ENABLING" if enable else "DISABLING"
-    print(f"!!! {action} LIVE KILL SWITCH !!!")
-    print("Note: This currently requires updating LIVE_KILL_SWITCH in your .env file")
-    print("or using the dashboard if implemented there.")
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        # Safe write
+        temp_path = state_path.with_suffix(".tmp")
+        with open(temp_path, "w") as f:
+            json.dump(state, f, indent=4)
+        
+        if state_path.exists():
+             state_path.unlink()
+        temp_path.rename(state_path)
+        
+        action = "ENABLED" if enable else "DISABLED"
+        print(f"LIVE KILL SWITCH {action} and persisted to {state_path}")
+    except Exception as exc:
+        print(f"Error: Could not write to {state_path}: {exc}")
 
 
 def live_flatten_command(pair: str, confirm: str) -> None:
@@ -1864,10 +1961,53 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live_run_parser.add_argument("--pair", help="Single pair to trade, e.g. B-BTC_USDT")
     live_run_parser.add_argument("--pairs", help="Comma-separated pairs to trade, e.g. B-BTC_USDT,B-ETH_USDT")
-    live_run_parser.add_argument("--interval", default="5m", help="Strategy interval, e.g. 5m, 1h")
+    live_run_parser.add_argument(
+        "--interval",
+        default="1h",
+        help="Strategy interval; live default is 1h.",
+    )
+    live_run_parser.add_argument(
+        "--execution-interval",
+        default="5m",
+        help="Intrabar execution interval; live default is 5m and must divide the strategy interval.",
+    )
     live_run_parser.add_argument("--strategy", default="hybrid_meta_v2", choices=STRATEGY_CHOICES)
-    live_run_parser.add_argument("--equity", type=_decimal_arg, required=True, help="Starting equity for sizing")
+    live_capital_group = live_run_parser.add_mutually_exclusive_group(required=True)
+    live_capital_group.add_argument(
+        "--equity",
+        "--allocated-capital",
+        dest="equity",
+        type=_decimal_arg,
+        help="Hard capital allocation for this bot. Portfolio equity is read separately from CoinDCX.",
+    )
+    live_capital_group.add_argument(
+        "--capital-per-pair",
+        "--allocated-capital-per-pair",
+        dest="capital_per_pair",
+        type=_decimal_arg,
+        help=(
+            "Capital bucket per pair. Total allocated capital becomes this value "
+            "multiplied by the number of pairs, and one pair cannot reserve more "
+            "than this much required margin."
+        ),
+    )
     live_run_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("1"), help="Leverage to use")
+    live_run_parser.add_argument(
+        "--leverage-by-pair",
+        "--pair-leverage",
+        dest="leverage_by_pair",
+        type=_pair_decimal_map_arg,
+        default=None,
+        help=(
+            "Optional comma-separated pair leverage map, e.g. "
+            "B-BTC_USDT=3,B-SOL_USDT=6. Pairs not listed use --leverage."
+        ),
+    )
+    live_run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Force simulated execution for this run, regardless of .env live settings.",
+    )
 
     exit_test_parser = subparsers.add_parser(
         "dry-run-exit-test", help="Verify dry-run exit logic with synthetic candles"
@@ -2883,9 +3023,13 @@ def main() -> None:
             pair=args.pair,
             pairs_csv=args.pairs,
             interval=args.interval,
+            execution_interval=args.execution_interval,
             strategy_name=args.strategy,
             equity=args.equity,
-            leverage=args.leverage
+            leverage=args.leverage,
+            dry_run=args.dry_run,
+            capital_per_pair=args.capital_per_pair,
+            leverage_by_pair=args.leverage_by_pair,
         )
     elif args.command == "dry-run-exit-test":
         dry_run_exit_test_command(

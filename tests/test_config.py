@@ -77,6 +77,7 @@ class ConfigTests(unittest.TestCase):
                             "MAX_LEVERAGE=4",
                             "MAX_TOTAL_OPEN_NOTIONAL_PCT=250",
                             "MAX_TOTAL_RISK_PCT=6",
+                            "MAX_MARGIN_PER_PAIR=750",
                             "LIQUIDATION_BUFFER_PCT=1.5",
                             "TRAILING_STOP_ENABLED=true",
                             "TRAILING_STOP_ACTIVATION_PCT=1.25",
@@ -100,6 +101,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(risk.max_leverage, 4)
                 self.assertEqual(risk.max_total_open_notional_pct, Decimal("250"))
                 self.assertEqual(risk.max_total_risk_pct, Decimal("6"))
+                self.assertEqual(risk.max_margin_per_pair, Decimal("750"))
                 self.assertEqual(risk.liquidation_buffer_pct, Decimal("1.5"))
                 self.assertTrue(risk.trailing_stop_enabled)
                 self.assertEqual(risk.trailing_stop_activation_pct, Decimal("1.25"))

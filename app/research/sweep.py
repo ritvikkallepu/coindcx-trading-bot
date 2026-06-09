@@ -34,6 +34,7 @@ from app.strategies.base import Strategy, StrategyEngine
 from app.strategies.bb_dynamic_grid import BollingerDynamicFuturesGridStrategy
 from app.strategies.bb_volume_reversion import BollingerVolumeMeanReversionStrategy
 from app.strategies.ema_rsi_trend import EMARSICrossoverStrategy
+from app.strategies.fib_ma_pullback import FibMAPullbackStrategy
 from app.strategies.hybrid_meta import HybridMetaStrategy, HybridMetaV2Strategy
 from app.strategies.rsi_macd_momentum import RSIMACDMomentumStrategy
 
@@ -90,7 +91,7 @@ class SweepConfig:
     leverage: Decimal = Decimal("3")
     margin_currency: str = "INR"
     price_quote_currency: str = "USDT"
-    quote_to_margin_rate: Decimal = Decimal("98")
+    quote_to_margin_rate: Decimal = Decimal("102")
     unit_contract_value: Decimal = Decimal("1")
     risk_per_trade_pct: Decimal | None = None
     compound_risk_equity: bool = True
@@ -261,6 +262,11 @@ def default_strategy_variants() -> tuple[StrategyVariant, ...]:
             factory=lambda: RSIMACDMomentumStrategy(),
         ),
         StrategyVariant(
+            name="fib_ma_pullback",
+            family="fib_ma_pullback",
+            factory=lambda: FibMAPullbackStrategy(),
+        ),
+        StrategyVariant(
             name="ema_fast",
             family="ema_rsi_trend",
             factory=lambda: EMARSICrossoverStrategy(
@@ -334,6 +340,8 @@ def strategy_variants_for_names(names: Iterable[str]) -> tuple[StrategyVariant, 
         "hybrid": "hybrid_meta",
         "weighted_hybrid_v2": "hybrid_meta_v2",
         "rsi_macd": "rsi_macd_momentum",
+        "fib_ma": "fib_ma_pullback",
+        "fib": "fib_ma_pullback",
     }
     selected: list[StrategyVariant] = []
     for name in requested:

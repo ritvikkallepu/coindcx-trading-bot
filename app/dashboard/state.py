@@ -117,6 +117,9 @@ def build_status_payload(
             "mode": settings.trading_mode,
             "live_trading_allowed": settings.live_trading_allowed,
             "live_trading_enabled": settings.live_trading_enabled,
+            "live_pilot_dry_run": settings.live_pilot_dry_run,
+            "live_confirm_i_understand_risk": settings.live_confirm_i_understand_risk,
+            "kill_switch_active": settings.risk.live_kill_switch,
             "default_pair": settings.default_pair,
             "futures_margin_currency": settings.futures_margin_currency,
             "price_quote_currency": settings.price_quote_currency,
@@ -300,6 +303,17 @@ def build_strategy_profile(*, strategy: str, interval: str) -> dict[str, str]:
             "secondary": "MACD cross/flip",
             "filter": "RSI/MACD exits + hard stop",
             "status": "Paper Research",
+        }
+
+    if normalized_strategy == "fib_ma_pullback":
+        return {
+            "name": "fib_ma_pullback",
+            "label": "Fib MA Pullback",
+            "mode": "Trend Pullback",
+            "primary": "EMA 50/200 trend",
+            "secondary": "0.382-0.618 fib zone",
+            "filter": "ATR-buffered swing stop + fib/R target",
+            "status": "Research / Dry Run",
         }
 
     if normalized_strategy == "ema_rsi_trend":

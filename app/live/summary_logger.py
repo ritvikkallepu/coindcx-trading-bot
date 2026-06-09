@@ -70,7 +70,7 @@ class PaperTradingSummaryLogger:
                 wins = sum(1 for pnl in recent if pnl > 0)
                 win_rate = (Decimal(wins) / Decimal(len(recent))) * Decimal("100")
                 
-            self.logger.info(
+            self.logger.debug(
                 f"[PAPER] candle={candle_number} | equity={equity:.2f} | "
                 f"open={open_positions} | today_pnl={daily_pnl:.2f} | "
                 f"win_rate={win_rate:.1f}% (last 20 trades)"

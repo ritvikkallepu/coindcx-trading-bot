@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from typing import Any
 
 from app.config import Settings
 from app.exchange.coindcx_rest import CoinDCXFuturesClient
+from app.exchange.errors import CoinDCXAPIError
 from app.exchange.models import FuturesOrderRequest
 from app.risk.limits import is_entry_signal, is_exit_signal
 from app.risk.models import RiskDecision, convert_for_json
 from app.strategies.base import SignalAction, SignalDirection, StrategySignal
+
+
+logger = logging.getLogger(__name__)
 
 
 ORDER_SYNC_STATUSES = (
@@ -138,6 +143,8 @@ class LiveSyncResult:
     tpsl_response: Any = None
     exit_response: Any = None
     cancel_response: Any = None
+    safety_failure: bool = False
+    submitted_to_exchange: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return convert_for_json(asdict(self))
@@ -153,6 +160,9 @@ class LiveExecutionReport:
     risk_decision: RiskDecision | None = None
     signal: StrategySignal | None = None
     metadata: dict[str, Any] | None = None
+    safety_failure: bool = False
+    submitted_to_exchange: bool = False
+    requires_manual_reconciliation: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -190,7 +200,7 @@ class LiveExecutionEngine:
             if self.settings.trading_mode != "live" or not self.settings.live_trading_enabled:
                  return _rejected(decision, "REAL LIVE TRADING BLOCKED: TRADING_MODE must be 'live' and LIVE_TRADING_ENABLED must be true.", dry_run=False)
             
-            if self.settings.live_confirm_i_understand_risk != "YES":
+            if self.settings.live_confirm_i_understand_risk.strip().upper() != "YES":
                  return _rejected(decision, "REAL LIVE TRADING BLOCKED: LIVE_CONFIRM_I_UNDERSTAND_RISK must be set to 'YES' in .env", dry_run=False)
 
         if is_entry_signal(signal):
@@ -223,7 +233,27 @@ class LiveExecutionEngine:
             preflight = self.sync.validate_no_conflicting_position(decision)
             if preflight is not None:
                 return _rejected(decision, preflight, dry_run=False)
-            response = self.client.place_order(order)
+            try:
+                response = self.client.place_order(order)
+            except CoinDCXAPIError as exc:
+                # 400 errors from CoinDCX are usually validation errors (Quantity, Notional, Tick)
+                # These are non-retryable for the same signal.
+                is_retryable = exc.status_code in (429, 500, 502, 503, 504)
+                logger.error("[%s] Exchange rejected order (code=%s): %s", signal.pair, exc.status_code, str(exc))
+                return LiveExecutionReport(
+                    accepted=False,
+                    dry_run=False,
+                    reason=f"ORDER_REJECTED_NON_RETRYABLE: {str(exc)}" if not is_retryable else f"ORDER_REJECTED_RETRYABLE: {str(exc)}",
+                    order_request=order_payload,
+                    exchange_response=exc.response_text,
+                    risk_decision=decision,
+                    signal=signal,
+                    metadata={"live_pilot": True, "exchange_rejected": True, "retryable": is_retryable, "error_code": exc.status_code},
+                )
+            except Exception as exc:
+                logger.error("[%s] Unhandled exception during order placement: %s", signal.pair, exc)
+                return _rejected(decision, f"EXECUTION_ERROR: {exc}", dry_run=False)
+
             sync_result = self.sync.sync_after_entry(response, decision)
             return LiveExecutionReport(
                 accepted=sync_result.ok,
@@ -238,6 +268,9 @@ class LiveExecutionEngine:
                 risk_decision=decision,
                 signal=signal,
                 metadata={"live_pilot": True, "live_sync": sync_result.to_dict()},
+                safety_failure=sync_result.safety_failure,
+                submitted_to_exchange=sync_result.submitted_to_exchange,
+                requires_manual_reconciliation=sync_result.safety_failure and sync_result.submitted_to_exchange,
             )
 
         if is_exit_signal(signal):
@@ -280,6 +313,9 @@ class LiveExecutionEngine:
                 risk_decision=decision,
                 signal=signal,
                 metadata={"live_pilot": True, "live_sync": sync_result.to_dict()},
+                safety_failure=sync_result.safety_failure,
+                submitted_to_exchange=sync_result.submitted_to_exchange,
+                requires_manual_reconciliation=sync_result.safety_failure and sync_result.submitted_to_exchange,
             )
 
         return _rejected(
@@ -295,6 +331,7 @@ class LiveExecutionEngine:
         *,
         take_profit: Decimal | None = None,
         stop_loss: Decimal | None = None,
+        tick_size: Decimal | None = None,
         reason: str = "dynamic_adjustment",
     ) -> LiveExecutionReport:
         position = self.sync.fetch_position(pair)
@@ -304,6 +341,17 @@ class LiveExecutionEngine:
                 dry_run=self.dry_run,
                 reason=f"No open position found for {pair} to update TPSL.",
             )
+
+        # Final safety normalization if tick_size provided
+        if tick_size and tick_size > 0:
+             from app.risk.exchange_rules import round_price
+             mode = "down" if position.direction == SignalDirection.LONG else "up"
+             if stop_loss:
+                  stop_loss = round_price(stop_loss, tick_size, mode)
+             if take_profit:
+                  # For TP, Long rounds UP (better), Short rounds DOWN (better)
+                  tp_mode = "up" if position.direction == SignalDirection.LONG else "down"
+                  take_profit = round_price(take_profit, tick_size, tp_mode)
 
         if self.dry_run:
             return LiveExecutionReport(
@@ -338,6 +386,14 @@ class LiveExecutionEngine:
                 reason=f"Live TPSL update submitted for {pair}. Reason: {reason}",
                 exchange_response=response,
                 metadata={"live_pilot": True},
+            )
+        except CoinDCXAPIError as exc:
+            is_retryable = exc.status_code in (429, 500, 502, 503, 504)
+            return LiveExecutionReport(
+                accepted=False,
+                dry_run=False,
+                reason=f"Live TPSL update REJECTED (code={exc.status_code}): {str(exc)}",
+                metadata={"live_pilot": True, "retryable": is_retryable, "error_code": exc.status_code},
             )
         except Exception as exc:
             return LiveExecutionReport(
@@ -447,61 +503,103 @@ class LiveExchangeSynchronizer:
         decision: RiskDecision,
     ) -> LiveSyncResult:
         signal = decision.signal
+        pair = signal.pair
         order_ids = _extract_order_ids(exchange_response)
         side = _entry_side(signal.action)
-        orders = self.fetch_orders(side=side, order_ids=order_ids)
-        position = self.fetch_position(signal.pair)
-        if position is None:
-            return LiveSyncResult(
-                ok=False,
-                reason="Live entry submitted but no exchange position row was returned.",
-                orders=orders,
-            )
+        
+        logger.info("[%s] Order submitted (ids=%s). Syncing protective TPSL...", pair, order_ids)
+        
+        # Wait briefly for exchange to process
+        import time
+        time.sleep(1.5)
+        
+        try:
+            orders = self.fetch_orders(side=side, order_ids=order_ids)
+            position = self.fetch_position(pair)
+            
+            if position is None:
+                return LiveSyncResult(
+                    ok=False,
+                    reason="Live entry submitted but no exchange position row was returned.",
+                    orders=orders,
+                )
 
-        tpsl_response = None
-        if position.is_open and _position_needs_tpsl_sync(position, signal):
-            tpsl_response = self.client.create_position_tpsl(
-                position_id=position.position_id,
-                take_profit_stop_price=signal.take_profit,
-                stop_loss_stop_price=signal.stop_loss,
-            )
-            position = self.fetch_position(signal.pair) or position
+            tpsl_response = None
+            if position.is_open and _position_needs_tpsl_sync(position, signal):
+                try:
+                    logger.info("[%s] Creating exchange-side TPSL: SL=%.2f, TP=%.2f", 
+                                pair, signal.stop_loss or 0, signal.take_profit or 0)
+                    tpsl_response = self.client.create_position_tpsl(
+                        position_id=position.position_id,
+                        take_profit_stop_price=signal.take_profit,
+                        stop_loss_stop_price=signal.stop_loss,
+                    )
+                    # Refresh position to see new triggers
+                    position = self.fetch_position(pair) or position
+                except Exception as exc:
+                    logger.error("[%s] SAFETY FAILURE: Order placed but TPSL creation FAILED: %s", pair, exc)
+                    return LiveSyncResult(
+                        ok=False, 
+                        reason=f"SAFETY FAILURE: Position is OPEN but protective TPSL sync failed: {exc}",
+                        orders=orders,
+                        position=position,
+                        safety_failure=True,
+                        submitted_to_exchange=True,
+                    )
 
-        if not position.is_open:
+            if not position.is_open:
+                return LiveSyncResult(
+                    ok=False,
+                    reason="Live entry submitted but exchange position is not open yet.",
+                    orders=orders,
+                    position=position,
+                    tpsl_response=tpsl_response,
+                    submitted_to_exchange=True,
+                )
+            
+            if signal.direction is not None and position.direction != signal.direction:
+                return LiveSyncResult(
+                    ok=False,
+                    reason=(
+                        "Live entry direction mismatch after sync: expected "
+                        f"{signal.direction.value}, exchange has "
+                        f"{position.direction.value if position.direction else 'none'}."
+                    ),
+                    orders=orders,
+                    position=position,
+                    tpsl_response=tpsl_response,
+                    submitted_to_exchange=True,
+                    safety_failure=True, # Direction mismatch is a safety issue
+                )
+                
+            if signal.stop_loss is not None and not position.has_stop_loss:
+                # If we required stop loss sync but it's missing, it's a safety failure
+                return LiveSyncResult(
+                    ok=False,
+                    reason="SAFETY FAILURE: Live entry is open but exchange stop-loss trigger is missing.",
+                    orders=orders,
+                    position=position,
+                    tpsl_response=tpsl_response,
+                    safety_failure=True,
+                    submitted_to_exchange=True,
+                )
+
             return LiveSyncResult(
-                ok=False,
-                reason="Live entry submitted but exchange position is not open yet.",
+                ok=True,
                 orders=orders,
                 position=position,
                 tpsl_response=tpsl_response,
+                reason="Live entry reconciled with exchange position.",
+                submitted_to_exchange=True,
             )
-        if signal.direction is not None and position.direction != signal.direction:
+        except Exception as exc:
+            logger.error("[%s] SAFETY FAILURE: Exception during post-entry sync: %s", pair, exc)
             return LiveSyncResult(
-                ok=False,
-                reason=(
-                    "Live entry direction mismatch after sync: expected "
-                    f"{signal.direction.value}, exchange has "
-                    f"{position.direction.value if position.direction else 'none'}."
-                ),
-                orders=orders,
-                position=position,
-                tpsl_response=tpsl_response,
+                ok=False, 
+                reason=f"SAFETY FAILURE: Post-entry sync exception: {exc}",
+                submitted_to_exchange=True, # Assume submitted if we got this far
+                safety_failure=True,
             )
-        if signal.stop_loss is not None and not position.has_stop_loss:
-            return LiveSyncResult(
-                ok=False,
-                reason="Live entry is open but exchange stop-loss trigger is missing.",
-                orders=orders,
-                position=position,
-                tpsl_response=tpsl_response,
-            )
-        return LiveSyncResult(
-            ok=True,
-            reason="Live entry reconciled with exchange position.",
-            orders=orders,
-            position=position,
-            tpsl_response=tpsl_response,
-        )
 
     def exit_position_for_signal(self, signal: StrategySignal) -> LiveSyncResult:
         position_id = str(signal.metadata.get("live_position_id") or "").strip()

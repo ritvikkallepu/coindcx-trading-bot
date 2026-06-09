@@ -108,8 +108,24 @@ class RiskManager:
                     f"max_open_positions_per_pair_blocked: {pair_open}/{self.settings.max_open_positions_per_pair} for {signal.pair}"
                 )
 
-        # 2. Global limit
-        if total_open >= self.settings.max_open_positions and not scale_in_reuses_position:
+        # 2. Position-count limit.
+        #
+        # When the risk context includes pair-level positions and multi-pair
+        # mode is enabled, different coins are allowed to coexist. Portfolio
+        # size is still constrained by margin, notional, daily-loss, and total
+        # open-risk checks below.
+        is_count_only_context = isinstance(context.open_positions, int)
+        is_new_distinct_pair = pair_open == 0
+        position_count_cap_applies = (
+            is_count_only_context
+            or not self.settings.allow_multi_pair_positions
+            or not is_new_distinct_pair
+        )
+        if (
+            position_count_cap_applies
+            and total_open >= self.settings.max_open_positions
+            and not scale_in_reuses_position
+        ):
             return self._reject(
                 signal,
                 f"max_open_positions_blocked: {total_open}/{self.settings.max_open_positions}",
@@ -128,6 +144,7 @@ class RiskManager:
                 signal=signal,
                 account_equity=context.account_equity,
                 available_equity=available_equity,
+                sizing_equity=context.sizing_equity,
                 risk_base_mode=context.risk_base_mode,
                 open_positions=context.open_positions,
                 daily_realized_pnl=context.daily_realized_pnl,
@@ -170,20 +187,43 @@ class RiskManager:
                 f"Requested leverage exceeds allowed limit: {requested_leverage} > {configured_allowed_leverage}.",
             )
 
+        sizing_account_equity = (
+            context.sizing_equity
+            if context.sizing_equity is not None
+            else context.account_equity
+        )
         risk_base_equity = _risk_sizing_base_equity(
-            account_equity=context.account_equity,
+            account_equity=sizing_account_equity,
             available_equity=available_equity,
             risk_base_mode=context.risk_base_mode,
         )
-        risk_context = replace(
+        if risk_base_equity <= 0:
+            return self._reject(
+                signal,
+                "pair_margin_cap_blocked: no remaining per-pair capital bucket available for sizing.",
+            )
+
+        sizing_context = replace(
             context,
             account_equity=risk_base_equity,
             available_equity=available_equity,
         )
+        limit_context = replace(context, available_equity=available_equity)
+
+        # Point 1: Hard-block live entries if existing positions have missing stops
+        if context.live_trading_allowed and not isinstance(context.open_positions, int):
+            for p in context.open_positions:
+                if p.is_open and p.stop_loss is None:
+                    return self._reject(
+                        signal,
+                        f"UNSAFE LIVE STATE: Existing position {p.pair} is missing a protective stop-loss. "
+                        "New entries are blocked until risk is secured."
+                    )
+
         basket_metadata: dict[str, object] = {}
         try:
             basket_metadata = _validate_risk_basket(
-                context=risk_context,
+                context=limit_context,
                 settings=self.settings,
             )
         except ValueError as exc:
@@ -206,14 +246,33 @@ class RiskManager:
         )
 
         sizing = _calculate_position_size(
-            context=risk_context,
+            context=sizing_context,
             settings=self.settings,
             account_equity=risk_base_equity,
             leverage=requested_leverage,
             risk_multiplier=effective_risk_multiplier,
         )
+
+        # Final Exchange Normalization: Round down to step if instrument is present
+        # This ensures that ALL subsequent risk checks (margin, notional, risk-limit)
+        # use the exact quantity that will be sent to the exchange.
+        if context.instrument and context.instrument.quantity_step:
+            normalized_qty = round_down_to_step(sizing.position_size, context.instrument.quantity_step)
+            if normalized_qty != sizing.position_size:
+                # Recalculate sizing with normalized quantity
+                price_value_multiplier = context.quote_to_margin_rate * context.unit_contract_value
+                stop_distance = abs(signal.entry_price - signal.stop_loss) if signal.stop_loss else Decimal("0")
+                
+                sizing = PositionSizingResult(
+                    position_size=normalized_qty,
+                    notional=normalized_qty * signal.entry_price * price_value_multiplier,
+                    max_loss=normalized_qty * stop_distance * price_value_multiplier,
+                    risk_budget=sizing.risk_budget, # Keep original budget for metadata
+                    capped_by_leverage=sizing.capped_by_leverage
+                )
+
         if sizing.position_size <= 0 or sizing.notional <= 0:
-            return self._reject(signal, "Calculated position size is zero.")
+            return self._reject(signal, "Calculated position size is zero or below instrument step.")
 
         margin_metadata: dict[str, object] = {}
         try:
@@ -224,6 +283,7 @@ class RiskManager:
                 leverage=requested_leverage,
                 max_margin_usage_pct=self.settings.max_margin_usage_pct,
                 max_margin_per_trade_pct=self.settings.max_margin_per_trade_pct,
+                max_margin_per_pair=self.settings.max_margin_per_pair,
             )
         except ValueError as exc:
             return self._reject(signal, str(exc))
@@ -248,7 +308,7 @@ class RiskManager:
         exposure_metadata: dict[str, object] = {}
         try:
             exposure_metadata = _validate_total_exposure(
-                context=risk_context,
+                context=limit_context,
                 settings=self.settings,
                 sizing=sizing,
             )
@@ -259,7 +319,7 @@ class RiskManager:
         total_risk_metadata: dict[str, object] = {}
         try:
             total_risk_metadata = _validate_projected_risk(
-                context=risk_context,
+                context=limit_context,
                 settings=self.settings,
                 sizing=sizing,
             )
@@ -296,15 +356,18 @@ class RiskManager:
             ),
             "risk_base_mode": context.risk_base_mode,
             "risk_base_amount": risk_base_equity,
+            "sizing_equity": sizing_account_equity,
+            "sizing_equity_applied": context.sizing_equity is not None,
             "account_equity_for_limits": context.account_equity,
             "available_equity_for_sizing": available_equity,
-            "risk_base_capped_by_available_equity": risk_base_equity < context.account_equity,
+            "risk_base_capped_by_available_equity": risk_base_equity < sizing_account_equity,
             "planned_risk_amount": sizing.risk_budget,
             "equity_before_trade": available_equity,
             "max_daily_loss_pct": self.settings.max_daily_loss_pct,
             "max_open_positions": self.settings.max_open_positions,
             "max_total_open_notional_pct": self.settings.max_total_open_notional_pct,
             "max_total_risk_pct": self.settings.max_total_risk_pct,
+            "max_margin_per_pair": self.settings.max_margin_per_pair,
             "configured_max_leverage": self.settings.max_leverage,
             "allowed_leverage": configured_allowed_leverage,
             "capped_by_leverage": sizing.capped_by_leverage,
@@ -330,9 +393,18 @@ class RiskManager:
             **total_risk_metadata,
         }
 
+        # Final Approval
+        approval_reason = "Entry approved by paper risk rules."
+        trading_mode = str(context.trading_mode or "paper").lower()
+        if trading_mode == "live":
+             if context.live_trading_enabled:
+                  approval_reason = "Approved by live risk rules."
+             else:
+                  approval_reason = "Approved by live risk rules; dry-run/no real order submitted."
+
         return RiskDecision(
             approved=True,
-            reason="Entry approved by paper risk rules.",
+            reason=approval_reason,
             signal=signal,
             position_size=sizing.position_size,
             notional=sizing.notional,
@@ -347,6 +419,7 @@ class RiskManager:
         *,
         account_equity: Decimal,
         available_equity: Decimal | None = None,
+        sizing_equity: Decimal | None = None,
         risk_base_mode: str = "current",
         open_positions: OpenPositions = (),
         daily_realized_pnl: Decimal = Decimal("0"),
@@ -364,6 +437,7 @@ class RiskManager:
                 signal=signal,
                 account_equity=account_equity,
                 available_equity=available_equity,
+                sizing_equity=sizing_equity,
                 risk_base_mode=risk_base_mode,
                 open_positions=open_positions,
                 daily_realized_pnl=daily_realized_pnl,
@@ -574,13 +648,19 @@ def _validate_margin_sufficiency(
     leverage: Decimal,
     max_margin_usage_pct: Decimal = Decimal("100"),
     max_margin_per_trade_pct: Decimal = Decimal("0"),
+    max_margin_per_pair: Decimal = Decimal("0"),
 ) -> dict[str, object]:
     if leverage <= 0:
         raise ValueError("Requested leverage must be positive.")
 
     existing_margin = _existing_required_margin(context.open_positions)
+    pair_existing_margin = _existing_pair_required_margin(
+        context.open_positions,
+        context.signal.pair,
+    )
     required_margin = sizing.notional / leverage
     total_projected_margin = existing_margin + required_margin
+    projected_pair_margin = pair_existing_margin + required_margin
 
     # Portfolio-wide margin cap
     max_margin_allowed = available_equity * (max_margin_usage_pct / Decimal("100"))
@@ -591,9 +671,11 @@ def _validate_margin_sufficiency(
     )
 
     if total_projected_margin > max_margin_allowed:
+        # User requested: If projected_margin <= allowed_margin, allow.
+        # We also want to log with full precision to identify tiny overflows.
         raise ValueError(
-            f"margin_usage_blocked: projected total margin {total_projected_margin:.2f} "
-            f"exceeds allowed {max_margin_allowed:.2f} ({max_margin_usage_pct}%) - exceeds available equity."
+            f"margin_usage_blocked: projected total margin {total_projected_margin} "
+            f"exceeds allowed {max_margin_allowed} ({max_margin_usage_pct}%) - exceeds available equity."
         )
 
     if per_trade_margin_limit > 0 and required_margin > per_trade_margin_limit:
@@ -601,6 +683,13 @@ def _validate_margin_sufficiency(
             "per_trade_margin_blocked: required margin "
             f"{required_margin:.2f} exceeds per-trade limit "
             f"{per_trade_margin_limit:.2f} ({max_margin_per_trade_pct}%)."
+        )
+
+    if max_margin_per_pair > 0 and projected_pair_margin > max_margin_per_pair:
+        raise ValueError(
+            "pair_margin_cap_blocked: projected margin for "
+            f"{context.signal.pair} {projected_pair_margin:.2f} exceeds per-pair cap "
+            f"{max_margin_per_pair:.2f}."
         )
 
     free_equity = available_equity - existing_margin
@@ -624,8 +713,11 @@ def _validate_margin_sufficiency(
     return {
         "projected_margin": required_margin,
         "existing_margin": existing_margin,
+        "pair_existing_margin": pair_existing_margin,
+        "projected_pair_margin": projected_pair_margin,
         "available_equity_after_margin_reservations": free_equity,
         "max_margin_per_trade_pct": max_margin_per_trade_pct,
+        "max_margin_per_pair": max_margin_per_pair,
         "per_trade_margin_limit": per_trade_margin_limit,
     }
 
@@ -711,6 +803,16 @@ def _existing_required_margin(open_positions: OpenPositions) -> Decimal:
         return Decimal("0")
     return sum(
         (p.notional / p.leverage) for p in open_positions if p.is_open
+    )
+
+
+def _existing_pair_required_margin(open_positions: OpenPositions, pair: str) -> Decimal:
+    if isinstance(open_positions, int):
+        return Decimal("0")
+    return sum(
+        (p.notional / p.leverage)
+        for p in open_positions
+        if p.is_open and p.pair == pair
     )
 
 
