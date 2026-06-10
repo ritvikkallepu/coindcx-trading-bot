@@ -26,7 +26,7 @@ class DashboardDefaults:
     interval: str = "1h"
     lookback: int = 1000
     equity: Decimal = Decimal("100000")
-    leverage: Decimal = Decimal("3")
+    leverage: Decimal = Decimal("10")
     risk_per_trade_pct: Decimal = Decimal("5")
     compound_risk_equity: bool = True
     stop_loss_pct: Decimal | None = None

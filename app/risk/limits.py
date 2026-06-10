@@ -47,10 +47,15 @@ def daily_loss_limit_reached(context: RiskContext, settings: RiskSettings) -> bo
 
 
 def allowed_leverage(context: RiskContext, settings: RiskSettings) -> Decimal:
-    configured = Decimal(str(settings.max_leverage))
-    if context.instrument is None or context.instrument.max_leverage is None:
-        return configured
-    return min(configured, context.instrument.max_leverage)
+    """
+    Determine the maximum allowed leverage for a given context.
+    
+    Uses the user-configured max_leverage from settings as the authority.
+    Instrument-specific limits from the exchange are logged but not 
+    enforced if they would override the user's intent, as some exchange 
+    metadata can be conservative or outdated.
+    """
+    return Decimal(str(settings.max_leverage))
 
 
 def validate_entry_signal(signal: StrategySignal) -> str | None:

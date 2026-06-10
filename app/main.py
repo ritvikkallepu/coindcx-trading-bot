@@ -2656,10 +2656,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run only the fast broad screen and skip validation/final stages.",
     )
     quick_parser.add_argument("--equity", type=_decimal_arg, default=None)
-    quick_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("3"))
+    quick_parser.add_argument("--leverage", type=_decimal_arg, default=Decimal("10"))
     quick_parser.add_argument(
         "--leverage-grid",
-        default="1,3,5",
+        default="1,5,10",
         help="Coarse leverage grid. Keep this coarse to avoid slow overfitting.",
     )
     quick_parser.add_argument("--risk-per-trade-pct", type=_decimal_arg, default=None)
