@@ -734,6 +734,24 @@ class HybridMetaStrategy(Strategy):
         else:
             stop_price = entry_price + (atr * policy.stop_atr_multiple)
             if policy.take_profit_atr_multiple > 0: tp_price = entry_price - (atr * policy.take_profit_atr_multiple)
+
+        # Apply Hard-Target Overrides (from Terminal args)
+        if "take_profit_pct" in config:
+             override_tp_pct = _decimal_from_metadata(config["take_profit_pct"], Decimal("0"))
+             if override_tp_pct > 0:
+                  if direction == SignalDirection.LONG:
+                       tp_price = entry_price * (1 + override_tp_pct / 100)
+                  else:
+                       tp_price = entry_price * (1 - override_tp_pct / 100)
+
+        if "stop_loss_pct" in config:
+             override_sl_pct = _decimal_from_metadata(config["stop_loss_pct"], Decimal("0"))
+             if override_sl_pct > 0:
+                  if direction == SignalDirection.LONG:
+                       stop_price = entry_price * (1 - override_sl_pct / 100)
+                  else:
+                       stop_price = entry_price * (1 + override_sl_pct / 100)
+
         return StrategySignal(
             strategy_name=self.name,
             pair=context.pair,
