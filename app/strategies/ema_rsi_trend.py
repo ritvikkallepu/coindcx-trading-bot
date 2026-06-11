@@ -21,7 +21,7 @@ from app.strategies.base import (
 @dataclass(frozen=True)
 class EMARSICrossoverStrategy(Strategy):
     name: str = "ema_rsi_trend"
-    fast_period: int = 7
+    fast_period: int = 9
     slow_period: int = 21
     rsi_period: int = 14
     long_rsi_min: Decimal = Decimal("65")
