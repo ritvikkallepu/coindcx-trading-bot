@@ -30,8 +30,8 @@ from app.strategies.bollinger_entry_gate import evaluate_bb_entry_gate
 @dataclass(frozen=True)
 class HybridMetaStrategy(Strategy):
     name: str = "hybrid_meta"
-    fast_period: int = 9
-    slow_period: int = 50
+    fast_period: int = 7
+    slow_period: int = 21
     rsi_period: int = 14
     bollinger_period: int = 20
     bollinger_std_dev: float = 2.0

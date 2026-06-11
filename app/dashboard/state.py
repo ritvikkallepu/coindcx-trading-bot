@@ -310,7 +310,7 @@ def build_strategy_profile(*, strategy: str, interval: str) -> dict[str, str]:
             "name": "fib_ma_pullback",
             "label": "Fib MA Pullback",
             "mode": "Trend Pullback",
-            "primary": "EMA 50/200 trend",
+            "primary": "EMA 7/21 trend",
             "secondary": "0.382-0.618 fib zone",
             "filter": "ATR-buffered swing stop + fib/R target",
             "status": "Research / Dry Run",

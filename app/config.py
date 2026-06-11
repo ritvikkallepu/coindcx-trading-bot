@@ -114,6 +114,7 @@ class RiskSettings:
     pair_loss_risk_multiplier: Decimal = Decimal("0.50")
     pair_loss_severe_limit: int = 3
     pair_loss_severe_risk_multiplier: Decimal = Decimal("0.25")
+    reentry_cooldown_candles: int = 1
     trailing_stop_enabled: bool = True
     trailing_stop_activation_pct: Decimal = Decimal("1")
     trailing_stop_distance_pct: Decimal = Decimal("2")
@@ -332,6 +333,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         pair_loss_severe_risk_multiplier=_decimal(
             _get(merged, "PAIR_LOSS_SEVERE_RISK_MULTIPLIER", "0.25")
         ),
+        reentry_cooldown_candles=int(_get(merged, "REENTRY_COOLDOWN_CANDLES", "1")),
         trailing_stop_enabled=_bool(_get(merged, "TRAILING_STOP_ENABLED", "false")),
         trailing_stop_activation_pct=_decimal(
             _get(merged, "TRAILING_STOP_ACTIVATION_PCT", "1")

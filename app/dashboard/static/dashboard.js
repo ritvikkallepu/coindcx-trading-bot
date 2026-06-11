@@ -855,7 +855,7 @@
         return { mode: 'Momentum', primary: 'RSI 50 reclaim/loss', secondary: 'MACD cross/flip', filter: 'RSI/MACD exits + hard stop' };
       }
       if (strategy === 'fib_ma_pullback') {
-        return { mode: 'Trend Pullback', primary: 'EMA 50/200 trend', secondary: '0.382-0.618 fib zone', filter: 'Swing stop + fib/R target' };
+        return { mode: 'Trend Pullback', primary: 'EMA 7/21 trend', secondary: '0.382-0.618 fib zone', filter: 'Swing stop + fib/R target' };
       }
       if (strategy === 'ema_rsi_trend') {
         return { mode: 'Trend', primary: 'EMA crossover', secondary: 'RSI filter', filter: 'ATR exits' };

@@ -98,6 +98,8 @@ class LiveTradingLoop:
         starting_equity: Decimal = Decimal("2000"),
         leverage: Decimal | dict[str, Decimal] = Decimal("1"),
         alert_interface: AlertInterface | None = None,
+        take_profit_pct: Decimal | None = None,
+        stop_loss_pct: Decimal | None = None,
     ) -> None:
         self.settings = settings
         self.strategy_name = strategy_name
@@ -106,6 +108,8 @@ class LiveTradingLoop:
         _validate_live_intervals(self.interval, self.execution_interval)
         self.starting_equity = starting_equity
         self.allocated_capital = starting_equity
+        self.take_profit_pct = take_profit_pct
+        self.stop_loss_pct = stop_loss_pct
         
         # Handle pair-specific leverage
         self._pair_leverage: dict[str, Decimal] = {}
@@ -579,6 +583,12 @@ class LiveTradingLoop:
                 if isinstance(processed_list, list):
                      self._processed_signals = set(processed_list)
 
+                # Recover stopped out candles for cooldown persistence
+                saved_stops = self.local_state.get("stopped_out_candles", {})
+                if isinstance(saved_stops, dict):
+                    for pair, ts in saved_stops.items():
+                        self._stopped_out_candles[pair] = int(ts)
+
                 # Recover dry run positions from state if any
                 for pair, pos in self.local_state.get("positions", {}).items():
                      if self.settings.live_pilot_dry_run:
@@ -611,6 +621,11 @@ class LiveTradingLoop:
             }
             self.local_state["last_evaluated_strategy_candle_close_time"] = eval_persistence
             
+            # Persist stopped out candles for cooldown persistence
+            self.local_state["stopped_out_candles"] = {
+                 pair: str(ts) for pair, ts in self._stopped_out_candles.items()
+            }
+
             # Persist processed signals (limit to last 200 for sanity)
             processed_list = sorted(list(self._processed_signals))
             if len(processed_list) > 200:
@@ -1487,11 +1502,18 @@ class LiveTradingLoop:
 
                 # Check cooldown/stopped out prevention
                 last_stop_ms = self._stopped_out_candles.get(candle.pair, 0)
-                if candle.open_time_ms <= last_stop_ms:
-                     logger.info("[%s %s] Cooldown blocked entry evaluation after recent position exit", candle.pair, candle.interval)
-                     # We still mark it as processed/evaluated so we don't try again
-                     self._last_evaluated_strategy_candle_ms[(candle.pair, candle.interval)] = candle.close_time_ms
-                     return
+                cooldown_candles = self.settings.risk.reentry_cooldown_candles
+                if cooldown_candles > 0:
+                     interval_ms = interval_to_ms(self.interval)
+                     # cooldown_until_ms blocks the current candle if it stopped out on this or previous N candles
+                     # If cooldown=1, we block the candle immediately following the stop (open_time == previous close_time)
+                     cooldown_until_ms = last_stop_ms + (cooldown_candles - 1) * interval_ms
+                     if candle.open_time_ms <= cooldown_until_ms:
+                          logger.info("[%s %s] Cooldown blocked entry evaluation after recent position exit (cooldown_candles=%d)", 
+                                      candle.pair, candle.interval, cooldown_candles)
+                          # We still mark it as processed/evaluated so we don't try again
+                          self._last_evaluated_strategy_candle_ms[(candle.pair, candle.interval)] = candle.close_time_ms
+                          return
 
                 # Valid new closed candle: Evaluate Strategy
                 self.series_by_pair[candle.pair].add(candle)
@@ -2260,10 +2282,27 @@ class LiveTradingLoop:
                         self.settings.execution_interval,
                    )
 
+        # Global overrides for strategies (backtest_config is used for this)
+        config: dict[str, Any] = {}
+        
+        # Determine leverage for ROE -> Price % conversion
+        leverage = self._pair_leverage.get(pair, Decimal("1"))
+        if leverage <= 0:
+             leverage = Decimal("1")
+
+        if self.take_profit_pct is not None:
+             # Convert ROE % to Price Move %
+             # Price % = ROE % / Leverage
+             config["take_profit_pct"] = self.take_profit_pct / leverage
+             
+        if self.stop_loss_pct is not None:
+             # Convert ROE % to Price Move %
+             config["stop_loss_pct"] = self.stop_loss_pct / leverage
+
         if enable_momentum_ignition:
              parent = self.series_by_pair[pair].latest()
              profile = pair_profile_for(pair)
-             config: dict[str, Any] = {
+             ignition_config = {
                   "intrabar_reversal_breakout_enabled": True,
                   "previous_parent_high": parent.high if parent else Decimal("0"),
                   "previous_parent_low": parent.low if parent else Decimal("0"),
@@ -2273,12 +2312,16 @@ class LiveTradingLoop:
                   "reversal_breakout_ignition_max_extension_atr": Decimal("5.0"),
                   "reversal_breakout_ignition_risk_multiplier": Decimal("0.25"),
              }
-             ignition_keys = tuple(config)
-             for key in ignition_keys:
+             for key, val in ignition_config.items():
+                  config.setdefault(key, val)
+             
+             for key in ignition_config:
                   if key in profile.config_overrides:
                        config[key] = profile.config_overrides[key]
-             features["backtest_config"] = config
              features["pair_profile"] = profile.metadata()
+        
+        if config:
+             features["backtest_config"] = config
 
         position = self.local_state.get("positions", {}).get(pair)
         if not position or abs(Decimal(str(position.get("active_pos", 0)))) <= 0:

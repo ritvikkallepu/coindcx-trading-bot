@@ -22,9 +22,9 @@ class FibMAPullbackStrategy(Strategy):
     """Trend-pullback strategy using Fibonacci retracement zones and moving averages."""
 
     name: str = "fib_ma_pullback"
-    fast_period: int = 50
-    slow_period: int = 200
-    warmup_lookback: int = 250
+    fast_period: int = 7
+    slow_period: int = 21
+    warmup_lookback: int = 50
     atr_period: int = 14
     volume_period: int = 20
     swing_lookback: int = 80

@@ -521,10 +521,27 @@ def live_run_command(
     dry_run: bool = False,
     capital_per_pair: Decimal | None = None,
     leverage_by_pair: dict[str, Decimal] | None = None,
+    take_profit_pct: Decimal | None = None,
+    stop_loss_pct: Decimal | None = None,
+    risk_per_trade_pct: Decimal | None = None,
+    reentry_cooldown_candles: int | None = None,
 ) -> None:
     settings = load_settings()
     if dry_run:
         settings = replace(settings, live_pilot_dry_run=True)
+    
+    if risk_per_trade_pct is not None:
+         settings = replace(
+              settings,
+              risk=replace(settings.risk, max_risk_per_trade_pct=risk_per_trade_pct)
+         )
+    
+    if reentry_cooldown_candles is not None:
+         settings = replace(
+              settings,
+              risk=replace(settings.risk, reentry_cooldown_candles=reentry_cooldown_candles)
+         )
+         
     configure_logging(settings)
 
     if not pair and not pairs_csv:
@@ -590,7 +607,9 @@ def live_run_command(
         interval=interval,
         execution_interval=execution_interval,
         starting_equity=equity,
-        leverage=effective_leverage
+        leverage=effective_leverage,
+        take_profit_pct=take_profit_pct,
+        stop_loss_pct=stop_loss_pct,
     )
 
     try:
@@ -2008,6 +2027,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force simulated execution for this run, regardless of .env live settings.",
     )
+    live_run_parser.add_argument(
+        "--take-profit-pct",
+        type=_decimal_arg,
+        default=None,
+        help="Override strategy take-profit with a fixed ROE percentage (e.g., 50 for 50%% profit on margin).",
+    )
+    live_run_parser.add_argument(
+        "--stop-loss-pct",
+        type=_decimal_arg,
+        default=None,
+        help="Override strategy stop-loss with a fixed ROE percentage (e.g., 10 for 10%% loss on margin).",
+    )
+    live_run_parser.add_argument(
+        "--risk-per-trade-pct",
+        type=_decimal_arg,
+        default=None,
+        help="Override max risk per trade percentage for this run.",
+    )
+    live_run_parser.add_argument(
+        "--reentry-cooldown-candles",
+        type=int,
+        default=None,
+        help="Wait N full candles after a stop before allowing re-entry on the same pair.",
+    )
 
     exit_test_parser = subparsers.add_parser(
         "dry-run-exit-test", help="Verify dry-run exit logic with synthetic candles"
@@ -3030,6 +3073,10 @@ def main() -> None:
             dry_run=args.dry_run,
             capital_per_pair=args.capital_per_pair,
             leverage_by_pair=args.leverage_by_pair,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            risk_per_trade_pct=args.risk_per_trade_pct,
+            reentry_cooldown_candles=args.reentry_cooldown_candles,
         )
     elif args.command == "dry-run-exit-test":
         dry_run_exit_test_command(
