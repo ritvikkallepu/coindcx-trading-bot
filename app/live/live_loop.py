@@ -1505,9 +1505,10 @@ class LiveTradingLoop:
                 cooldown_candles = self.settings.risk.reentry_cooldown_candles
                 if cooldown_candles > 0:
                      interval_ms = interval_to_ms(self.interval)
-                     # cooldown_until_ms blocks the current candle if it stopped out on this or previous N candles
-                     # If cooldown=1, we block the candle immediately following the stop (open_time == previous close_time)
-                     cooldown_until_ms = last_stop_ms + (cooldown_candles - 1) * interval_ms
+                     # cooldown_until_ms blocks candles for N full intervals after the stop
+                     # If stop at 14:08 on 5m, and cooldown=1: wait until 14:13.
+                     # The 14:10 candle (open_time=14:10) will be <= 14:13 and thus blocked.
+                     cooldown_until_ms = last_stop_ms + (cooldown_candles * interval_ms)
                      if candle.open_time_ms <= cooldown_until_ms:
                           logger.info("[%s %s] Cooldown blocked entry evaluation after recent position exit (cooldown_candles=%d)", 
                                       candle.pair, candle.interval, cooldown_candles)
@@ -1770,13 +1771,18 @@ class LiveTradingLoop:
             return
 
         last_stop_ms = self._stopped_out_candles.get(candle.pair, 0)
-        if last_stop_ms > 0 and candle.open_time_ms <= last_stop_ms:
-            logger.info(
-                "[%s %s] Cooldown blocked momentum ignition evaluation after recent position exit",
-                candle.pair,
-                candle.interval,
-            )
-            return
+        cooldown_candles = self.settings.risk.reentry_cooldown_candles
+        if cooldown_candles > 0:
+             interval_ms = interval_to_ms(self.interval)
+             cooldown_until_ms = last_stop_ms + (cooldown_candles * interval_ms)
+             if candle.open_time_ms <= cooldown_until_ms:
+                  logger.info(
+                       "[%s %s] Cooldown blocked momentum ignition evaluation after recent position exit (cooldown_candles=%d)",
+                       candle.pair,
+                       candle.interval,
+                       cooldown_candles
+                  )
+                  return
 
         series = self.series_by_pair[candle.pair]
         if len(series) < 20:
