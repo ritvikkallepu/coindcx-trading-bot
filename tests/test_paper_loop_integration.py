@@ -41,7 +41,7 @@ class PaperLoopIntegrationTests(unittest.TestCase):
         self.settings = Settings(
             paper_starting_equity=Decimal("5000"),
             quote_to_margin_rate=Decimal("1"),
-            risk=RiskSettings(max_risk_per_trade_pct=Decimal("1")),
+            risk=RiskSettings(max_risk_per_trade_pct=Decimal("1"), trailing_stop_enabled=False),
         )
 
     def tearDown(self) -> None:

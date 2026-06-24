@@ -77,16 +77,20 @@ class ParityBacktestPaperTests(unittest.TestCase):
             fee_gst_rate=Decimal("0.18"),
             slippage_pct=Decimal("0"), # Task: 0 slippage for exact parity
             stop_slippage_pct=Decimal("0"),
-            atr_stop_enabled=True,
-            atr_take_profit_enabled=True,
-            atr_trailing_enabled=True,
+            trailing_stop_enabled=False,
+            atr_stop_enabled=False,
+            atr_take_profit_enabled=False,
+            atr_trailing_enabled=False,
             atr_stop_multiple=Decimal("1.5"),
             atr_trailing_multiple=Decimal("2.0"),
-            atr_take_profit_multiple=Decimal("2.4")
+            atr_take_profit_multiple=Decimal("2.4"),
+            profit_giveback_guard_enabled=False,
         )
         
         self.settings = Settings(
             paper_starting_equity=Decimal("10000"),
+            paper_leverage=Decimal("3"),
+            quote_to_margin_rate=Decimal("1"),
             risk=self.common_risk,
             paper_intrabar_enabled=True,
             strategy_interval="15m",

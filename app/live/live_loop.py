@@ -44,6 +44,10 @@ from app.live.portfolio import (
     build_futures_portfolio_snapshot,
     risk_capacity_before_reservations,
 )
+from app.risk.profit_protection import (
+    compute_profit_giveback_stop,
+    post_profit_pullback_seen,
+)
 from app.risk.manager import RiskManager
 from app.risk.models import RiskContext, OpenPosition, get_unit_contract_value, InstrumentMetadata
 from app.risk.exchange_rules import round_price
@@ -196,6 +200,8 @@ class LiveTradingLoop:
         self._is_warming_up: dict[str, bool] = {p: True for p in self.pairs}
         self._stopped_out_candles: dict[str, int] = {} # pair: close_time_ms
         self._processed_signals: set[str] = set() # pair|interval|close_time|side
+        self._same_direction_profit_cooldown_until_ms: dict[tuple[str, str], int] = {}
+        self._post_profit_reentry_state: dict[str, dict[str, Any]] = {}
         self._pending_entry_pairs: set[str] = set()
         self._portfolio_snapshot: FuturesPortfolioSnapshot | None = None
         self._portfolio_positions: dict[str, dict[str, Any]] = {}
@@ -589,6 +595,21 @@ class LiveTradingLoop:
                     for pair, ts in saved_stops.items():
                         self._stopped_out_candles[pair] = int(ts)
 
+                saved_profit_cooldowns = self.local_state.get("same_direction_profit_cooldown_until_ms", {})
+                if isinstance(saved_profit_cooldowns, dict):
+                    for key, ts in saved_profit_cooldowns.items():
+                        pair, _, direction = str(key).partition("|")
+                        if pair and direction:
+                            self._same_direction_profit_cooldown_until_ms[(pair, direction)] = int(ts)
+
+                saved_reentry_state = self.local_state.get("post_profit_reentry_state", {})
+                if isinstance(saved_reentry_state, dict):
+                    self._post_profit_reentry_state = {
+                        str(pair): dict(state)
+                        for pair, state in saved_reentry_state.items()
+                        if isinstance(state, dict)
+                    }
+
                 # Recover dry run positions from state if any
                 for pair, pos in self.local_state.get("positions", {}).items():
                      if self.settings.live_pilot_dry_run:
@@ -625,6 +646,12 @@ class LiveTradingLoop:
             self.local_state["stopped_out_candles"] = {
                  pair: str(ts) for pair, ts in self._stopped_out_candles.items()
             }
+
+            self.local_state["same_direction_profit_cooldown_until_ms"] = {
+                 f"{pair}|{direction}": str(ts)
+                 for (pair, direction), ts in self._same_direction_profit_cooldown_until_ms.items()
+            }
+            self.local_state["post_profit_reentry_state"] = self._post_profit_reentry_state
 
             # Persist processed signals (limit to last 200 for sanity)
             processed_list = sorted(list(self._processed_signals))
@@ -1020,6 +1047,20 @@ class LiveTradingLoop:
                        transaction_fee if transaction_count > 0 else None
                   ),
              )
+             closed_at_ms = max(
+                  (
+                       _int_or_zero(order.get("updated_at") or order.get("created_at"))
+                       for order in exit_orders
+                  ),
+                  default=int(time.time() * 1000),
+             )
+             self._record_post_profit_exit(
+                  pair=pair,
+                  direction=accounting.direction,
+                  exit_price=accounting.exit_price,
+                  net_pnl=accounting.net_pnl,
+                  closed_at_ms=closed_at_ms,
+             )
              logger.info(
                   "[%s] Closed position accounting: source=%s direction=%s entry=%s "
                   "exit=%s qty=%s gross_pnl=%.2f entry_fee=%.2f exit_fee=%.2f net_pnl=%.2f",
@@ -1313,6 +1354,113 @@ class LiveTradingLoop:
              self.kill_switch_active = True
              self.local_state["kill_switch_active"] = True
 
+
+    def _risk_decimal(self, name: str, default: Decimal) -> Decimal:
+        return _decimal_or_default(getattr(self.settings.risk, name, default), default)
+
+    def _risk_int(self, name: str, default: int) -> int:
+        try:
+            return int(getattr(self.settings.risk, name, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _risk_bool(self, name: str, default: bool) -> bool:
+        value = getattr(self.settings.risk, name, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
+    def _record_post_profit_exit(
+        self,
+        *,
+        pair: str,
+        direction: SignalDirection,
+        exit_price: Decimal,
+        net_pnl: Decimal,
+        closed_at_ms: int,
+    ) -> None:
+        if net_pnl <= 0 or not self._risk_bool("post_profit_reentry_guard_enabled", False):
+            return
+        interval_ms = interval_to_ms(self.execution_interval or self.interval)
+        cooldown_candles = max(self._risk_int("post_profit_reentry_cooldown_candles", 12), 0)
+        until_ms = closed_at_ms + (cooldown_candles * interval_ms)
+        key = (pair, direction.value)
+        self._same_direction_profit_cooldown_until_ms[key] = max(
+            self._same_direction_profit_cooldown_until_ms.get(key, 0),
+            until_ms,
+        )
+        self._post_profit_reentry_state[pair] = {
+            "direction": direction.value,
+            "exit_price": str(exit_price),
+            "closed_at_ms": str(closed_at_ms),
+            "cooldown_until_ms": str(until_ms),
+            "pullback_seen": False,
+            "net_pnl": str(net_pnl),
+        }
+        logger.info(
+            "[%s] Post-profit same-direction guard active for %s until %s.",
+            pair,
+            direction.value,
+            datetime.fromtimestamp(until_ms / 1000, timezone.utc).isoformat(),
+        )
+
+    def _post_profit_reentry_block(
+        self,
+        signal: StrategySignal,
+        candle: OHLCVCandle,
+    ) -> tuple[str, dict[str, Any]] | None:
+        if not self._risk_bool("post_profit_reentry_guard_enabled", False):
+            return None
+        if not is_entry_signal(signal) or signal.direction is None:
+            return None
+        key = (signal.pair, signal.direction.value)
+        until_ms = self._same_direction_profit_cooldown_until_ms.get(key, 0)
+        candle_close_ms = _int_or_zero(getattr(candle, "close_time_ms", 0))
+        if candle_close_ms < until_ms:
+            return (
+                "post_profit_reentry_cooldown",
+                {
+                    "cooldown_until_ms": until_ms,
+                    "direction": signal.direction.value,
+                },
+            )
+
+        state = self._post_profit_reentry_state.get(signal.pair)
+        if not state or state.get("direction") != signal.direction.value:
+            return None
+        if bool(state.get("pullback_seen")):
+            return None
+
+        exit_price = _decimal_or_default(state.get("exit_price"), Decimal("0"))
+        if exit_price <= 0:
+            return None
+        indicators = latest_indicator_snapshot(self.series_by_pair.get(signal.pair, CandleSeries(maxlen=1)))
+        atr = indicators.atr if indicators else None
+        if post_profit_pullback_seen(
+            direction=signal.direction,
+            exit_price=exit_price,
+            candle_high=candle.high,
+            candle_low=candle.low,
+            atr=atr,
+            pullback_atr=self._risk_decimal("post_profit_reentry_pullback_atr", Decimal("0.75")),
+            pullback_pct=self._risk_decimal("post_profit_reentry_pullback_pct", Decimal("1.0")),
+        ):
+            state["pullback_seen"] = True
+            self._post_profit_reentry_state[signal.pair] = state
+            return None
+
+        return (
+            "post_profit_pullback_required",
+            {
+                "direction": signal.direction.value,
+                "last_profit_exit_price": str(exit_price),
+                "pullback_atr": str(self._risk_decimal("post_profit_reentry_pullback_atr", Decimal("0.75"))),
+                "pullback_pct": str(self._risk_decimal("post_profit_reentry_pullback_pct", Decimal("1.0"))),
+            },
+        )
+
     def _reconcile_daily_loss(self) -> None:
         from datetime import timedelta
         now = datetime.now(timezone.utc)
@@ -1604,9 +1752,17 @@ class LiveTradingLoop:
                   exit_price,
              )
              
+             net_pnl = raw_pnl - simulated_fee
              self.alert.alert(f"DRY-RUN STOP LOSS HIT for {candle.pair} @ {exit_price}")
-             self._update_accounting_balances(raw_pnl - simulated_fee)
-             
+             self._update_accounting_balances(net_pnl)
+             self._record_post_profit_exit(
+                  pair=candle.pair,
+                  direction=direction,
+                  exit_price=exit_price,
+                  net_pnl=net_pnl,
+                  closed_at_ms=candle.close_time_ms,
+             )
+
              # Point 9: Track stopped out candle to prevent re-entry
              self._stopped_out_candles[candle.pair] = candle.close_time_ms
 
@@ -1925,6 +2081,24 @@ class LiveTradingLoop:
                   self.save_local_state()
                   return
 
+             post_profit_block = self._post_profit_reentry_block(signal, candle)
+             if post_profit_block:
+                  reason, block_metadata = post_profit_block
+                  diagnostic_metadata = {
+                       **signal.metadata,
+                       **block_metadata,
+                       "direction": signal.direction.value if signal.direction else None,
+                  }
+                  self._add_diagnostic({
+                       "action": "rejected",
+                       "reason": reason,
+                       "confidence": str(signal.confidence),
+                       "metadata": diagnostic_metadata,
+                  }, signal.pair, candle)
+                  self._processed_signals.add(signal_key)
+                  self.save_local_state()
+                  return
+
         tradable_equity = Decimal(self.local_state.get("tradable_base", str(self.starting_equity)))
         open_positions = self._get_open_positions()
         existing_required_margin = sum(
@@ -2104,9 +2278,16 @@ class LiveTradingLoop:
                                      exit_price,
                                 )
                                 
+                                net_pnl = raw_pnl - simulated_fee
                                 logger.info("[%s] dry-run closed accounting uses simulated fills: PnL=%.2f, Fee=%.2f", signal.pair, raw_pnl, simulated_fee)
-                                self._update_accounting_balances(raw_pnl - simulated_fee)
-
+                                self._update_accounting_balances(net_pnl)
+                                self._record_post_profit_exit(
+                                     pair=signal.pair,
+                                     direction=normalize_position_direction(pos),
+                                     exit_price=exit_price,
+                                     net_pnl=net_pnl,
+                                     closed_at_ms=candle.close_time_ms,
+                                )
                            self._dry_run_positions.pop(signal.pair, None)
                            self.local_state["positions"].pop(signal.pair, None)
                            self.local_state.get("position_metadata", {}).pop(signal.pair, None)
@@ -2174,46 +2355,47 @@ class LiveTradingLoop:
         current_stop = Decimal(str(pos_data.get("stop_loss_trigger") or initial_stop))
         new_stop = current_stop
         
-        # 1. R-Based Tightening (Phase 5)
-        if direction == SignalDirection.LONG:
-            if max_r >= Decimal("0.8") and current_stop < entry_price:
-                 new_stop = entry_price + (r_val * Decimal("0.05"))
-            if max_r >= Decimal("1.2"):
-                 target_lock = entry_price + (r_val * Decimal("0.25"))
-                 new_stop = max(new_stop, target_lock)
-            if max_r >= Decimal("1.8"):
-                 target_lock = entry_price + (r_val * Decimal("0.75"))
-                 new_stop = max(new_stop, target_lock)
-            if max_r >= Decimal("3.0"):
-                 target_lock = entry_price + (r_val * Decimal("2.0"))
-                 new_stop = max(new_stop, target_lock)
-        else:
-            if max_r >= Decimal("0.8") and current_stop > entry_price:
-                 new_stop = entry_price - (r_val * Decimal("0.05"))
-            if max_r >= Decimal("1.2"):
-                 target_lock = entry_price - (r_val * Decimal("0.25"))
-                 new_stop = min(new_stop, target_lock)
-            if max_r >= Decimal("1.8"):
-                 target_lock = entry_price - (r_val * Decimal("0.75"))
-                 new_stop = min(new_stop, target_lock)
-            if max_r >= Decimal("3.0"):
-                 target_lock = entry_price - (r_val * Decimal("2.0"))
-                 new_stop = min(new_stop, target_lock)
-
-        # 2. ATR Trailing (after 2.0R)
-        if max_r >= Decimal("2.0"):
-             # Get ATR from latest snapshot
+        # 1. Profit giveback guard: protect a configurable fraction of best R seen.
+        giveback = compute_profit_giveback_stop(
+             entry_price=entry_price,
+             initial_r=r_val,
+             direction=direction,
+             current_stop=current_stop,
+             current_price=current_price,
+             favorable_price=favorable_price,
+             previous_max_r=max_r,
+             activation_r=self._risk_decimal("profit_giveback_activation_r", Decimal("1.0")),
+             lock_fraction=self._risk_decimal("profit_giveback_lock_fraction", Decimal("0.50")),
+             min_lock_r=self._risk_decimal("profit_giveback_min_lock_r", Decimal("0.25")),
+             tighten_after_r=self._risk_decimal("profit_giveback_tighten_after_r", Decimal("3.0")),
+             tighten_fraction=self._risk_decimal("profit_giveback_tighten_fraction", Decimal("0.70")),
+        )
+        max_r = giveback.max_r
+        meta["current_r"] = str(giveback.current_r)
+        meta["favorable_r"] = str(giveback.favorable_r)
+        meta["max_r_hit"] = str(giveback.max_r)
+        meta["profit_giveback_active"] = str(self._risk_bool("profit_giveback_guard_enabled", False) and giveback.active).lower()
+        meta["profit_giveback_stop"] = str(giveback.stop) if giveback.stop is not None else None
+        meta["profit_giveback_lock_r"] = str(giveback.lock_r)
+        meta["profit_giveback_max_r_hit"] = str(giveback.max_r)
+        if self._risk_bool("profit_giveback_guard_enabled", False) and giveback.active and giveback.stop is not None:
+             if direction == SignalDirection.LONG:
+                  new_stop = max(new_stop, giveback.stop)
+             else:
+                  new_stop = min(new_stop, giveback.stop)
+        # 2. ATR trailing can add extra protection after the configured R threshold.
+        atr_trail_activation_r = self._risk_decimal("atr_trail_activation_r", Decimal("2.0"))
+        if max_r >= atr_trail_activation_r:
              indicators = latest_indicator_snapshot(self.series_by_pair[candle.pair])
              atr = indicators.atr or Decimal("0")
              if atr > 0:
-                  trail_dist = atr * self.settings.risk.atr_trailing_multiple
+                  trail_dist = atr * self._risk_decimal("atr_trailing_multiple", Decimal("1.2"))
                   if direction == SignalDirection.LONG:
                        atr_stop = peak_price - trail_dist
                        new_stop = max(new_stop, atr_stop)
                   else:
                        atr_stop = peak_price + trail_dist
                        new_stop = min(new_stop, atr_stop)
-
         # 3. Keep a late-arriving spike update executable relative to current price.
         instrument = self._instruments.get(candle.pair)
         tick_buffer = (
@@ -2292,18 +2474,20 @@ class LiveTradingLoop:
         config: dict[str, Any] = {}
         
         # Determine leverage for ROE -> Price % conversion
-        leverage = self._pair_leverage.get(pair, Decimal("1"))
+        leverage = getattr(self, "_pair_leverage", {}).get(pair, Decimal("1"))
         if leverage <= 0:
              leverage = Decimal("1")
 
-        if self.take_profit_pct is not None:
+        take_profit_pct = getattr(self, "take_profit_pct", None)
+        if take_profit_pct is not None:
              # Convert ROE % to Price Move %
              # Price % = ROE % / Leverage
-             config["take_profit_pct"] = self.take_profit_pct / leverage
+             config["take_profit_pct"] = take_profit_pct / leverage
              
-        if self.stop_loss_pct is not None:
+        stop_loss_pct = getattr(self, "stop_loss_pct", None)
+        if stop_loss_pct is not None:
              # Convert ROE % to Price Move %
-             config["stop_loss_pct"] = self.stop_loss_pct / leverage
+             config["stop_loss_pct"] = stop_loss_pct / leverage
 
         if enable_momentum_ignition:
              parent = self.series_by_pair[pair].latest()

@@ -23,6 +23,7 @@ from app.fees import effective_fee_rate
 from app.persistence.paper_state import PaperStateStore
 from app.risk.limits import is_entry_signal, is_exit_signal
 from app.risk.models import RiskDecision
+from app.risk.profit_protection import compute_profit_giveback_stop
 from app.strategies.base import SignalAction, SignalDirection, StrategySignal
 from app.strategies.bollinger_trail_policy import update_bb_trail
 from app.utils.time import utc_timestamp_ms
@@ -359,6 +360,12 @@ class PaperBroker:
         profit_lock_enabled: bool = False,
         profit_lock_activation_r: Decimal = Decimal("1.5"),
         profit_lock_r: Decimal = Decimal("0.5"),
+        profit_giveback_guard_enabled: bool = False,
+        profit_giveback_activation_r: Decimal = Decimal("1.0"),
+        profit_giveback_lock_fraction: Decimal = Decimal("0.50"),
+        profit_giveback_min_lock_r: Decimal = Decimal("0.25"),
+        profit_giveback_tighten_after_r: Decimal = Decimal("3.0"),
+        profit_giveback_tighten_fraction: Decimal = Decimal("0.70"),
         atr_trail_after_r_enabled: bool = False,
         atr_trail_activation_r: Decimal = Decimal("2.0"),
         bb_band: BollingerBandPoint | None = None,
@@ -383,7 +390,12 @@ class PaperBroker:
             "bb_trail_enabled",
             bb_trail_enabled,
         ):
-            return
+            if not _bool_metadata(
+                position.metadata,
+                "profit_giveback_guard_enabled",
+                profit_giveback_guard_enabled,
+            ):
+                return
         if position.opened_at_ms > candle.close_time_ms:
             return
 
@@ -422,6 +434,36 @@ class PaperBroker:
             position.metadata,
             "profit_lock_activation_r",
             profit_lock_activation_r,
+        )
+        profit_giveback_guard_enabled = _bool_metadata(
+            position.metadata,
+            "profit_giveback_guard_enabled",
+            profit_giveback_guard_enabled,
+        )
+        profit_giveback_activation_r = _decimal_metadata(
+            position.metadata,
+            "profit_giveback_activation_r",
+            profit_giveback_activation_r,
+        )
+        profit_giveback_lock_fraction = _decimal_metadata(
+            position.metadata,
+            "profit_giveback_lock_fraction",
+            profit_giveback_lock_fraction,
+        )
+        profit_giveback_min_lock_r = _decimal_metadata(
+            position.metadata,
+            "profit_giveback_min_lock_r",
+            profit_giveback_min_lock_r,
+        )
+        profit_giveback_tighten_after_r = _decimal_metadata(
+            position.metadata,
+            "profit_giveback_tighten_after_r",
+            profit_giveback_tighten_after_r,
+        )
+        profit_giveback_tighten_fraction = _decimal_metadata(
+            position.metadata,
+            "profit_giveback_tighten_fraction",
+            profit_giveback_tighten_fraction,
         )
         profit_lock_r = _decimal_metadata(
             position.metadata,
@@ -482,6 +524,7 @@ class PaperBroker:
             and not take_profit_enabled
             and not breakeven_enabled
             and not profit_lock_enabled
+            and not profit_giveback_guard_enabled
             and not bb_trail_enabled
         ):
             return
@@ -516,6 +559,7 @@ class PaperBroker:
             and not take_profit_enabled
             and not breakeven_enabled
             and not profit_lock_enabled
+            and not profit_giveback_guard_enabled
             and not bb_trail_enabled
         ):
             return
@@ -605,6 +649,58 @@ class PaperBroker:
                     management_stop = candidate
                     stop_type = "profit_lock"
 
+        profit_giveback_metadata: dict[str, object] = {
+            "profit_giveback_guard_enabled": profit_giveback_guard_enabled,
+            "profit_giveback_active": False,
+            "profit_giveback_stop": None,
+            "profit_giveback_lock_r": Decimal("0"),
+            "profit_giveback_max_r_hit": _decimal_metadata(
+                position.metadata,
+                "profit_giveback_max_r_hit",
+                _decimal_metadata(position.metadata, "max_r_hit", Decimal("0")),
+            ),
+            "profit_giveback_current_r": current_r,
+            "profit_giveback_favorable_r": current_r,
+        }
+        if profit_giveback_guard_enabled and r_unit is not None and r_unit > 0:
+            favorable_price = candle.high if position.direction == SignalDirection.LONG else candle.low
+            giveback = compute_profit_giveback_stop(
+                entry_price=position.entry_price,
+                initial_r=r_unit,
+                direction=position.direction,
+                current_stop=management_stop,
+                current_price=candle.close,
+                favorable_price=favorable_price,
+                previous_max_r=_decimal_metadata(
+                    position.metadata,
+                    "profit_giveback_max_r_hit",
+                    _decimal_metadata(position.metadata, "max_r_hit", Decimal("0")),
+                ),
+                activation_r=profit_giveback_activation_r,
+                lock_fraction=profit_giveback_lock_fraction,
+                min_lock_r=profit_giveback_min_lock_r,
+                tighten_after_r=profit_giveback_tighten_after_r,
+                tighten_fraction=profit_giveback_tighten_fraction,
+            )
+            profit_giveback_metadata.update(
+                {
+                    "profit_giveback_active": giveback.active,
+                    "profit_giveback_stop": giveback.stop,
+                    "profit_giveback_lock_r": giveback.lock_r,
+                    "profit_giveback_max_r_hit": giveback.max_r,
+                    "profit_giveback_current_r": giveback.current_r,
+                    "profit_giveback_favorable_r": giveback.favorable_r,
+                    "max_r_hit": giveback.max_r,
+                }
+            )
+            if giveback.active and giveback.stop is not None:
+                if position.direction == SignalDirection.LONG:
+                    if management_stop is None or giveback.stop > management_stop:
+                        management_stop = giveback.stop
+                        stop_type = "profit_giveback"
+                elif management_stop is None or giveback.stop < management_stop:
+                    management_stop = giveback.stop
+                    stop_type = "profit_giveback"
         # ATR Trail after R activation
         actual_trailing_enabled = trailing_enabled
         if atr_trail_after_r_enabled:
@@ -726,7 +822,7 @@ class PaperBroker:
             else (
                 position.metadata.get("stop_type")
                 if stop_candidate == position.stop_loss
-                and position.metadata.get("stop_type") in {"breakeven", "profit_lock"}
+                and position.metadata.get("stop_type") in {"breakeven", "profit_lock", "profit_giveback"}
                 else "atr"
             )
         )
@@ -766,6 +862,7 @@ class PaperBroker:
                         "profit_lock_enabled": profit_lock_enabled,
                         "bb_trail_enabled": bb_trail_enabled,
                         "bb_trail_active": bool(bb_metadata.get("bb_trail_active", False)),
+                        "profit_giveback_active": bool(profit_giveback_metadata.get("profit_giveback_active", False)),
                     },
                 )
             ),
@@ -777,6 +874,7 @@ class PaperBroker:
             + 1,
             "stop_type": resolved_stop_type,
         }
+        metadata.update(profit_giveback_metadata)
         metadata.update(bb_metadata)
         metadata["stop_type"] = resolved_stop_type
         if bb_partial_enabled:
@@ -2522,6 +2620,8 @@ def _trailing_priority_enabled(position: PaperPosition) -> bool:
         return False
     if _bool_metadata(position.metadata, "profit_lock_enabled", False):
         return True
+    if _bool_metadata(position.metadata, "profit_giveback_active", False):
+        return True
     if _bool_metadata(position.metadata, "bb_trail_active", False):
         return True
     if (
@@ -2545,6 +2645,7 @@ def _dynamic_atr_exits_enabled(position: PaperPosition) -> bool:
             "atr_trailing_enabled",
             "breakeven_enabled",
             "profit_lock_enabled",
+            "profit_giveback_guard_enabled",
             "bb_trail_enabled",
         )
     )
@@ -2604,6 +2705,14 @@ def _exit_trigger(
         "bb_buffer_atr": position.metadata.get("bb_buffer_atr"),
         "bb_entry_band_position": position.metadata.get("bb_entry_band_position"),
         "bb_entry_gate_passed": position.metadata.get("bb_entry_gate_passed"),
+        "profit_giveback_guard_enabled": position.metadata.get("profit_giveback_guard_enabled"),
+        "profit_giveback_active": position.metadata.get("profit_giveback_active"),
+        "profit_giveback_stop": position.metadata.get("profit_giveback_stop"),
+        "profit_giveback_lock_r": position.metadata.get("profit_giveback_lock_r"),
+        "profit_giveback_max_r_hit": position.metadata.get("profit_giveback_max_r_hit"),
+        "profit_giveback_current_r": position.metadata.get("profit_giveback_current_r"),
+        "profit_giveback_favorable_r": position.metadata.get("profit_giveback_favorable_r"),
+        "max_r_hit": position.metadata.get("max_r_hit"),
     }
     if extra_metadata:
         metadata.update(extra_metadata)
@@ -2651,6 +2760,14 @@ def _exit_fill_metadata(signal: StrategySignal) -> dict[str, object]:
         "bb_buffer_atr",
         "bb_entry_band_position",
         "bb_entry_gate_passed",
+        "profit_giveback_guard_enabled",
+        "profit_giveback_active",
+        "profit_giveback_stop",
+        "profit_giveback_lock_r",
+        "profit_giveback_max_r_hit",
+        "profit_giveback_current_r",
+        "profit_giveback_favorable_r",
+        "max_r_hit",
         "partial_close",
         "partial_close_pct",
         "partial_close_message",
@@ -2808,18 +2925,22 @@ def _decimal_metadata(
         return default
 
 
+
 def _stop_reason(position: PaperPosition) -> str:
     # Exit priority (highest to lowest):
     # 1. hard stop loss (initial protective stop)
     # 2. profit lock stop
     # 3. bb_trail - Bollinger Band hybrid trail (when bb_trail_active=True)
-    # 4. ATR dynamic trail
-    # 5. normal trailing stop (pct-based)
-    # 6. strategy invalidation
-    # 7. take profit (or partial close if bb_trail_partial_close_at_tp=True)
+    # 4. profit_giveback - protects a fraction of max R after activation
+    # 5. ATR dynamic trail
+    # 6. normal trailing stop (pct-based)
+    # 7. strategy invalidation
+    # 8. take profit (or partial close if bb_trail_partial_close_at_tp=True)
     stop_type = str(position.metadata.get("stop_type", "")).strip().lower()
     if stop_type == "bb_trail":
         return "Bollinger Band hybrid trail stop triggered."
+    if stop_type == "profit_giveback":
+        return "Profit giveback guard stop triggered."
     if position.metadata.get("atr_dynamic_exit_active") and position.metadata.get("atr_stop_enabled"):
         if stop_type == "breakeven":
             return "Breakeven stop triggered."
@@ -2841,6 +2962,8 @@ def _gap_stop_reason(position: PaperPosition) -> str:
     stop_type = str(position.metadata.get("stop_type", "")).strip().lower()
     if stop_type == "bb_trail":
         return "Bollinger Band hybrid trail stop gapped through; filled at candle open."
+    if stop_type == "profit_giveback":
+        return "Profit giveback guard stop gapped through; filled at candle open."
     if position.metadata.get("atr_dynamic_exit_active") and position.metadata.get("atr_stop_enabled"):
         if stop_type == "breakeven":
             return "Breakeven stop gapped through; filled at candle open."

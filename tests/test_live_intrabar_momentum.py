@@ -148,6 +148,9 @@ class LiveIntrabarMomentumTests(unittest.TestCase):
         loop.local_state = {"positions": {}}
         loop._pending_entry_pairs = set()
         loop._stopped_out_candles = {}
+        loop.settings = SimpleNamespace(
+            risk=SimpleNamespace(reentry_cooldown_candles=0)
+        )
         loop._strategy_features = MagicMock(return_value={})
         loop._handle_signal = MagicMock()
         loop._add_diagnostic = MagicMock()
@@ -178,6 +181,9 @@ class LiveIntrabarMomentumTests(unittest.TestCase):
         loop.local_state = {"positions": {}}
         loop._pending_entry_pairs = set()
         loop._stopped_out_candles = {}
+        loop.settings = SimpleNamespace(
+            risk=SimpleNamespace(reentry_cooldown_candles=0)
+        )
         loop._strategy_features = MagicMock(return_value={})
         loop._handle_signal = MagicMock()
         loop._add_diagnostic = MagicMock()
@@ -238,6 +244,82 @@ class LiveIntrabarMomentumTests(unittest.TestCase):
             "3",
         )
 
+    def test_profitable_exit_blocks_same_direction_reentry_until_cooldown(self) -> None:
+        loop = self._post_profit_guard_loop()
+        loop._record_post_profit_exit(
+            pair=PAIR,
+            direction=SignalDirection.LONG,
+            exit_price=Decimal("100"),
+            net_pnl=Decimal("50"),
+            closed_at_ms=1_000,
+        )
+
+        block = loop._post_profit_reentry_block(
+            _momentum_signal(direction=SignalDirection.LONG),
+            _candle(close_time_ms=300_000, high="101", low="99.5", close="100"),
+        )
+
+        self.assertIsNotNone(block)
+        self.assertEqual(block[0], "post_profit_reentry_cooldown")
+
+    def test_profitable_exit_does_not_block_opposite_direction(self) -> None:
+        loop = self._post_profit_guard_loop()
+        loop._record_post_profit_exit(
+            pair=PAIR,
+            direction=SignalDirection.LONG,
+            exit_price=Decimal("100"),
+            net_pnl=Decimal("50"),
+            closed_at_ms=1_000,
+        )
+
+        block = loop._post_profit_reentry_block(
+            _momentum_signal(direction=SignalDirection.SHORT),
+            _candle(close_time_ms=300_000, high="101", low="99.5", close="100"),
+        )
+
+        self.assertIsNone(block)
+
+    def test_same_direction_requires_pullback_after_post_profit_cooldown(self) -> None:
+        loop = self._post_profit_guard_loop()
+        loop._record_post_profit_exit(
+            pair=PAIR,
+            direction=SignalDirection.LONG,
+            exit_price=Decimal("100"),
+            net_pnl=Decimal("50"),
+            closed_at_ms=1_000,
+        )
+
+        block = loop._post_profit_reentry_block(
+            _momentum_signal(direction=SignalDirection.LONG),
+            _candle(close_time_ms=700_000, high="101", low="99.5", close="100"),
+        )
+        self.assertIsNotNone(block)
+        self.assertEqual(block[0], "post_profit_pullback_required")
+
+        allowed = loop._post_profit_reentry_block(
+            _momentum_signal(direction=SignalDirection.LONG),
+            _candle(close_time_ms=800_000, high="101", low="98.9", close="99"),
+        )
+        self.assertIsNone(allowed)
+        self.assertTrue(loop._post_profit_reentry_state[PAIR]["pullback_seen"])
+
+    @staticmethod
+    def _post_profit_guard_loop() -> LiveTradingLoop:
+        loop = object.__new__(LiveTradingLoop)
+        loop.interval = "1h"
+        loop.execution_interval = "5m"
+        loop.settings = SimpleNamespace(
+            risk=SimpleNamespace(
+                post_profit_reentry_guard_enabled=True,
+                post_profit_reentry_cooldown_candles=2,
+                post_profit_reentry_pullback_atr=Decimal("0"),
+                post_profit_reentry_pullback_pct=Decimal("1"),
+            )
+        )
+        loop._same_direction_profit_cooldown_until_ms = {}
+        loop._post_profit_reentry_state = {}
+        loop.series_by_pair = {PAIR: _parent_series()}
+        return loop
     @staticmethod
     def _profit_protection_loop(*, active_pos: str, stop: str) -> LiveTradingLoop:
         loop = object.__new__(LiveTradingLoop)

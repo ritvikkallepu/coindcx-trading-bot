@@ -26,6 +26,7 @@ from app.risk.models import OpenPosition, RiskDecision
 from app.risk.limits import is_entry_signal, is_exit_signal
 from app.risk.pair_profiles import apply_pair_profile_to_config, pair_profile_for
 from app.risk.pair_performance import pair_recent_risk_profile
+from app.risk.profit_protection import post_profit_pullback_seen
 from app.strategies.base import StrategyEngine, StrategyContext, SignalAction, SignalDirection, StrategySignal
 from app.strategies.defaults import STRATEGY_CHOICES, strategy_engine_for_name
 from app.utils.json import to_jsonable
@@ -97,6 +98,8 @@ def _paper_exit_reason(fill: PaperFill) -> str:
             return "breakeven_stop"
         if stop_type == "profit_lock" or "profit lock" in detail_l:
             return "profit_lock_stop"
+        if stop_type == "profit_giveback" or "profit giveback" in detail_l:
+            return "profit_giveback_stop"
         if (
             stop_type == "atr"
             or (
@@ -318,6 +321,7 @@ class PaperTradingLoop:
         self._pair_cooldown_until_ms: dict[str, int] = {}
         self._same_direction_cooldown_until_ms: dict[tuple[str, str], int] = {}
         self._same_direction_reversal_cooldown_until_ms: dict[tuple[str, str], int] = {}
+        self._post_profit_reentry_state: dict[str, dict[str, Any]] = {}
         self._pair_recent_net_pnls: dict[str, list[Decimal]] = {}
         self._pair_overrides: dict[str, dict[str, Any]] = {}
         self._global_loss_cooldown_until_ms: int = 0
@@ -1175,6 +1179,14 @@ class PaperTradingLoop:
                         restored_reversal[(pair, direction)] = int(value)
                 self._same_direction_reversal_cooldown_until_ms = restored_reversal
 
+            raw_post_profit_reentry = saved.get("post_profit_reentry_state")
+            if isinstance(raw_post_profit_reentry, dict):
+                self._post_profit_reentry_state = {
+                    str(pair): dict(state)
+                    for pair, state in raw_post_profit_reentry.items()
+                    if isinstance(state, dict)
+                }
+
             raw_pair_pnls = saved.get("pair_recent_net_pnls")
             if isinstance(raw_pair_pnls, dict):
                 restored_pnls: dict[str, list[Decimal]] = {}
@@ -1228,6 +1240,7 @@ class PaperTradingLoop:
                 f"{pair}|{direction}": value
                 for (pair, direction), value in self._same_direction_reversal_cooldown_until_ms.items()
             },
+            "post_profit_reentry_state": self._post_profit_reentry_state,
             "pair_recent_net_pnls": {
                 pair: [str(value) for value in values]
                 for pair, values in self._pair_recent_net_pnls.items()
@@ -1523,6 +1536,7 @@ class PaperTradingLoop:
             "atr_take_profit_enabled": pair_risk.atr_take_profit_enabled,
             "atr_trailing_enabled": pair_risk.atr_trailing_enabled,
             "profit_lock_enabled": pair_risk.profit_lock_enabled,
+            "profit_giveback_guard_enabled": pair_risk.profit_giveback_guard_enabled,
             "bb_trail_enabled": pair_risk.bb_trail_enabled,
             "bb_trail_observe_only": pair_risk.bb_trail_observe_only,
         }
@@ -2421,6 +2435,12 @@ class PaperTradingLoop:
             profit_lock_enabled=pair_risk.profit_lock_enabled,
             profit_lock_activation_r=pair_risk.profit_lock_activation_r,
             profit_lock_r=pair_risk.profit_lock_r,
+            profit_giveback_guard_enabled=pair_risk.profit_giveback_guard_enabled,
+            profit_giveback_activation_r=pair_risk.profit_giveback_activation_r,
+            profit_giveback_lock_fraction=pair_risk.profit_giveback_lock_fraction,
+            profit_giveback_min_lock_r=pair_risk.profit_giveback_min_lock_r,
+            profit_giveback_tighten_after_r=pair_risk.profit_giveback_tighten_after_r,
+            profit_giveback_tighten_fraction=pair_risk.profit_giveback_tighten_fraction,
             atr_trail_after_r_enabled=pair_risk.atr_trail_after_r_enabled,
             atr_trail_activation_r=pair_risk.atr_trail_activation_r,
             bb_band=bb_band,
@@ -2738,6 +2758,41 @@ class PaperTradingLoop:
                 if _paper_reentry_override(signal, strict=False):
                     return None
                 return "paper_same_direction_cooldown"
+            post_profit_state = self._post_profit_reentry_state.get(signal.pair)
+            if (
+                self.settings.risk.post_profit_reentry_guard_enabled
+                and post_profit_state
+                and post_profit_state.get("direction") == signal.direction.value
+            ):
+                cooldown_until_ms = int(post_profit_state.get("cooldown_until_ms") or 0)
+                if candle.close_time_ms < cooldown_until_ms:
+                    return "paper_post_profit_reentry_cooldown"
+                if not _bool_metadata(post_profit_state.get("pullback_seen"), False):
+                    exit_price = _decimal_metadata(
+                        post_profit_state.get("exit_price"),
+                        Decimal("0"),
+                    )
+                    strategy_series = self.series.get(signal.pair)
+                    atr = (
+                        latest_indicator_snapshot(strategy_series).atr
+                        if strategy_series is not None
+                        else None
+                    )
+                    if exit_price > 0 and post_profit_pullback_seen(
+                        direction=signal.direction,
+                        exit_price=exit_price,
+                        candle_high=candle.high,
+                        candle_low=candle.low,
+                        atr=atr,
+                        pullback_atr=self.settings.risk.post_profit_reentry_pullback_atr,
+                        pullback_pct=self.settings.risk.post_profit_reentry_pullback_pct,
+                    ):
+                        self._post_profit_reentry_state[signal.pair] = {
+                            **post_profit_state,
+                            "pullback_seen": True,
+                        }
+                    else:
+                        return "paper_post_profit_pullback_required"
         return None
 
     def _apply_paper_loss_throttle(self, signal: Any) -> Any:
@@ -2836,7 +2891,38 @@ class PaperTradingLoop:
             if direction is None:
                 return
             key = (fill.pair, direction.value)
-            if _paper_stop_style_exit(exit_reason):
+            if self.settings.risk.post_profit_reentry_guard_enabled:
+                cooldown_candles = max(
+                    self.settings.risk.post_profit_reentry_cooldown_candles,
+                    0,
+                )
+                cooldown_until_ms = (
+                    candle.close_time_ms + (cooldown_candles * interval_ms)
+                )
+                self._same_direction_cooldown_until_ms[key] = max(
+                    self._same_direction_cooldown_until_ms.get(key, 0),
+                    cooldown_until_ms,
+                )
+                if _paper_stop_style_exit(exit_reason):
+                    self._same_direction_reversal_cooldown_until_ms[key] = max(
+                        self._same_direction_reversal_cooldown_until_ms.get(key, 0),
+                        cooldown_until_ms,
+                    )
+                self._post_profit_reentry_state[fill.pair] = {
+                    "direction": direction.value,
+                    "exit_price": str(fill.price),
+                    "closed_at_ms": str(candle.close_time_ms),
+                    "cooldown_until_ms": str(cooldown_until_ms),
+                    "pullback_seen": False,
+                    "net_pnl": str(net_pnl),
+                }
+                self.logger.info(
+                    "[%s] Paper safety: post-profit %s guard active for %d execution candles.",
+                    fill.pair,
+                    direction.value,
+                    cooldown_candles,
+                )
+            elif _paper_stop_style_exit(exit_reason):
                 self._same_direction_reversal_cooldown_until_ms[key] = max(
                     self._same_direction_reversal_cooldown_until_ms.get(key, 0),
                     candle.close_time_ms + (12 * interval_ms),
@@ -2969,6 +3055,12 @@ class PaperTradingLoop:
                 "atr_take_profit_enabled": pair_risk.atr_take_profit_enabled,
                 "atr_trailing_enabled": pair_risk.atr_trailing_enabled,
                 "profit_lock_enabled": pair_risk.profit_lock_enabled,
+                "profit_giveback_guard_enabled": pair_risk.profit_giveback_guard_enabled,
+                "profit_giveback_activation_r": pair_risk.profit_giveback_activation_r,
+                "profit_giveback_lock_fraction": pair_risk.profit_giveback_lock_fraction,
+                "profit_giveback_min_lock_r": pair_risk.profit_giveback_min_lock_r,
+                "profit_giveback_tighten_after_r": pair_risk.profit_giveback_tighten_after_r,
+                "profit_giveback_tighten_fraction": pair_risk.profit_giveback_tighten_fraction,
                 "bb_trail_enabled": pair_risk.bb_trail_enabled,
                 "bb_trail_buffer_multiplier": pair_risk.bb_trail_buffer_multiplier,
                 "bb_trail_activation_r": pair_risk.bb_trail_activation_r,

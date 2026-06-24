@@ -152,6 +152,16 @@ class SweepConfig:
     profit_lock_enabled: bool = False
     profit_lock_activation_r: Decimal = Decimal("1.5")
     profit_lock_r: Decimal = Decimal("0.5")
+    profit_giveback_guard_enabled: bool = False
+    profit_giveback_activation_r: Decimal = Decimal("1.0")
+    profit_giveback_lock_fraction: Decimal = Decimal("0.50")
+    profit_giveback_min_lock_r: Decimal = Decimal("0.25")
+    profit_giveback_tighten_after_r: Decimal = Decimal("3.0")
+    profit_giveback_tighten_fraction: Decimal = Decimal("0.70")
+    post_profit_reentry_guard_enabled: bool = False
+    post_profit_reentry_cooldown_candles: int = 12
+    post_profit_reentry_pullback_atr: Decimal = Decimal("0.75")
+    post_profit_reentry_pullback_pct: Decimal = Decimal("1.0")
     atr_trail_after_r_enabled: bool = False
     atr_trail_activation_r: Decimal = Decimal("2.0")
     
@@ -832,6 +842,16 @@ def _run_one(
         profit_lock_enabled=config.profit_lock_enabled,
         profit_lock_activation_r=config.profit_lock_activation_r,
         profit_lock_r=config.profit_lock_r,
+        profit_giveback_guard_enabled=config.profit_giveback_guard_enabled,
+        profit_giveback_activation_r=config.profit_giveback_activation_r,
+        profit_giveback_lock_fraction=config.profit_giveback_lock_fraction,
+        profit_giveback_min_lock_r=config.profit_giveback_min_lock_r,
+        profit_giveback_tighten_after_r=config.profit_giveback_tighten_after_r,
+        profit_giveback_tighten_fraction=config.profit_giveback_tighten_fraction,
+        post_profit_reentry_guard_enabled=config.post_profit_reentry_guard_enabled,
+        post_profit_reentry_cooldown_candles=config.post_profit_reentry_cooldown_candles,
+        post_profit_reentry_pullback_atr=config.post_profit_reentry_pullback_atr,
+        post_profit_reentry_pullback_pct=config.post_profit_reentry_pullback_pct,
         atr_trail_after_r_enabled=config.atr_trail_after_r_enabled,
         atr_trail_activation_r=config.atr_trail_activation_r,
         chop_filter_enabled=config.chop_filter_enabled,

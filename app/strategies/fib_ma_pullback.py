@@ -24,7 +24,7 @@ class FibMAPullbackStrategy(Strategy):
     name: str = "fib_ma_pullback"
     fast_period: int = 7
     slow_period: int = 21
-    warmup_lookback: int = 50
+    warmup_lookback: int = 250
     atr_period: int = 14
     volume_period: int = 20
     swing_lookback: int = 80

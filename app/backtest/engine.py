@@ -19,9 +19,10 @@ from app.data.candle_builder import CandleSeries, OHLCVCandle, interval_to_ms
 from app.data.indicators import latest_indicator_snapshot
 from app.data.open_interest import OpenInterestFeatureSeries
 from app.execution.engine import PaperExecutionEngine
-from app.risk.limits import daily_loss_limit_amount
+from app.risk.limits import daily_loss_limit_amount, is_entry_signal
 from app.risk.manager import RiskManager
 from app.risk.pair_profiles import apply_pair_profile_to_config
+from app.risk.profit_protection import post_profit_pullback_seen
 from app.risk.models import InstrumentMetadata, OpenPosition, RiskDecision
 from app.strategies.base import (
     SignalAction,
@@ -71,6 +72,7 @@ class _BacktestSafetyState:
     config: BacktestConfig
     interval_ms: int
     peak_equity: Decimal
+    reentry_interval_ms: int | None = None
     consecutive_losses: int = 0
     recent_trades: list[BacktestTrade] = field(default_factory=list)
     equity_history: list[tuple[int, Decimal]] = field(default_factory=list)
@@ -84,6 +86,10 @@ class _BacktestSafetyState:
     blocked_count_rolling: int = 0
     blocked_count_giveback: int = 0
     blocked_count_post_spike: int = 0
+    post_profit_direction: SignalDirection | None = None
+    post_profit_exit_price: Decimal = Decimal("0")
+    post_profit_cooldown_until_ms: int = 0
+    post_profit_pullback_seen: bool = False
 
     def active(self, timestamp_ms: int) -> bool:
         return timestamp_ms < self.max_cooldown(timestamp_ms)
@@ -188,6 +194,50 @@ class _BacktestSafetyState:
             self.consecutive_losses = 0
             if trade.exit_time_ms >= self.cooldown_until_ms:
                 self.cooldown_until_ms = 0
+            if self.config.post_profit_reentry_guard_enabled:
+                guard_interval_ms = self.reentry_interval_ms or self.interval_ms
+                self.post_profit_direction = trade.direction
+                self.post_profit_exit_price = trade.exit_price
+                self.post_profit_cooldown_until_ms = (
+                    trade.exit_time_ms
+                    + (
+                        self.config.post_profit_reentry_cooldown_candles
+                        * guard_interval_ms
+                    )
+                )
+                self.post_profit_pullback_seen = False
+
+    def post_profit_reentry_reason(
+        self,
+        signal: StrategySignal,
+        *,
+        candle: OHLCVCandle,
+        atr: Decimal | None,
+    ) -> str | None:
+        if not self.config.post_profit_reentry_guard_enabled:
+            return None
+        if not is_entry_signal(signal) or signal.direction is None:
+            return None
+        if signal.direction != self.post_profit_direction:
+            return None
+        if candle.close_time_ms < self.post_profit_cooldown_until_ms:
+            return "post_profit_reentry_cooldown"
+        if self.post_profit_pullback_seen:
+            return None
+        if self.post_profit_exit_price <= 0:
+            return None
+        if post_profit_pullback_seen(
+            direction=signal.direction,
+            exit_price=self.post_profit_exit_price,
+            candle_high=candle.high,
+            candle_low=candle.low,
+            atr=atr,
+            pullback_atr=self.config.post_profit_reentry_pullback_atr,
+            pullback_pct=self.config.post_profit_reentry_pullback_pct,
+        ):
+            self.post_profit_pullback_seen = True
+            return None
+        return "post_profit_pullback_required"
 
     def record_blocked(self, reason: str) -> None:
         if "equity_giveback_guard" in reason:
@@ -266,6 +316,7 @@ class BacktestEngine:
             config=self.config,
             interval_ms=interval_to_ms(self.config.interval),
             peak_equity=self.config.starting_equity,
+            reentry_interval_ms=interval_to_ms(self.config.interval),
         )
 
         for candle in all_candles:
@@ -407,6 +458,12 @@ class BacktestEngine:
                     latest_candle=candle,
                     indicators=indicators,
                     config=self.config,
+                )
+                decision = _apply_post_profit_reentry_guard(
+                    decision,
+                    safety_state=safety_state,
+                    candle=candle,
+                    atr=getattr(indicators, "atr", None),
                 )
                 if _entry_blocked_by_loss_cooldown(
                     decision.signal,
@@ -571,6 +628,7 @@ class BacktestEngine:
             config=self.config,
             interval_ms=interval_to_ms(self.config.interval),
             peak_equity=self.config.starting_equity,
+            reentry_interval_ms=interval_to_ms(execution_interval),
         )
 
         child_by_parent = _execution_candles_by_parent(all_candles, execution_list)
@@ -753,6 +811,12 @@ class BacktestEngine:
                             indicators=indicators,
                             config=self.config,
                         )
+                        decision = _apply_post_profit_reentry_guard(
+                            decision,
+                            safety_state=safety_state,
+                            candle=child,
+                            atr=getattr(indicators, "atr", None),
+                        )
                         if decision.approved:
                             report = execution.process_decision(
                                 decision,
@@ -821,6 +885,15 @@ class BacktestEngine:
                             atr_period=self.config.atr_period,
                         ),
                         config=self.config,
+                    )
+                    decision = _apply_post_profit_reentry_guard(
+                        decision,
+                        safety_state=safety_state,
+                        candle=child,
+                        atr=latest_indicator_snapshot(
+                            series,
+                            atr_period=self.config.atr_period,
+                        ).atr,
                     )
                     if _entry_blocked_by_loss_cooldown(
                         decision.signal,
@@ -927,6 +1000,12 @@ class BacktestEngine:
                         indicators=indicators,
                         config=self.config,
                     )
+                    decision = _apply_post_profit_reentry_guard(
+                        decision,
+                        safety_state=safety_state,
+                        candle=parent_candle,
+                        atr=getattr(indicators, "atr", None),
+                    )
                     if _entry_blocked_by_loss_cooldown(
                         decision.signal,
                         safety_state=safety_state,
@@ -1027,6 +1106,36 @@ def _should_defer_decision(decision: RiskDecision) -> bool:
         SignalAction.EXIT_LONG,
         SignalAction.EXIT_SHORT,
     }
+
+
+def _apply_post_profit_reentry_guard(
+    decision: RiskDecision,
+    *,
+    safety_state: _BacktestSafetyState,
+    candle: OHLCVCandle,
+    atr: Decimal | None,
+) -> RiskDecision:
+    if not decision.approved:
+        return decision
+    reason = safety_state.post_profit_reentry_reason(
+        decision.signal,
+        candle=candle,
+        atr=atr,
+    )
+    if reason is None:
+        return decision
+    return RiskDecision(
+        approved=False,
+        reason=reason,
+        signal=replace(
+            decision.signal,
+            metadata={
+                **decision.signal.metadata,
+                "funnel_reason": SignalFunnelReason.COOLDOWN_BLOCKED.value,
+                "post_profit_reentry_blocked": True,
+            },
+        ),
+    )
 
 
 def _entry_blocked_by_loss_cooldown(
@@ -1722,6 +1831,12 @@ def _update_dynamic_exits(
         profit_lock_enabled=config.profit_lock_enabled,
         profit_lock_activation_r=config.profit_lock_activation_r,
         profit_lock_r=config.profit_lock_r,
+        profit_giveback_guard_enabled=config.profit_giveback_guard_enabled,
+        profit_giveback_activation_r=config.profit_giveback_activation_r,
+        profit_giveback_lock_fraction=config.profit_giveback_lock_fraction,
+        profit_giveback_min_lock_r=config.profit_giveback_min_lock_r,
+        profit_giveback_tighten_after_r=config.profit_giveback_tighten_after_r,
+        profit_giveback_tighten_fraction=config.profit_giveback_tighten_fraction,
         atr_trail_after_r_enabled=config.atr_trail_after_r_enabled,
         atr_trail_activation_r=config.atr_trail_activation_r,
         bb_band=getattr(indicators, "bollinger", None),

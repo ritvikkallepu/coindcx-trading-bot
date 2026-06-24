@@ -621,6 +621,7 @@ class PaperBrokerTests(unittest.TestCase):
             atr=Decimal("2"),
             stop_multiple=Decimal("2"),
             take_profit_multiple=Decimal("3"),
+            profit_giveback_guard_enabled=False,
         )
         position = broker.open_positions()[0]
 
@@ -642,6 +643,33 @@ class PaperBrokerTests(unittest.TestCase):
         self.assertEqual(reports[0].reason, "Dynamic ATR stop triggered.")
         self.assertEqual(reports[0].fill.price, Decimal("104"))  # type: ignore[union-attr]
 
+    def test_profit_giveback_guard_tightens_long_stop_from_favorable_high(self) -> None:
+        broker = PaperBroker(starting_equity=Decimal("1000"))
+        engine = PaperExecutionEngine(broker)
+        engine.process_decision(
+            _decision(_entry_signal()),
+            market_price=Decimal("100"),
+            timestamp_ms=10,
+        )
+
+        broker.update_dynamic_atr_exits(
+            _candle(low=Decimal("101"), high=Decimal("110"), close=Decimal("108")),
+            atr=Decimal("2"),
+            stop_multiple=Decimal("2"),
+            take_profit_multiple=Decimal("3"),
+            trailing_enabled=False,
+            take_profit_enabled=False,
+            profit_giveback_guard_enabled=True,
+            profit_giveback_activation_r=Decimal("1"),
+            profit_giveback_lock_fraction=Decimal("0.5"),
+            profit_giveback_tighten_after_r=Decimal("3"),
+        )
+        position = broker.open_positions()[0]
+
+        self.assertEqual(position.stop_loss, Decimal("105.0"))
+        self.assertEqual(position.metadata["stop_type"], "profit_giveback")
+        self.assertTrue(position.metadata["profit_giveback_active"])
+        self.assertEqual(position.metadata["profit_giveback_max_r_hit"], Decimal("2"))
     def test_dynamic_atr_exits_manage_position_missing_dynamic_flag(self) -> None:
         broker = PaperBroker(starting_equity=Decimal("1000"))
         engine = PaperExecutionEngine(broker)
@@ -666,6 +694,7 @@ class PaperBrokerTests(unittest.TestCase):
             stop_multiple=Decimal("2"),
             take_profit_multiple=Decimal("3"),
             trailing_multiple=Decimal("2"),
+            profit_giveback_guard_enabled=False,
         )
         position = broker.open_positions()[0]
 

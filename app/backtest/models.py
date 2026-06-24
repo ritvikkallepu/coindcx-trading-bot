@@ -132,6 +132,16 @@ class BacktestConfig:
     profit_lock_enabled: bool = False
     profit_lock_activation_r: Decimal = Decimal("1.5")
     profit_lock_r: Decimal = Decimal("0.5")
+    profit_giveback_guard_enabled: bool = False
+    profit_giveback_activation_r: Decimal = Decimal("1.0")
+    profit_giveback_lock_fraction: Decimal = Decimal("0.50")
+    profit_giveback_min_lock_r: Decimal = Decimal("0.25")
+    profit_giveback_tighten_after_r: Decimal = Decimal("3.0")
+    profit_giveback_tighten_fraction: Decimal = Decimal("0.70")
+    post_profit_reentry_guard_enabled: bool = False
+    post_profit_reentry_cooldown_candles: int = 12
+    post_profit_reentry_pullback_atr: Decimal = Decimal("0.75")
+    post_profit_reentry_pullback_pct: Decimal = Decimal("1.0")
     atr_trail_after_r_enabled: bool = False
     atr_trail_activation_r: Decimal = Decimal("2.0")
     
@@ -227,6 +237,12 @@ class BacktestConfig:
             raise ValueError("max_consecutive_losses cannot be negative.")
         if self.loss_cooldown_candles < 0:
             raise ValueError("loss_cooldown_candles cannot be negative.")
+        if self.post_profit_reentry_cooldown_candles < 0:
+            raise ValueError("post_profit_reentry_cooldown_candles cannot be negative.")
+        if self.post_profit_reentry_pullback_atr < 0:
+            raise ValueError("post_profit_reentry_pullback_atr cannot be negative.")
+        if self.post_profit_reentry_pullback_pct < 0:
+            raise ValueError("post_profit_reentry_pullback_pct cannot be negative.")
         if self.max_daily_loss_pct <= 0:
             raise ValueError("max_daily_loss_pct must be positive.")
         if self.atr_take_profit_mode not in {

@@ -153,16 +153,16 @@ class LiveReadinessTests(unittest.TestCase):
              mock_handle = MagicMock()
              mock_update.return_value = MagicMock(accepted=True)
              
-             # Current stop 90. Logic wants to move to 102.5.
+             # Current stop 90. Profit giveback wants to protect 0.75R at 107.5.
              loop._apply_profit_protection(MagicMock(close=Decimal("115"), high=Decimal("115"), low=Decimal("114"), pair=loop.pairs[0]))
              mock_update.assert_called()
-             self.assertEqual(mock_update.call_args[1]['stop_loss'], Decimal("102.5"))
+             self.assertEqual(mock_update.call_args[1]['stop_loss'], Decimal("107.5"))
              
              # Now try to loosen it (should be blocked by code safety)
              # If we manually set logic to try to move to 91
              mock_update.reset_mock()
-             loop.local_state["positions"][loop.pairs[0]]["stop_loss_trigger"] = "103"
-             # max_r is still 1.5, so target is 102.5. 102.5 < 103 (loosening for LONG).
+             loop.local_state["positions"][loop.pairs[0]]["stop_loss_trigger"] = "108"
+             # max_r is still 1.5, so target is 107.5. 107.5 < 108 (loosening for LONG).
              loop._apply_profit_protection(MagicMock(close=Decimal("115"), high=Decimal("115"), low=Decimal("114"), pair=loop.pairs[0]))
              mock_update.assert_not_called()
 
