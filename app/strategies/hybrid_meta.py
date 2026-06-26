@@ -47,7 +47,7 @@ class HybridMetaStrategy(Strategy):
     entry_threshold: Decimal = Decimal("0.40")
     exit_threshold: Decimal = Decimal("0.42")
     
-    min_volume_ratio: Decimal = Decimal("0.60")
+    min_volume_ratio: Decimal = Decimal("0.50")
     max_spike_atr_multiple: Decimal = Decimal("3.5")
     
     stop_atr_multiple: Decimal = Decimal("2.0")
@@ -932,7 +932,7 @@ class HybridMetaV2Strategy(HybridMetaStrategy):
     hybrid_bollinger_score_enabled: bool = False
     entry_threshold: Decimal = Decimal("0.45")
     exit_threshold: Decimal = Decimal("0.42")
-    min_volume_ratio: Decimal = Decimal("0.60")
+    min_volume_ratio: Decimal = Decimal("0.50")
     max_spike_atr_multiple: Decimal = Decimal("3.0")
     stop_atr_multiple: Decimal = Decimal("2.0")
     take_profit_atr_multiple: Decimal = Decimal("2.8")

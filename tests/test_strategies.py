@@ -59,6 +59,16 @@ def _context(
 
 
 class StrategyTests(unittest.TestCase):
+    def test_hybrid_visual_volume_thresholds_are_half_average(self) -> None:
+        self.assertEqual(
+            HybridMetaStrategy().min_volume_ratio,
+            Decimal("0.50"),
+        )
+        self.assertEqual(
+            HybridMetaV2Strategy().min_volume_ratio,
+            Decimal("0.50"),
+        )
+
     def test_all_strategy_choice_includes_all_registered_strategies(self) -> None:
         engine = strategy_engine_for_name("all")
         names = {strategy.name for strategy in engine.strategies}
