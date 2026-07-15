@@ -27,3 +27,8 @@ build/
 
 *.zip
 *.tar.gz
+
+# Runtime-generated live trading data
+data/coindcx_inr_futures_pairs_cache.json
+data/live_state.json
+data/live_state/
