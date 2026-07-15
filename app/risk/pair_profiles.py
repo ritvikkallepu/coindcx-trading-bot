@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from app.strategies.entry_quality import (
+    A_SETUP_AGREEMENT_THRESHOLD,
+    B_SETUP_AGREEMENT_THRESHOLD,
+    DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD,
+)
+
 
 MAJOR_LIQUID_BASES = frozenset(
     {
@@ -63,13 +69,13 @@ MAJOR_LIQUID_PROFILE = PairTradingProfile(
     description="Lower relative-volume burst requirements and calmer risk for high-liquidity majors.",
     config_overrides={
         "trade_quality_mode": "tiered",
-        "long_entry_threshold": Decimal("0.34"),
-        "short_entry_threshold": Decimal("0.42"),
-        "short_agreement_threshold": Decimal("0.55"),
+        "long_entry_threshold": DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD,
+        "short_entry_threshold": DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD,
+        "short_agreement_threshold": B_SETUP_AGREEMENT_THRESHOLD,
         "a_setup_score_threshold": Decimal("0.48"),
-        "a_setup_agreement_threshold": Decimal("0.60"),
+        "a_setup_agreement_threshold": A_SETUP_AGREEMENT_THRESHOLD,
         "b_setup_score_threshold": Decimal("0.36"),
-        "b_setup_agreement_threshold": Decimal("0.52"),
+        "b_setup_agreement_threshold": B_SETUP_AGREEMENT_THRESHOLD,
         "b_setup_risk_multiplier": Decimal("0.50"),
         "balanced_breakout_volume_ratio_min": Decimal("1.25"),
         "balanced_breakout_body_ratio_min": Decimal("0.50"),

@@ -29,6 +29,11 @@ from app.risk.pair_performance import pair_recent_risk_profile
 from app.risk.profit_protection import post_profit_pullback_seen
 from app.strategies.base import StrategyEngine, StrategyContext, SignalAction, SignalDirection, StrategySignal
 from app.strategies.defaults import STRATEGY_CHOICES, strategy_engine_for_name
+from app.strategies.entry_quality import (
+    A_SETUP_AGREEMENT_THRESHOLD,
+    B_SETUP_AGREEMENT_THRESHOLD,
+    DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD,
+)
 from app.utils.json import to_jsonable
 from app.live.state import LivePaperState, _update_live_state, get_live_state, reset_live_state
 from app.live.summary_logger import PaperTradingSummaryLogger
@@ -3035,14 +3040,14 @@ class PaperTradingLoop:
                 "trade_quality_mode": "strict",
                 "controlled_shorts_enabled": False,
                 "a_setup_score_threshold": Decimal("0.50"),
-                "a_setup_agreement_threshold": Decimal("0.65"),
+                "a_setup_agreement_threshold": A_SETUP_AGREEMENT_THRESHOLD,
                 "b_setup_score_threshold": Decimal("0.40"),
-                "b_setup_agreement_threshold": Decimal("0.55"),
+                "b_setup_agreement_threshold": B_SETUP_AGREEMENT_THRESHOLD,
                 "b_setup_risk_multiplier": Decimal("0.50"),
                 "minimum_visual_score": Decimal("0"),
-                "long_entry_threshold": Decimal("0.40"),
-                "short_entry_threshold": Decimal("0.55"),
-                "short_agreement_threshold": Decimal("0.60"),
+                "long_entry_threshold": DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD,
+                "short_entry_threshold": DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD,
+                "short_agreement_threshold": B_SETUP_AGREEMENT_THRESHOLD,
                 "trailing_stop_enabled": pair_risk.trailing_stop_enabled,
                 "trailing_stop_activation_pct": pair_risk.trailing_stop_activation_pct,
                 "trailing_stop_distance_pct": pair_risk.trailing_stop_distance_pct,

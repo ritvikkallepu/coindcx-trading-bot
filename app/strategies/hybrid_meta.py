@@ -26,6 +26,14 @@ from app.strategies.base import (
 )
 from app.strategies.atr_policy import ATRPolicyRouter
 from app.strategies.bollinger_entry_gate import evaluate_bb_entry_gate
+from app.strategies.entry_quality import (
+    A_SETUP_AGREEMENT_THRESHOLD,
+    B_SETUP_AGREEMENT_THRESHOLD,
+    DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD,
+    active_hybrid_components,
+    agreement_ratio as calculate_agreement_ratio,
+    directional_trend_confirmation,
+)
 
 @dataclass(frozen=True)
 class HybridMetaStrategy(Strategy):
@@ -130,7 +138,15 @@ class HybridMetaStrategy(Strategy):
         volume_sma = simple_moving_average(volumes, self.volume_period)
 
 
-        if not all([fast[-1], slow[-1], rsi_values[-1], atr_values[-1], bands[-1], volume_sma[-1]]):
+        indicator_values = (
+            fast[-1],
+            slow[-1],
+            rsi_values[-1],
+            atr_values[-1],
+            bands[-1],
+            volume_sma[-1],
+        )
+        if any(value is None for value in indicator_values):
             if len(context.candles) < 20: pass
             else: return self._hold(context, "Waiting for indicators to stabilize.")
 
@@ -174,10 +190,13 @@ class HybridMetaStrategy(Strategy):
         )
 
         quality = _quality_settings(context.features, self.entry_threshold)
-        agreement_scores = (
-            (ema_score, bb_score, visual["score"], oi_score)
-            if bb_score_enabled
-            else (ema_score, visual["score"], oi_score)
+        agreement_scores = active_hybrid_components(
+            ema_score=ema_score,
+            visual_score=visual["score"],
+            bb_score=bb_score,
+            bb_active=bb_score_enabled,
+            oi_score=oi_score,
+            oi_active=bool(oi_metadata["score_used"]),
         )
         long_agreement = _agreement_ratio(SignalDirection.LONG, agreement_scores)
         short_agreement = _agreement_ratio(SignalDirection.SHORT, agreement_scores)
@@ -194,9 +213,13 @@ class HybridMetaStrategy(Strategy):
             "bb_score_used_in_hybrid": bb_score_enabled, "visual_score": visual["score"],
             "open_interest_score": oi_score, "open_interest": oi_metadata,
             "final_score": final_score, "active_weight": active_weight, "visual": visual,
-            "ema_fast": fast[-1], "ema_slow": slow[-1], "rsi": rsi_values[-1],
+            "ema_fast": fast[-1], "ema_slow": slow[-1],
+            "ema_fast_previous": fast[-2] if len(fast) > 1 else None,
+            "ema_slow_previous": slow[-2] if len(slow) > 1 else None,
+            "rsi": rsi_values[-1],
             "bollinger": bands[-1], "atr": atr_val, "average_volume": volume_sma[-1],
             "trade_quality_mode": quality["mode"], "long_agreement_ratio": long_agreement, "short_agreement_ratio": short_agreement,
+            "agreement_component_count": len(agreement_scores),
         }
         pair_profile = context.features.get("pair_profile")
         if isinstance(pair_profile, dict):
@@ -306,6 +329,16 @@ class HybridMetaStrategy(Strategy):
         
         # Mode-based confirmed trend logic
         if final_score >= quality["long_entry_threshold"]:
+            if long_agreement < quality["b_setup_agreement_threshold"]:
+                return self._hold(
+                    context,
+                    f"Long agreement too low: {long_agreement:.2f}",
+                    {
+                        **metadata,
+                        "agreement_ratio": long_agreement,
+                        "funnel_reason": SignalFunnelReason.AGREEMENT_BELOW_MINIMUM,
+                    },
+                )
             is_late, late_reason, funnel_reason = self._check_late_chase(direction=SignalDirection.LONG, execution_candles=exec_candles, extension_atr=extension_atr, config=config)
             if is_late: return self._hold(context, f"Confirmed trend long blocked: {late_reason}", {**metadata, "funnel_reason": funnel_reason})
             
@@ -329,12 +362,22 @@ class HybridMetaStrategy(Strategy):
                     final_score=final_score,
                     atr=atr_val,
                     reason="Hybrid score confirmed long setup.",
-                    metadata={**metadata, "setup_tier": "strict", "agreement_ratio": long_agreement},
+                    metadata={**metadata, "setup_tier": "strict", "agreement_ratio": long_agreement, "entry_type": "confirmed_trend"},
                     bands=bands,
                     config=config,
                 )
 
         if final_score <= -quality["short_entry_threshold"]:
+            if short_agreement < quality["b_setup_agreement_threshold"]:
+                return self._hold(
+                    context,
+                    f"Short agreement too low: {short_agreement:.2f}",
+                    {
+                        **metadata,
+                        "agreement_ratio": short_agreement,
+                        "funnel_reason": SignalFunnelReason.AGREEMENT_BELOW_MINIMUM,
+                    },
+                )
             is_late, late_reason, funnel_reason = self._check_late_chase(direction=SignalDirection.SHORT, execution_candles=exec_candles, extension_atr=extension_atr, config=config)
             if is_late: return self._hold(context, f"Confirmed trend short blocked: {late_reason}", {**metadata, "funnel_reason": funnel_reason})
             
@@ -368,7 +411,7 @@ class HybridMetaStrategy(Strategy):
                     final_score=final_score,
                     atr=atr_val,
                     reason="Hybrid score confirmed short setup.",
-                    metadata={**metadata, "setup_tier": "strict", "agreement_ratio": short_agreement},
+                    metadata={**metadata, "setup_tier": "strict", "agreement_ratio": short_agreement, "entry_type": "confirmed_trend"},
                     bands=bands,
                     config=config,
                 )
@@ -532,7 +575,7 @@ class HybridMetaStrategy(Strategy):
         is_resume = (latest.close > latest.open and latest.close > execution_candles[-2].high and body_ratio >= _decimal_from_metadata(config.get("pullback_resume_body_ratio_min", self.pullback_resume_body_ratio_min), Decimal("0.45"))) if direction == SignalDirection.LONG else (latest.close < latest.open and latest.close < execution_candles[-2].low and body_ratio >= _decimal_from_metadata(config.get("pullback_resume_body_ratio_min", self.pullback_resume_body_ratio_min), Decimal("0.45")))
         if not is_resume: return None
         extension_atr = abs(latest.close - fast_ema) / atr if atr > 0 else Decimal("0")
-        if extension_atr > max_dist * Decimal("50.0"): return None
+        if extension_atr > max_dist: return None
         return {"entry_type": "pullback_continuation", "direction": direction, "candle": latest, "breakout_age": len(execution_candles)-1-breakout_idx, "extension_atr": extension_atr, "risk_multiplier": _decimal_from_metadata(config.get("pullback_risk_multiplier", self.pullback_risk_multiplier), Decimal("0.50"))}
 
     def _check_false_breakout(self, *, direction: SignalDirection, candle: OHLCVCandle, parent_high: Decimal, parent_low: Decimal, volume_ratio: Decimal, extension_atr: Decimal, config: dict[str, Any]) -> tuple[bool, str | None, SignalFunnelReason | None]:
@@ -664,6 +707,45 @@ class HybridMetaStrategy(Strategy):
                     "funnel_reason": SignalFunnelReason.BB_ENTRY_GATE_BLOCKED,
                 },
             )
+
+        entry_type = str(metadata.get("entry_type") or "confirmed_trend")
+        if entry_type in {"confirmed_trend", "pullback_continuation"}:
+            quality = _quality_settings(context.features, self.entry_threshold)
+            direction_agreement = _decimal_from_metadata(
+                metadata.get(
+                    "long_agreement_ratio"
+                    if direction == SignalDirection.LONG
+                    else "short_agreement_ratio"
+                ),
+                Decimal("0"),
+            )
+            if direction_agreement < quality["b_setup_agreement_threshold"]:
+                return self._hold(
+                    context,
+                    f"{direction.value.title()} agreement too low: {direction_agreement:.2f}",
+                    {
+                        **merged_metadata,
+                        "agreement_ratio": direction_agreement,
+                        "funnel_reason": SignalFunnelReason.AGREEMENT_BELOW_MINIMUM,
+                    },
+                )
+            confirmed, confirmation_reason, confirmation_metadata = directional_trend_confirmation(
+                direction=direction,
+                entry_price=latest.close,
+                fast_ema=_optional_decimal(metadata.get("ema_fast")),
+                slow_ema=_optional_decimal(metadata.get("ema_slow")),
+                previous_slow_ema=_optional_decimal(metadata.get("ema_slow_previous")),
+            )
+            merged_metadata.update(confirmation_metadata)
+            if not confirmed:
+                return self._hold(
+                    context,
+                    confirmation_reason,
+                    {
+                        **merged_metadata,
+                        "funnel_reason": SignalFunnelReason.BELOW_ENTRY_THRESHOLD,
+                    },
+                )
 
         return self._entry_signal(
             context=context,
@@ -930,7 +1012,7 @@ class HybridMetaV2Strategy(HybridMetaStrategy):
     bb_weight: Decimal = Decimal("0.20")
     visual_weight: Decimal = Decimal("0.25")
     hybrid_bollinger_score_enabled: bool = False
-    entry_threshold: Decimal = Decimal("0.45")
+    entry_threshold: Decimal = DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD
     exit_threshold: Decimal = Decimal("0.42")
     min_volume_ratio: Decimal = Decimal("0.50")
     max_spike_atr_multiple: Decimal = Decimal("3.0")
@@ -945,14 +1027,14 @@ def _quality_settings(features: dict[str, Any], default_entry_threshold: Decimal
     return {
         "mode": mode,
         "a_setup_score_threshold": _decimal_from_metadata(config.get("a_setup_score_threshold"), Decimal("0.50")),
-        "a_setup_agreement_threshold": _decimal_from_metadata(config.get("a_setup_agreement_threshold"), Decimal("0.65")),
+        "a_setup_agreement_threshold": _decimal_from_metadata(config.get("a_setup_agreement_threshold"), A_SETUP_AGREEMENT_THRESHOLD),
         "b_setup_score_threshold": _decimal_from_metadata(config.get("b_setup_score_threshold"), Decimal("0.40")),
-        "b_setup_agreement_threshold": _decimal_from_metadata(config.get("b_setup_agreement_threshold"), Decimal("0.55")),
+        "b_setup_agreement_threshold": _decimal_from_metadata(config.get("b_setup_agreement_threshold"), B_SETUP_AGREEMENT_THRESHOLD),
         "b_setup_risk_multiplier": _decimal_from_metadata(config.get("b_setup_risk_multiplier"), Decimal("0.50")),
         "minimum_visual_score": _decimal_from_metadata(config.get("minimum_visual_score"), Decimal("0")),
         "long_entry_threshold": _decimal_from_metadata(config.get("long_entry_threshold"), default_entry_threshold),
         "short_entry_threshold": _decimal_from_metadata(config.get("short_entry_threshold"), default_entry_threshold),
-        "short_agreement_threshold": _decimal_from_metadata(config.get("short_agreement_threshold"), Decimal("0.60")),
+        "short_agreement_threshold": _decimal_from_metadata(config.get("short_agreement_threshold"), B_SETUP_AGREEMENT_THRESHOLD),
         "controlled_shorts_enabled": _bool_value(config.get("controlled_shorts_enabled"), False),
     }
 
@@ -996,8 +1078,7 @@ def _short_block_reason(
 
 
 def _agreement_ratio(direction: SignalDirection, scores: tuple[Decimal, ...]) -> Decimal:
-    matching = sum(1 for s in scores if (s > 0 if direction == SignalDirection.LONG else s < 0))
-    return Decimal(matching) / Decimal(len(scores))
+    return calculate_agreement_ratio(direction, scores)
 
 
 def _clamp(value: Decimal, min_val: Decimal, max_val: Decimal) -> Decimal:
@@ -1011,6 +1092,15 @@ def _decimal_from_metadata(value: Any, default: Decimal) -> Decimal:
         return Decimal(str(value))
     except (ValueError, TypeError, InvalidOperation):
         return default
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (ValueError, TypeError, InvalidOperation):
+        return None
 
 
 def _bool_value(value: Any, default: bool) -> bool:

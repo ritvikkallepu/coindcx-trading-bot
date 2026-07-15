@@ -101,8 +101,8 @@ class RiskSettings:
     
     # Short Strictness
     short_strictness_enabled: bool = False
-    short_confidence_bonus: Decimal = Decimal("0.05")
-    short_min_agreement_bonus: Decimal = Decimal("0.05")
+    short_confidence_bonus: Decimal = Decimal("0")
+    short_min_agreement_bonus: Decimal = Decimal("0")
     short_require_trend_confirmation: bool = True
     short_require_price_below_ema: bool = True
     short_require_bearish_structure: bool = False
@@ -323,9 +323,9 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         live_allow_all_pairs_for_real_trading=_bool(
             _get(merged, "LIVE_ALLOW_ALL_PAIRS_FOR_REAL_TRADING", "false")
         ),
-        short_strictness_enabled=_bool(_get(merged, "SHORT_STRICTNESS_ENABLED", "true")),
-        short_confidence_bonus=_decimal(_get(merged, "SHORT_CONFIDENCE_BONUS", "0.05")),
-        short_min_agreement_bonus=_decimal(_get(merged, "SHORT_MIN_AGREEMENT_BONUS", "0.05")),
+        short_strictness_enabled=_bool(_get(merged, "SHORT_STRICTNESS_ENABLED", "false")),
+        short_confidence_bonus=_decimal(_get(merged, "SHORT_CONFIDENCE_BONUS", "0")),
+        short_min_agreement_bonus=_decimal(_get(merged, "SHORT_MIN_AGREEMENT_BONUS", "0")),
         short_require_trend_confirmation=_bool(_get(merged, "SHORT_REQUIRE_TREND_CONFIRMATION", "true")),
         short_require_price_below_ema=_bool(_get(merged, "SHORT_REQUIRE_PRICE_BELOW_EMA", "true")),
         short_require_bearish_structure=_bool(_get(merged, "SHORT_REQUIRE_BEARISH_STRUCTURE", "false")),

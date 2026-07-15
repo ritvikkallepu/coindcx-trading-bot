@@ -32,13 +32,16 @@ from app.strategies.base import (
     StrategyEngine,
     StrategySignal,
 )
+from app.strategies.entry_quality import (
+    active_hybrid_components,
+    agreement_ratio as calculate_agreement_ratio,
+)
 
 
 ENTRY_SAFETY_SPIKE_ATR_MULTIPLE = Decimal("3.5")
 ENTRY_SAFETY_OPPOSITE_BODY_ATR_MULTIPLE = Decimal("0.75")
 ENTRY_SAFETY_EXHAUSTION_LOOKBACK = 4
 ENTRY_SAFETY_EXHAUSTION_ATR_MULTIPLE = Decimal("3")
-ENTRY_SAFETY_COMPONENT_MIN_SCORE = Decimal("0.10")
 ENTRY_SAFETY_COMPONENT_STRONG_OPPOSITE = Decimal("0.55")
 ENTRY_SAFETY_HIGHER_CONTEXT_GROUP = 4
 
@@ -1310,42 +1313,42 @@ def _component_agreement_rejection(
     direction = signal.direction
     if direction is None:
         return None
-    scores = [
-        _decimal_from_metadata(signal.metadata.get(key))
-        for key in (
-            "ema_score",
-            "bb_score",
-            "visual_score",
-            "open_interest_score",
-        )
-    ]
-    scores = [score for score in scores if score is not None]
+    oi_metadata = signal.metadata.get("open_interest")
+    scores = active_hybrid_components(
+        ema_score=_decimal_from_metadata(signal.metadata.get("ema_score")),
+        visual_score=_decimal_from_metadata(signal.metadata.get("visual_score")),
+        bb_score=_decimal_from_metadata(signal.metadata.get("bb_score")),
+        bb_active=bool(signal.metadata.get("bb_score_used_in_hybrid", False)),
+        oi_score=_decimal_from_metadata(signal.metadata.get("open_interest_score")),
+        oi_active=isinstance(oi_metadata, dict) and bool(oi_metadata.get("score_used")),
+    )
     if len(scores) < 2:
         return None
 
     if direction == SignalDirection.LONG:
-        agreeing = sum(1 for score in scores if score >= ENTRY_SAFETY_COMPONENT_MIN_SCORE)
         strongly_opposed = any(
             score <= -ENTRY_SAFETY_COMPONENT_STRONG_OPPOSITE for score in scores
         )
     else:
-        agreeing = sum(1 for score in scores if score <= -ENTRY_SAFETY_COMPONENT_MIN_SCORE)
         strongly_opposed = any(
             score >= ENTRY_SAFETY_COMPONENT_STRONG_OPPOSITE for score in scores
         )
 
-    if config.trade_quality_mode == "tiered":
-        agreement_ratio = _metadata_decimal(
+    metadata_key = (
+        "long_agreement_ratio"
+        if direction == SignalDirection.LONG
+        else "short_agreement_ratio"
+    )
+    ratio = _metadata_decimal(
+        signal.metadata,
+        "agreement_ratio",
+        _metadata_decimal(
             signal.metadata,
-            "agreement_ratio",
-            Decimal(agreeing) / Decimal(len(scores)),
-        )
-        if agreement_ratio < config.b_setup_agreement_threshold:
-            return "Entry safety blocked signal: strategy components do not agree enough."
-        if not strongly_opposed:
-            return None
-
-    if agreeing < 2 or strongly_opposed:
+            metadata_key,
+            calculate_agreement_ratio(direction, scores),
+        ),
+    )
+    if ratio < config.b_setup_agreement_threshold or strongly_opposed:
         return "Entry safety blocked signal: strategy components do not agree enough."
     return None
 

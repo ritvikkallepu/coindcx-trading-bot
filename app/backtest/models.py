@@ -13,6 +13,11 @@ from app.broker.models import (
 )
 from app.risk.models import convert_for_json
 from app.strategies.base import SignalAction, SignalDirection, SignalFunnelReason
+from app.strategies.entry_quality import (
+    A_SETUP_AGREEMENT_THRESHOLD,
+    B_SETUP_AGREEMENT_THRESHOLD,
+    DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD,
+)
 
 
 @dataclass(frozen=True)
@@ -32,14 +37,14 @@ class BacktestConfig:
     trade_quality_mode: str = "strict"
     controlled_shorts_enabled: bool = False
     a_setup_score_threshold: Decimal = Decimal("0.50")
-    a_setup_agreement_threshold: Decimal = Decimal("0.65")
+    a_setup_agreement_threshold: Decimal = A_SETUP_AGREEMENT_THRESHOLD
     b_setup_score_threshold: Decimal = Decimal("0.40")
-    b_setup_agreement_threshold: Decimal = Decimal("0.55")
+    b_setup_agreement_threshold: Decimal = B_SETUP_AGREEMENT_THRESHOLD
     b_setup_risk_multiplier: Decimal = Decimal("0.50")
     minimum_visual_score: Decimal = Decimal("0")
-    long_entry_threshold: Decimal = Decimal("0.40")
-    short_entry_threshold: Decimal = Decimal("0.55")
-    short_agreement_threshold: Decimal = Decimal("0.60")
+    long_entry_threshold: Decimal = DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD
+    short_entry_threshold: Decimal = DEFAULT_DIRECTIONAL_ENTRY_THRESHOLD
+    short_agreement_threshold: Decimal = B_SETUP_AGREEMENT_THRESHOLD
     stop_loss_pct: Decimal | None = None
     take_profit_pct: Decimal | None = None
     maker_fee_rate: Decimal = Decimal("0")

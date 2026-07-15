@@ -62,7 +62,7 @@ class TestBalancedEntries(unittest.TestCase):
         context = StrategyContext(pair="B-SOL_USDT", interval="1h", candles=series,
             indicators=latest_indicator_snapshot(series), features=features)
         signal = self.strategy.evaluate(context)
-        self.assertEqual(signal.action, SignalAction.ENTER_LONG)
+        self.assertEqual(signal.action, SignalAction.ENTER_LONG, signal.reason)
         self.assertEqual(signal.metadata.get("entry_type"), "balanced_breakout")
 
     def test_late_long_chase_is_blocked(self):
@@ -104,7 +104,7 @@ class TestBalancedEntries(unittest.TestCase):
         self.assertIn("late_chase_consecutive_impulse", signal.reason)
 
     def test_pullback_continuation_long_enters(self):
-        closes = [Decimal("100") for i in range(60)]
+        closes = [Decimal("100") + (Decimal(i) * Decimal("0.1")) for i in range(60)]
         exec_closes = [Decimal("106"), Decimal("105.1"), Decimal("105.2"), Decimal("107")]
         exec_candles = []
         for i, c in enumerate(exec_closes):
@@ -128,7 +128,7 @@ class TestBalancedEntries(unittest.TestCase):
         context = StrategyContext(pair="B-SOL_USDT", interval="1h", candles=series,
             indicators=latest_indicator_snapshot(series), features=features)
         signal = self.strategy.evaluate(context)
-        self.assertEqual(signal.action, SignalAction.ENTER_LONG)
+        self.assertEqual(signal.action, SignalAction.ENTER_LONG, signal.reason)
         self.assertEqual(signal.metadata.get("entry_type"), "pullback_continuation")
 
     def test_short_balanced_breakdown_enters(self):
@@ -156,11 +156,11 @@ class TestBalancedEntries(unittest.TestCase):
         context = StrategyContext(pair="B-SOL_USDT", interval="1h", candles=series,
             indicators=latest_indicator_snapshot(series), features=features)
         signal = self.strategy.evaluate(context)
-        self.assertEqual(signal.action, SignalAction.ENTER_SHORT)
+        self.assertEqual(signal.action, SignalAction.ENTER_SHORT, signal.reason)
         self.assertEqual(signal.metadata.get("entry_type"), "balanced_breakout")
 
     def test_short_pullback_continuation_enters(self):
-        closes = [Decimal("100") for i in range(60)]
+        closes = [Decimal("100") - (Decimal(i) * Decimal("0.1")) for i in range(60)]
         exec_closes = [Decimal("94"), Decimal("94.9"), Decimal("94.8"), Decimal("93")]
         exec_candles = []
         for i, c in enumerate(exec_closes):
@@ -184,5 +184,5 @@ class TestBalancedEntries(unittest.TestCase):
         context = StrategyContext(pair="B-SOL_USDT", interval="1h", candles=series,
             indicators=latest_indicator_snapshot(series), features=features)
         signal = self.strategy.evaluate(context)
-        self.assertEqual(signal.action, SignalAction.ENTER_SHORT)
+        self.assertEqual(signal.action, SignalAction.ENTER_SHORT, signal.reason)
         self.assertEqual(signal.metadata.get("entry_type"), "pullback_continuation")
