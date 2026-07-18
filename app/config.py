@@ -83,7 +83,7 @@ class RiskSettings:
     live_max_margin_per_order: Decimal = Decimal("1000")
     live_max_daily_loss_inr: Decimal = Decimal("1000")
     live_max_orders_per_day: int = 99999
-    live_min_confidence: Decimal = Decimal("0.60")
+    live_min_confidence: Decimal = Decimal("0.58")
     live_require_stop_loss: bool = True
     live_require_exchange_stop_sync: bool = True
     live_kill_switch: bool = False
@@ -308,7 +308,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
             _get(merged, "LIVE_MAX_DAILY_LOSS_INR", "1000")
         ),
         live_max_orders_per_day=int(_get(merged, "LIVE_MAX_ORDERS_PER_DAY", "99999")),
-        live_min_confidence=_decimal(_get(merged, "LIVE_MIN_CONFIDENCE", "0.60")),
+        live_min_confidence=_decimal(_get(merged, "LIVE_MIN_CONFIDENCE", "0.58")),
         live_require_stop_loss=_bool(_get(merged, "LIVE_REQUIRE_STOP_LOSS", "true")),
         live_require_exchange_stop_sync=_bool(
             _get(merged, "LIVE_REQUIRE_EXCHANGE_STOP_SYNC", "true")
