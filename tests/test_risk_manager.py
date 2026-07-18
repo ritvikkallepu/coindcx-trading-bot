@@ -294,6 +294,30 @@ class RiskManagerTests(unittest.TestCase):
         self.assertFalse(decision.approved)
         self.assertIn("leverage exceeds", decision.reason)
 
+    def test_can_explicitly_override_exchange_leverage_limit(self) -> None:
+        manager = RiskManager(
+            RiskSettings(
+                max_risk_per_trade_pct=Decimal("1"),
+                max_daily_loss_pct=Decimal("3"),
+                max_open_positions=1,
+                max_leverage=30,
+                enforce_exchange_leverage_limit=False,
+            )
+        )
+        instrument = InstrumentMetadata(pair="B-ZEC_USDT", max_leverage=Decimal("5"))
+
+        with self.assertLogs("app.risk.manager", level="WARNING") as logs:
+            decision = manager.evaluate_signal(
+                _entry_signal(pair="B-ZEC_USDT", stop_loss=Decimal("99")),
+                account_equity=Decimal("1000"),
+                instrument=instrument,
+                requested_leverage=Decimal("30"),
+            )
+
+        self.assertTrue(decision.approved)
+        self.assertEqual(decision.leverage, Decimal("30"))
+        self.assertIn("EXCHANGE LEVERAGE LIMIT OVERRIDE", "\n".join(logs.output))
+
     def test_instrument_metadata_parses_nested_coindcx_shape(self) -> None:
         instrument = InstrumentMetadata.from_mapping(
             "B-BTC_USDT",

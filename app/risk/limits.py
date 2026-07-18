@@ -50,16 +50,28 @@ def allowed_leverage(context: RiskContext, settings: RiskSettings) -> Decimal:
     """Return the lower of configured leverage and exchange instrument limit."""
 
     configured = Decimal(str(settings.max_leverage))
+    if not settings.enforce_exchange_leverage_limit:
+        return configured
+
+    exchange_limit = exchange_leverage_limit(context)
+    if exchange_limit is None:
+        return configured
+    return min(configured, exchange_limit)
+
+
+def exchange_leverage_limit(context: RiskContext) -> Decimal | None:
+    """Return the positive exchange-reported leverage limit, when available."""
+
     instrument_limit = getattr(context.instrument, "max_leverage", None)
     if instrument_limit is None:
-        return configured
+        return None
     try:
         exchange_limit = Decimal(str(instrument_limit))
     except Exception:
-        return configured
+        return None
     if exchange_limit <= 0:
-        return configured
-    return min(configured, exchange_limit)
+        return None
+    return exchange_limit
 
 
 def validate_entry_signal(signal: StrategySignal) -> str | None:

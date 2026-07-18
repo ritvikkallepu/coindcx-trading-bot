@@ -75,6 +75,7 @@ class ConfigTests(unittest.TestCase):
                             "MAX_DAILY_LOSS_PCT=2.5",
                             "MAX_OPEN_POSITIONS=3",
                             "MAX_LEVERAGE=4",
+                            "ENFORCE_EXCHANGE_LEVERAGE_LIMIT=false",
                             "MAX_TOTAL_OPEN_NOTIONAL_PCT=250",
                             "MAX_TOTAL_RISK_PCT=6",
                             "MAX_MARGIN_PER_PAIR=750",
@@ -99,6 +100,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(risk.max_daily_loss_pct, Decimal("2.5"))
                 self.assertEqual(risk.max_open_positions, 3)
                 self.assertEqual(risk.max_leverage, 4)
+                self.assertFalse(risk.enforce_exchange_leverage_limit)
                 self.assertEqual(risk.max_total_open_notional_pct, Decimal("250"))
                 self.assertEqual(risk.max_total_risk_pct, Decimal("6"))
                 self.assertEqual(risk.max_margin_per_pair, Decimal("750"))

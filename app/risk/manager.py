@@ -11,6 +11,7 @@ from app.risk.limits import (
     allowed_leverage,
     daily_loss_limit_amount,
     daily_loss_limit_reached,
+    exchange_leverage_limit,
     is_entry_signal,
     is_exit_signal,
     validate_entry_signal,
@@ -181,6 +182,20 @@ class RiskManager:
 
         configured_allowed_leverage = allowed_leverage(context, self.settings)
         requested_leverage = context.requested_leverage or Decimal("1")
+        exchange_limit = exchange_leverage_limit(context)
+        if (
+            not self.settings.enforce_exchange_leverage_limit
+            and exchange_limit is not None
+            and requested_leverage > exchange_limit
+        ):
+            self.logger.warning(
+                "[%s] EXCHANGE LEVERAGE LIMIT OVERRIDE: requested=%s configured_max=%s "
+                "exchange_reported=%s. CoinDCX may reject this order.",
+                signal.pair,
+                requested_leverage,
+                self.settings.max_leverage,
+                exchange_limit,
+            )
         if requested_leverage > configured_allowed_leverage:
             return self._reject(
                 signal,

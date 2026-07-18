@@ -59,6 +59,7 @@ class RiskSettings:
     allow_multi_pair_positions: bool = True
     allow_same_pair_pyramiding: bool = False
     max_leverage: int = 125
+    enforce_exchange_leverage_limit: bool = True
     max_total_open_notional_pct: Decimal = Decimal("0")
     max_total_risk_pct: Decimal = Decimal("50")
     max_margin_usage_pct: Decimal = Decimal("100.0")
@@ -272,6 +273,9 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         allow_multi_pair_positions=_bool(_get(merged, "ALLOW_MULTI_PAIR_POSITIONS", "true")),
         allow_same_pair_pyramiding=_bool(_get(merged, "ALLOW_SAME_PAIR_PYRAMIDING", "false")),
         max_leverage=int(_get(merged, "MAX_LEVERAGE", "125")),
+        enforce_exchange_leverage_limit=_bool(
+            _get(merged, "ENFORCE_EXCHANGE_LEVERAGE_LIMIT", "true")
+        ),
         max_total_open_notional_pct=_decimal(
             _get(merged, "MAX_TOTAL_OPEN_NOTIONAL_PCT", "0")
         ),
