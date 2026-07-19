@@ -437,7 +437,13 @@ class TestLiveSafetyHardening(unittest.TestCase):
         mock_candle.is_closed = True
         
         with patch.object(loop, '_check_dry_run_stops', return_value=False):
-            with patch('time.time', return_value=(aligned_ts + interval_ms + 1000) / 1000.0):
+            ready_time_ms = (
+                aligned_ts
+                + interval_ms
+                + loop.settings.live_closed_candle_buffer_ms
+                + 1
+            )
+            with patch('time.time', return_value=ready_time_ms / 1000.0):
                 with self.assertLogs('app.live.live_loop', level='DEBUG') as cm:
                     loop._on_candle(mock_candle)
                     found = any("cooldown blocked entry" in line.lower() for line in cm.output)

@@ -63,6 +63,83 @@ class TestCandleAcceptance(unittest.TestCase):
         # Ensure evaluate was NOT called
         self.loop.strategy_engine.evaluate.assert_not_called()
 
+    def test_strategy_candle_waits_for_post_close_buffer(self):
+        interval_ms = 300000
+        base_time_ms = (int(time.time() * 1000) // interval_ms) * interval_ms
+        close_time_ms = base_time_ms + interval_ms - 1
+
+        for index in range(25):
+            open_time_ms = base_time_ms - ((25 - index) * interval_ms)
+            self.loop.series_by_pair["B-BTC_USDT"].add(
+                OHLCVCandle(
+                    pair="B-BTC_USDT",
+                    interval="5m",
+                    open_time_ms=open_time_ms,
+                    close_time_ms=open_time_ms + interval_ms - 1,
+                    open=Decimal("50000"),
+                    high=Decimal("50000"),
+                    low=Decimal("50000"),
+                    close=Decimal("50000"),
+                    volume=Decimal("1"),
+                    is_closed=True,
+                )
+            )
+
+        candle = OHLCVCandle(
+            pair="B-BTC_USDT",
+            interval="5m",
+            open_time_ms=base_time_ms,
+            close_time_ms=close_time_ms,
+            open=Decimal("50000"),
+            high=Decimal("51000"),
+            low=Decimal("49000"),
+            close=Decimal("50500"),
+            volume=Decimal("100"),
+            is_closed=True,
+        )
+
+        with patch("time.time", return_value=(close_time_ms - 1000) / 1000.0):
+            self.loop._on_candle(candle, source="websocket")
+
+        self.loop.strategy_engine.evaluate.assert_not_called()
+        self.assertEqual(self.loop.candle_count, 0)
+
+        ready_time_ms = close_time_ms + self.settings.live_closed_candle_buffer_ms + 1
+        with patch("time.time", return_value=ready_time_ms / 1000.0):
+            self.loop._flush_matured_candles()
+
+        self.loop.strategy_engine.evaluate.assert_called_once()
+        self.assertEqual(self.loop.candle_count, 1)
+
+    def test_execution_entry_waits_for_post_close_buffer(self):
+        interval_ms = 60000
+        base_time_ms = (int(time.time() * 1000) // interval_ms) * interval_ms
+        close_time_ms = base_time_ms + interval_ms - 1
+        candle = OHLCVCandle(
+            pair="B-BTC_USDT",
+            interval="1m",
+            open_time_ms=base_time_ms,
+            close_time_ms=close_time_ms,
+            open=Decimal("100"),
+            high=Decimal("105"),
+            low=Decimal("99"),
+            close=Decimal("104"),
+            volume=Decimal("100"),
+            is_closed=True,
+        )
+        self.loop._process_execution_momentum_candle = MagicMock()
+
+        with patch("time.time", return_value=(close_time_ms - 500) / 1000.0):
+            self.loop._on_candle(candle, source="websocket")
+
+        self.loop._process_execution_momentum_candle.assert_not_called()
+
+        ready_time_ms = close_time_ms + self.settings.live_closed_candle_buffer_ms + 1
+        with patch("time.time", return_value=ready_time_ms / 1000.0):
+            self.loop._flush_matured_candles()
+
+        self.loop._process_execution_momentum_candle.assert_called_once()
+
     @patch("app.live.live_loop.logger")
     def test_forming_strategy_candle_logs_scheduled_close_once(self, mock_logger):
         interval_ms = 300000

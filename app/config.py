@@ -231,6 +231,9 @@ class Settings:
     ws_ping_interval_seconds: float = 25.0
     log_level: str = "INFO"
     log_dir: str = "logs"
+    log_max_bytes: int = 25_000_000
+    log_backup_count: int = 30
+    log_compress_backups: bool = True
     risk: RiskSettings = RiskSettings()
 
     @property
@@ -480,6 +483,9 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         ws_ping_interval_seconds=float(_get(merged, "WS_PING_INTERVAL_SECONDS", "25")),
         log_level=_get(merged, "LOG_LEVEL", "INFO").upper(),
         log_dir=_get(merged, "LOG_DIR", "logs"),
+        log_max_bytes=int(_get(merged, "LOG_MAX_BYTES", "25000000")),
+        log_backup_count=int(_get(merged, "LOG_BACKUP_COUNT", "30")),
+        log_compress_backups=_bool(_get(merged, "LOG_COMPRESS_BACKUPS", "true")),
         risk=risk,
     )
 

@@ -89,6 +89,10 @@ class ConfigTests(unittest.TestCase):
                             "LIVE_REQUIRE_STOP_LOSS=false",
                             "LIVE_PILOT_DRY_RUN=false",
                             "LIVE_POSITION_MARGIN_TYPE=isolated",
+                            "LOG_DIR=/tmp/coindcx-test-logs",
+                            "LOG_MAX_BYTES=123456",
+                            "LOG_BACKUP_COUNT=12",
+                            "LOG_COMPRESS_BACKUPS=false",
                         ]
                     ),
                     encoding="utf-8",
@@ -114,6 +118,10 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(risk.live_require_stop_loss)
             self.assertFalse(settings.live_pilot_dry_run)
             self.assertEqual(settings.live_position_margin_type, "isolated")
+            self.assertEqual(settings.log_dir, "/tmp/coindcx-test-logs")
+            self.assertEqual(settings.log_max_bytes, 123456)
+            self.assertEqual(settings.log_backup_count, 12)
+            self.assertFalse(settings.log_compress_backups)
 
 
 if __name__ == "__main__":

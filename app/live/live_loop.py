@@ -224,6 +224,9 @@ class LiveTradingLoop:
         self._reconcile_thread = None
         self._ws_client = None
         self._processing_lock = threading.Lock()
+        self._pending_closed_candles: dict[
+            tuple[str, str, int], tuple[OHLCVCandle, str]
+        ] = {}
         
         # Event worker
         self._event_queue = queue.Queue()
@@ -1590,11 +1593,14 @@ class LiveTradingLoop:
                 try:
                     event = self._event_queue.get(timeout=1.0)
                 except queue.Empty:
+                    with self._processing_lock:
+                        self._flush_matured_candles()
                     continue
 
                 # Use the processing lock to ensure thread safety
                 with self._processing_lock:
                      self._process_event_sync(event)
+                     self._flush_matured_candles()
                 
                 self._event_queue.task_done()
             except Exception as exc:
@@ -1621,6 +1627,50 @@ class LiveTradingLoop:
         # Offload to worker to keep WebSocket thread responsive
         self._event_queue.put(event)
 
+    def _candle_past_close_buffer(self, candle: OHLCVCandle, now_ms: int) -> bool:
+        settings = getattr(self, "settings", None)
+        buffer_ms = max(
+            0,
+            int(getattr(settings, "live_closed_candle_buffer_ms", 0)),
+        )
+        return now_ms >= candle.close_time_ms + 1 + buffer_ms
+
+    def _candle_ready_for_entry(self, candle: OHLCVCandle, now_ms: int) -> bool:
+        """Return whether a closed candle is past the configured safety buffer."""
+
+        return candle.is_closed and self._candle_past_close_buffer(candle, now_ms)
+
+    def _defer_candle_until_closed(self, candle: OHLCVCandle, source: str) -> None:
+        key = (candle.pair, candle.interval, candle.open_time_ms)
+        pending = getattr(self, "_pending_closed_candles", None)
+        if pending is None:
+            pending = {}
+            self._pending_closed_candles = pending
+        pending[key] = (candle, source)
+
+    def _flush_matured_candles(self) -> None:
+        """Process the latest update only after its candle is indisputably closed."""
+
+        now_ms = int(time.time() * 1000)
+        pending_candles = getattr(self, "_pending_closed_candles", {})
+        ready_keys = sorted(
+            (
+                key
+                for key, (candle, _) in list(pending_candles.items())
+                if self._candle_past_close_buffer(candle, now_ms)
+            ),
+            key=lambda key: (key[2], key[0], key[1]),
+        )
+        for key in ready_keys:
+            pending = pending_candles.pop(key, None)
+            if pending is None:
+                continue
+            candle, source = pending
+            self._on_candle(
+                replace(candle, is_closed=True),
+                source=f"{source}_deferred",
+            )
+
     def _on_candle(self, candle: OHLCVCandle, source: str = "unknown") -> None:
         # Synchronous candle handler called by worker or rest poll
         if candle.pair not in self.pairs:
@@ -1638,8 +1688,10 @@ class LiveTradingLoop:
             if candle.open_time_ms % interval_ms != 0:
                  return
 
-            # Strict closed candle detection
-            is_closed_confirmed = candle.is_closed and (now_ms >= candle.close_time_ms - 2000)
+            # Candle timestamps are authoritative. Some websocket payloads mark a
+            # forming candle as closed, so entries wait until the configured
+            # post-close buffer has elapsed.
+            is_closed_confirmed = self._candle_ready_for_entry(candle, now_ms)
 
             if is_closed_confirmed:
                 last_eval = self._last_evaluated_strategy_candle_ms.get((candle.pair, candle.interval), 0)
@@ -1681,6 +1733,7 @@ class LiveTradingLoop:
                      self._current_forming_candle_ms[(candle.pair, candle.interval)] = 0
             else:
                 # Still forming
+                self._defer_candle_until_closed(candle, source)
                 previous_forming_close = self._current_forming_candle_ms.get(
                     (candle.pair, candle.interval),
                     0,
@@ -1699,7 +1752,7 @@ class LiveTradingLoop:
             self.execution_series_by_pair[candle.pair].add(candle)
             self._apply_profit_protection(candle)
 
-            is_closed_confirmed = candle.is_closed and (now_ms >= candle.close_time_ms - 2000)
+            is_closed_confirmed = self._candle_ready_for_entry(candle, now_ms)
             if is_closed_confirmed:
                 key = (candle.pair, candle.interval)
                 last_eval = self._last_evaluated_strategy_candle_ms.get(key, 0)
@@ -1717,6 +1770,8 @@ class LiveTradingLoop:
                         self._last_evaluated_strategy_candle_ms[key] = candle.close_time_ms
                         self._last_processed_candle_ms[key] = candle.close_time_ms
                         self.save_local_state()
+            else:
+                self._defer_candle_until_closed(candle, source)
 
     def _check_dry_run_stops(self, candle: OHLCVCandle) -> bool:
         pos = self.local_state["positions"].get(candle.pair)
