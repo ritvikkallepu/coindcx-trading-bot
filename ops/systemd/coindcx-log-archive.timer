@@ -1,0 +1,10 @@
+[Unit]
+Description=Create a daily CoinDCX bot audit archive
+
+[Timer]
+OnCalendar=*-*-* 00:15:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

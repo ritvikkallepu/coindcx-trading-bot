@@ -1,0 +1,6 @@
+[Unit]
+Description=Archive CoinDCX bot logs and runtime state
+
+[Service]
+Type=oneshot
+ExecStart=/opt/coindcx-trading-bot/scripts/export_vps_audit.sh

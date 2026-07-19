@@ -1,0 +1,23 @@
+[Unit]
+Description=CoinDCX futures trading bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/coindcx-trading-bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/coindcx-bot/runtime.env
+ExecStart=/opt/coindcx-trading-bot/scripts/run_live_vps.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coindcx-bot
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
