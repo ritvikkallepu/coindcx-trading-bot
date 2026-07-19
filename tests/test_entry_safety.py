@@ -4,6 +4,7 @@ import unittest
 from decimal import Decimal
 
 from app.config import RiskSettings
+from app.risk.entry_safety import assess_entry_safety
 from app.risk.manager import RiskManager
 from app.risk.pair_performance import pair_recent_risk_profile
 from app.strategies.base import SignalAction, SignalDirection, StrategySignal
@@ -31,6 +32,32 @@ def _entry_signal(
 
 
 class EntrySafetyTests(unittest.TestCase):
+    def test_short_agreement_uses_same_b_tier_baseline_as_long(self) -> None:
+        signal = StrategySignal(
+            strategy_name="hybrid_meta_v2",
+            pair="B-BTC_USDT",
+            interval="5m",
+            action=SignalAction.ENTER_SHORT,
+            direction=SignalDirection.SHORT,
+            confidence=Decimal("0.58"),
+            reason="symmetric short",
+            timestamp_ms=1,
+            entry_price=Decimal("100"),
+            stop_loss=Decimal("101"),
+            metadata={"agreement_ratio": Decimal("0.50")},
+        )
+        settings = RiskSettings(
+            short_strictness_enabled=True,
+            short_confidence_bonus=Decimal("0"),
+            short_min_agreement_bonus=Decimal("0"),
+            short_require_trend_confirmation=False,
+            short_require_price_below_ema=False,
+        )
+
+        assessment = assess_entry_safety(signal, settings)
+
+        self.assertTrue(assessment.approved, assessment.reason)
+
     def test_rejects_tiny_stop_distance_before_sizing(self) -> None:
         decision = RiskManager(
             RiskSettings(

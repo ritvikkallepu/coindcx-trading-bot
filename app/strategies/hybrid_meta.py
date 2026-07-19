@@ -344,14 +344,14 @@ class HybridMetaStrategy(Strategy):
             
             if quality["mode"] == "tiered":
                 decision = _quality_decision(SignalDirection.LONG, final_score, long_agreement, visual["score"], quality)
-                if not decision.allowed: return self._hold(context, "Hybrid score below tiered entry threshold.", {**metadata, **_quality_metadata(decision, long_agreement)})
+                if not decision.allowed: return self._hold(context, "Hybrid score below tiered entry threshold.", {**metadata, **_quality_metadata(decision, long_agreement, quality)})
                 return self._entry_or_bb_hold(
                     context=context,
                     direction=SignalDirection.LONG,
                     final_score=final_score,
                     atr=atr_val,
                     reason=f"Hybrid {decision.tier}-tier long setup confirmed.",
-                    metadata={**metadata, **_quality_metadata(decision, long_agreement), "entry_type": "confirmed_trend"},
+                    metadata={**metadata, **_quality_metadata(decision, long_agreement, quality), "entry_type": "confirmed_trend"},
                     bands=bands,
                     config=config,
                 )
@@ -362,7 +362,7 @@ class HybridMetaStrategy(Strategy):
                     final_score=final_score,
                     atr=atr_val,
                     reason="Hybrid score confirmed long setup.",
-                    metadata={**metadata, "setup_tier": "strict", "agreement_ratio": long_agreement, "entry_type": "confirmed_trend"},
+                    metadata={**metadata, "setup_tier": "strict", "agreement_ratio": long_agreement, "base_agreement_threshold": quality["b_setup_agreement_threshold"], "entry_type": "confirmed_trend"},
                     bands=bands,
                     config=config,
                 )
@@ -393,14 +393,14 @@ class HybridMetaStrategy(Strategy):
                      return self._hold(context, f"Short agreement too low: {short_agreement:.2f}", {**metadata, "funnel_reason": SignalFunnelReason.AGREEMENT_BELOW_MINIMUM})
 
                 decision = _quality_decision(SignalDirection.SHORT, final_score, short_agreement, visual["score"], quality)
-                if not decision.allowed: return self._hold(context, "Hybrid score below tiered entry threshold.", {**metadata, **_quality_metadata(decision, short_agreement)})
+                if not decision.allowed: return self._hold(context, "Hybrid score below tiered entry threshold.", {**metadata, **_quality_metadata(decision, short_agreement, quality)})
                 return self._entry_or_bb_hold(
                     context=context,
                     direction=SignalDirection.SHORT,
                     final_score=final_score,
                     atr=atr_val,
                     reason=f"Hybrid {decision.tier}-tier short setup confirmed.",
-                    metadata={**metadata, **_quality_metadata(decision, short_agreement), "entry_type": "confirmed_trend"},
+                    metadata={**metadata, **_quality_metadata(decision, short_agreement, quality), "entry_type": "confirmed_trend"},
                     bands=bands,
                     config=config,
                 )
@@ -411,7 +411,7 @@ class HybridMetaStrategy(Strategy):
                     final_score=final_score,
                     atr=atr_val,
                     reason="Hybrid score confirmed short setup.",
-                    metadata={**metadata, "setup_tier": "strict", "agreement_ratio": short_agreement, "entry_type": "confirmed_trend"},
+                    metadata={**metadata, "setup_tier": "strict", "agreement_ratio": short_agreement, "base_agreement_threshold": quality["b_setup_agreement_threshold"], "entry_type": "confirmed_trend"},
                     bands=bands,
                     config=config,
                 )
@@ -1126,11 +1126,21 @@ def _average_volume(candles: list[OHLCVCandle]) -> Decimal:
     return sum(c.volume for c in candles) / Decimal(len(candles))
 
 
-def _quality_metadata(decision: Any, agreement: Decimal) -> dict[str, Any]:
+def _quality_metadata(
+    decision: Any,
+    agreement: Decimal,
+    quality: dict[str, Any],
+) -> dict[str, Any]:
+    agreement_threshold = (
+        quality["a_setup_agreement_threshold"]
+        if decision.tier == "A"
+        else quality["b_setup_agreement_threshold"]
+    )
     return {
         "setup_tier": decision.tier,
         "setup_tier_risk_multiplier": decision.risk_multiplier,
         "agreement_ratio": agreement,
+        "base_agreement_threshold": agreement_threshold,
         "risk_multiplier": decision.risk_multiplier,
     }
 

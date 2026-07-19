@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 from app.config import RiskSettings
 from app.strategies.base import SignalAction, StrategySignal
+from app.strategies.entry_quality import B_SETUP_AGREEMENT_THRESHOLD
 
 
 @dataclass(frozen=True)
@@ -162,9 +163,12 @@ def _assess_short_strictness(
     if signal.confidence < required_conf:
         failed_filters.append(f"confidence {signal.confidence:.2f} < {required_conf:.2f}")
 
-    # B. Agreement Bonus
-    # Use 0.66 as baseline if not explicitly in metadata
-    base_agreement = _first_decimal(signal.metadata, "base_agreement_threshold") or Decimal("0.66")
+    # B. Agreement Bonus. The fallback is the same shared B-tier threshold
+    # used by both long and short strategy decisions.
+    base_agreement = (
+        _first_decimal(signal.metadata, "base_agreement_threshold")
+        or B_SETUP_AGREEMENT_THRESHOLD
+    )
     required_agreement = base_agreement + settings.short_min_agreement_bonus
     actual_agreement = _first_decimal(signal.metadata, "agreement_ratio", "short_agreement_ratio") or Decimal("0")
     
