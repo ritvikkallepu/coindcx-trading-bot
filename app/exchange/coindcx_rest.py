@@ -66,12 +66,15 @@ class UrllibTransport:
                     headers=dict(response.headers.items()),
                 )
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            return HTTPResponse(
-                status_code=exc.code,
-                text=body,
-                headers=dict(exc.headers.items()) if exc.headers else {},
-            )
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+                return HTTPResponse(
+                    status_code=exc.code,
+                    text=body,
+                    headers=dict(exc.headers.items()) if exc.headers else {},
+                )
+            finally:
+                exc.close()
         except URLError as exc:
             raise CoinDCXNetworkError(str(exc.reason)) from exc
 

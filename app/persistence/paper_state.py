@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 from decimal import Decimal
 from tempfile import NamedTemporaryFile
@@ -34,7 +35,7 @@ class PaperStateStore:
 
     def _init_db(self) -> None:
         # Task: Ensure schema is stable but allows updates
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             # We don't DROP if we want persistence across restarts
             conn.execute(
                 """
@@ -146,7 +147,7 @@ class PaperStateStore:
         
         saved_at = datetime.now(timezone.utc).isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute(
                 """
                 INSERT INTO broker_state (
@@ -203,7 +204,7 @@ class PaperStateStore:
             conn.commit()
 
     def load(self) -> dict[str, Any] | None:
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             row = conn.execute(
                 """
                 SELECT equity, positions, fills, daily_pnl, daily_limit_equity, 
@@ -328,14 +329,14 @@ class PaperStateStore:
         )
 
     def clear(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute("DELETE FROM broker_state")
             conn.execute("DELETE FROM strategy_state")
             conn.commit()
 
     def save_strategy_state(self, key: str, state: dict[str, Any]) -> None:
         state_json = json.dumps(to_jsonable(state))
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute(
                 """
                 INSERT INTO strategy_state (key, state)
@@ -347,7 +348,7 @@ class PaperStateStore:
             conn.commit()
 
     def load_strategy_state(self, key: str) -> dict[str, Any] | None:
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             row = conn.execute(
                 "SELECT state FROM strategy_state WHERE key = ?", (key,)
             ).fetchone()
@@ -358,11 +359,8 @@ class PaperStateStore:
         return self._restore_decimals(json.loads(row[0]))
 
     def close(self) -> None:
-        # On some OSs (like Windows), open sqlite handles can prevent file deletion.
-        # Since we use 'with sqlite3.connect' inside methods, we don't store a long-lived conn.
-        # But we can force a GC or just wait. 
-        import gc
-        gc.collect()
+        # Connections are scoped and closed inside each operation.
+        return None
 
 
 class PaperSessionStore:

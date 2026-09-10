@@ -38,5 +38,10 @@ class TelegramAlert(AlertInterface):
         try:
             with urlopen(req, timeout=10) as response:
                 pass
-        except (URLError, HTTPError) as exc:
+        except HTTPError as exc:
+            try:
+                self.logger.error("Failed to send Telegram alert: %s", exc)
+            finally:
+                exc.close()
+        except URLError as exc:
             self.logger.error("Failed to send Telegram alert: %s", exc)

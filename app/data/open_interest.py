@@ -112,7 +112,11 @@ class BinanceOpenInterestClient:
             with self._opener(request, timeout=self.timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
-            if _is_unavailable_binance_oi_response(exc):
+            try:
+                unavailable = _is_unavailable_binance_oi_response(exc)
+            finally:
+                exc.close()
+            if unavailable:
                 return []
             raise
         data = json.loads(raw)
